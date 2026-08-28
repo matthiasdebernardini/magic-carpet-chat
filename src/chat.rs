@@ -17,6 +17,7 @@ use gpui_component::{
     v_flex,
 };
 use http_client::{AsyncBody, HttpClient, Method, Request, StatusCode};
+use magic_carpet_chat::secrets::Secret;
 use serde_json::json;
 
 use crate::palette::*;
@@ -268,20 +269,24 @@ impl Render for Chat {
     }
 }
 
-fn api_key() -> Option<String> {
+/// The API key is a bearer credential like the nsecs, so it travels in the
+/// same redacting [`Secret`] wrapper: a stray `{:?}` on the request path can
+/// never print it. It is exposed exactly once, at the header site.
+fn api_key() -> Option<Secret> {
     // Trim: a key read from a file usually carries a newline, and a header value
     // with one fails to build with a message that says nothing about why.
     std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty())
+        .map(Secret::new)
 }
 
 /// POSTs the transcript and feeds every `text_delta` into the pending bubble.
 /// Runs on gpui's foreground executor; the socket reads never block the frame.
 async fn stream_reply(
     http: Arc<dyn HttpClient>,
-    api_key: String,
+    api_key: Secret,
     payload: String,
     reply_ix: usize,
     chat: WeakEntity<Chat>,
@@ -293,7 +298,7 @@ async fn stream_reply(
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
         .header("anthropic-version", "2023-06-01")
-        .header("x-api-key", api_key)
+        .header("x-api-key", api_key.expose())
         .body(AsyncBody::from(payload))
         .map_err(|error| format!("The request would not build: {error}"))?;
 

@@ -1,0 +1,102 @@
+{
+    "success": true,
+    "bounty": {
+        "id": "5f44688e-fcb3-4c6a-bee6-e287995f7d3e",
+        "issuer_pubkey": "853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba",
+        "list_coordinate": "39998:853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba:cities-tennessee-rehearsal",
+        "amount_sats": 100,
+        "criteria": "Cities in the state of Tennessee (rehearsal 2)",
+        "expiration": null,
+        "created_at": 1786093449,
+        "status": "fulfilled",
+        "bounty_cap_sats": 100,
+        "reward_per_item": 1,
+        "max_rewards_per_npub": 1,
+        "auto_pay": 1,
+        "auto_pay_min_rank": 3,
+        "derivedStatus": "fulfilled",
+        "paymentState": {
+            "rewardAmountSats": 100,
+            "bountyCapSats": 100,
+            "rewardPerItem": true,
+            "maxRewardsPerNpub": 1,
+            "totalRewardSlots": 1,
+            "paidRewardCount": 1,
+            "heldRewardCount": 0,
+            "remainingRewardSlots": 0,
+            "payableRewardCount": 0,
+            "reconciliationRewardCount": 0,
+            "openRewardSlots": 0,
+            "fulfilled": true
+        }
+    },
+    "claims": [
+        {
+            "event": {
+                "content": "Memphis",
+                "created_at": 1786093454,
+                "id": "afb4bfe5b6556aa4a65a3c51a82d0e974c234dbe9551963d347208aa5d4ebc85",
+                "kind": 39999,
+                "pubkey": "873c82612de7a968b61cb343e34db3d88c477597203406392a00ab9521684d61",
+                "sig": "a404be99ab887251701cb1371f72199f46e77d7e267068c9ce0194cc43fb9e3dd518120d2d77000c111c335dce8eb872014d8538dc34dd36d1d0561efb92e9f8",
+                "tags": [
+                    [
+                        "z",
+                        "39998:853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba:cities-tennessee-rehearsal"
+                    ],
+                    [
+                        "d",
+                        "mc-1786093454-7"
+                    ]
+                ]
+            },
+            "zapReceipt": {
+                "content": "",
+                "created_at": 1786093481,
+                "id": "b3b3f887aab52d97796777aeac056f72ddaf745fd98329a3fcdb9ac37ba332c7",
+                "kind": 9735,
+                "pubkey": "8b7cd4981e30ed2dd6b5ef1f816763453b282b3e44f41ef2a3da77ff5ef8d141",
+                "sig": "9f618f109b5551cea6a087beceaf8c90bb0e95847b95da6077dd0fedb253557eb6c6ccf3fe12f947c4e1b0307bd5a552e605e06cadb1328bfe5eee8ac5a11b7a",
+                "tags": [
+                    [
+                        "p",
+                        "873c82612de7a968b61cb343e34db3d88c477597203406392a00ab9521684d61"
+                    ],
+                    [
+                        "e",
+                        "afb4bfe5b6556aa4a65a3c51a82d0e974c234dbe9551963d347208aa5d4ebc85"
+                    ],
+                    [
+                        "a",
+                        "39998:853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba:cities-tennessee-rehearsal"
+                    ],
+                    [
+                        "P",
+                        "caca367dde1c413c59049519f73669d750f63609936b71c5d933e85836047d38"
+                    ],
+                    [
+                        "bolt11",
+                        "lnbc1u1p48t8a8pp50murnrgp8ne67me3zhjsxdp3e96j7gnzndsz9zf4knlky3x3yd3qhp57qssq9spts5h55w0tlmllmnhjw4vv2p6me2mt42sy7ejgzclvgkscqzzsxqrrs0sp5g02373l0f7z8auzgpyxfkqrrjwuwjsmm85n8cfdk0krxwm7p8css9qxpqysgqxuglqadp7jkes824a62j4uju23j2g6qw9m2ekqhlj5dtn8gyx3dj3ueh63phv58v76hq5gwfq2y8tfzfr0lnlp9tq0zxmavemnyvtxsptd9qud"
+                    ],
+                    [
+                        "description",
+                        "{\"kind\":9734,\"created_at\":1786093479,\"content\":\"\",\"tags\":[[\"p\",\"873c82612de7a968b61cb343e34db3d88c477597203406392a00ab9521684d61\"],[\"e\",\"afb4bfe5b6556aa4a65a3c51a82d0e974c234dbe9551963d347208aa5d4ebc85\"],[\"a\",\"39998:853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba:cities-tennessee-rehearsal\"],[\"amount\",\"100000\"],[\"relays\",\"wss://magic-carpet.brainstorm.world/relay\",\"wss://relay.damus.io\",\"wss://nos.lol\",\"wss://relay.primal.net\"]],\"pubkey\":\"caca367dde1c413c59049519f73669d750f63609936b71c5d933e85836047d38\",\"id\":\"96756a9f0ceaeb26737dcd4ebe4d92f0b0e7b32226df2322b06c475646cf08ac\",\"sig\":\"2b8ab1e483e7c51d00b66b8ceaac3777b2763399a93434c2865ef1974ffa4b5613db9c7daa66a85115a59cd5ff078f618eef2e7df1882a8d25c105cee3ab2a2a\"}"
+                    ]
+                ]
+            },
+            "autoPayment": {
+                "id": "89e5ef2c-0af4-4d55-aa70-e3d88aec402c",
+                "claim_event_id": "afb4bfe5b6556aa4a65a3c51a82d0e974c234dbe9551963d347208aa5d4ebc85",
+                "bounty_id": "5f44688e-fcb3-4c6a-bee6-e287995f7d3e",
+                "issuer_pubkey": "853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba",
+                "amount_sats": 100,
+                "state": "settled",
+                "reason": null,
+                "created_at": 1786093475,
+                "updated_at": 1786093481
+            },
+            "paymentStatus": "paid",
+            "paymentAmountSats": 100
+        }
+    ]
+}

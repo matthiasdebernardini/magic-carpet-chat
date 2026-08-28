@@ -23,6 +23,31 @@ reqwest_client = { git = "https://github.com/zed-industries/zed" }
 futures = "0.3"
 serde_json = "1"
 
+# The protocol layer (src/lib.rs): Nostr + the instance REST API, run on a
+# dedicated tokio thread (gpui's executor is not tokio — see src/nostr.rs).
+nostr-sdk = "0.45"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "cookies",
+] }
+# Both ring (zed's http stack) and aws-lc-rs (reqwest's rustls-tls default)
+# end up in the graph, and rustls refuses to guess between two providers at
+# runtime. spawn_runtime() installs ring explicitly before any TLS happens.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
+keyring = "4"
+lightning-invoice = { version = "0.34", features = ["std"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+# dtag.js hashes with SHA-256 (first 8 hex chars); slug() strips diacritics
+# via NFD, which needs a real normalizer to match JS String.normalize.
+sha2 = "0.10"
+unicode-normalization = "0.1"
+
 # Debug builds of gpui and its text/layout stack are unusably slow without this.
 # Copied from the gpui-component workspace.
 [profile.dev]
