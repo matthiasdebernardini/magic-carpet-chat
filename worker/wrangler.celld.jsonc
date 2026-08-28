@@ -1,0 +1,25 @@
+// celld deploy config. ./deploy.sh copies this to a temporary file, replaces
+// @ANTHROPIC_API_KEY@ with the key from the environment, and deploys that copy.
+// celld has no secrets, only string vars, so the key is in cleartext inside the
+// deployed bundle metadata; it must never be written into this tracked file.
+//
+// Do not rename "magic-carpet-chat". Durable Object data is bound to the script
+// name, so a rename orphans every stored conversation.
+//
+// celld 0.3.0 accepts these keys and no others: $schema, name, main,
+// compatibility_date, compatibility_flags, durable_objects, migrations, assets,
+// services, vars, no_bundle (crates/celld/deploy.rs, SUPPORTED_KEYS). Every
+// other key fails the deploy by name, "routes", "triggers" and "d1_databases"
+// included.
+{
+  "name": "magic-carpet-chat",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [{ "name": "CHAT", "class_name": "ChatCell" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChatCell"] }],
+  "vars": {
+    "ANTHROPIC_API_KEY": "@ANTHROPIC_API_KEY@"
+  }
+}

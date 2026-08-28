@@ -1,0 +1,11 @@
+// Local loop only: `npm run dev`. ANTHROPIC_API_KEY comes from .dev.vars.
+// The celld deploy uses wrangler.celld.jsonc — keep the two in step.
+{
+  "name": "magic-carpet-chat",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [{ "name": "CHAT", "class_name": "ChatCell" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChatCell"] }]
+}

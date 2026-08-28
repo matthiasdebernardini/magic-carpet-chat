@@ -1,0 +1,14 @@
+{
+  "name": "magic-carpet-chat-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260827.1",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.28.0"
+  }
+}
