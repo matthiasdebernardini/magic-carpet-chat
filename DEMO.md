@@ -27,10 +27,10 @@ money move.
 | 3 | `⌘N` | "New DList + bounty" form opens (the house issuer is the active account at launch), caret in the first field. |
 | 4 | type, `Enter` after each field | Singular → plural → description → criteria → reward (prefilled 100) → cap (prefilled 400) → min rank (prefilled 2). `Enter` on the last field publishes the kind-39998 list through the instance, then creates the auto-pay bounty with the session login. |
 | 5 | watch | Activity logs "Published list …" then "Bounty … created — watching for claims". The new bounty is selected; the top-bar pill reads **Auto-pay armed** because the bounty really has autoPay. |
-| 6 | `⌘]` | Switch to the claimant (Matthias). The rail ring moves; the sidebar shows his real npub and kind-0 name. |
+| 6 | `⌘]` | Switch to the claimant (Matthias). The rail ring moves; the sidebar shows his real npub and kind-0 name. **Trap:** while a text field has focus, `⌘[`/`⌘]` indent instead of switching accounts — submit or cancel the form first (both return focus to the shell), or press `⌘2` to park focus. |
 | 7 | `⌘N` | Claim form for the selected bounty. |
 | 8 | type the item name, `Enter` | Publishes the kind-39999 claim through `POST /api/strfry/publish` (the only door the bounty machinery sees). |
-| 9 | watch | The claim card walks the real state machine live: *Claim submitted → Auto-pay attempting… → Paid — waiting for the zap receipt → Payment settled*, then **"Zap receipt … N s after the claim"**. `⌘1` shows the same beats in Recent activity. |
+| 9 | watch | The claim card walks the real state machine live: *Claim submitted → Auto-pay attempting… → Paid — waiting for the zap receipt → Payment settled*, then **"Zap receipt … N s after the claim"**. `⌘1` shows the same beats in Recent activity. If the receipt lags, the money has already moved — show the Strike notification, or `↑`/`↓` to the settled rehearsal bounty (`cities-tennessee-rehearsal`) as the receipt exhibit. |
 
 ## Other keys
 
@@ -41,9 +41,6 @@ money move.
 
 ## Caveats — read before going on stage
 
-- `⌘[` and `⌘]` do indent/outdent while a text field has focus. Finish or
-  cancel the form first (focus returns to the shell on submit and on cancel),
-  or press `⌘2` to park focus, then switch accounts.
 - `esc` inside a field cancels the form only when the field has nothing of its
   own to do with it; `⌘.` cancels from anywhere, always.
 - Selecting an old bounty replays its historical payment facts into the

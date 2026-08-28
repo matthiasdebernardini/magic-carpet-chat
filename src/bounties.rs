@@ -106,7 +106,12 @@ fn bounty_row(bounty: &Bounty, selected: bool, cx: &mut Context<Shell>) -> AnyEl
         .cursor_pointer()
         .map(|this| {
             if selected {
-                this.bg(rgb(BG_NAV_ON)).border_color(rgb(ACCENT))
+                // Unmissable from stage: fill + accent border + a soft glow.
+                this.bg(rgb(BG_NAV_ON)).border_color(rgb(ACCENT)).shadow(vec![
+                    BoxShadow::new(px(0.), px(0.), wash(ACCENT_GLOW))
+                        .spread_radius(px(2.))
+                        .blur_radius(px(10.)),
+                ])
             } else {
                 this.bg(rgb(BG_CARD))
                     .border_color(rgb(BORDER))
@@ -214,10 +219,18 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
             .collect(),
     };
 
+    // The pane scrolls on its own (the screen does not). The tracked handle
+    // is what BountyCreated uses to bring the new bounty into view; the rows
+    // must stay DIRECT children so scroll_to_item's indices match the list.
     v_flex()
+        .id("bounty-list")
         .w(px(300.))
         .flex_shrink_0()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .track_scroll(&shell.bounty_list_scroll)
         .gap(px(8.))
+        .pb(px(12.))
         .children(body)
         .into_any_element()
 }
@@ -251,6 +264,22 @@ fn claim_card(claim: &Claim) -> AnyElement {
 
     match &claim.auto_payment {
         Some(row) => {
+            // The poll can miss the short-lived `attempting` state entirely.
+            // The row's created_at IS when the attempt started, so the beat
+            // renders retroactively and the timeline never jumps straight
+            // from "Claim submitted" to "Paid".
+            if row.state != "attempting"
+                && let Some(started) = row.created_at.filter(|ts| *ts > 0) {
+                    rows.push(timeline_row(
+                        ACCENT,
+                        "Auto-pay attempted".into(),
+                        Some(format!(
+                            "{} UTC · {}",
+                            timefmt::hhmmss_utc(started),
+                            timefmt::relative(now, started)
+                        )),
+                    ));
+                }
             let amount = row
                 .amount_sats
                 .map(|sats| format!("{} sats", timefmt::fmt_sats(sats)));
@@ -410,7 +439,13 @@ fn detail_pane(shell: &Shell) -> AnyElement {
                 .py(px(8.))
                 .text_size(px(12.))
                 .text_color(rgb(TEXT_DIM))
-                .child("Loading claims…")
+                .child(if shell.selected_is_optimistic() {
+                    // The header above renders the just-submitted values; be
+                    // honest that the server has not echoed them back yet.
+                    "Created — syncing with the instance…"
+                } else {
+                    "Loading claims…"
+                })
                 .into_any_element(),
         ],
         Some(detail) if detail.claims.is_empty() => vec![
@@ -425,9 +460,13 @@ fn detail_pane(shell: &Shell) -> AnyElement {
     };
     let claim_count = detail.map(|d| d.claims.len()).unwrap_or(0);
 
+    // Header (title / status / metrics / "Claims" heading) is laid out as
+    // fixed children; ONLY the claim list below them scrolls — the header
+    // stays pinned while a long claim list moves under it.
     v_flex()
         .flex_1()
         .min_w(px(0.))
+        .min_h(px(0.))
         .bg(rgb(BG_CARD))
         .border_1()
         .border_color(rgb(BORDER))
@@ -481,7 +520,16 @@ fn detail_pane(shell: &Shell) -> AnyElement {
                     this.child(count_badge(claim_count.to_string()))
                 }),
         )
-        .child(v_flex().gap(px(8.)).children(claims))
+        .child(
+            v_flex()
+                .id("claim-list")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .gap(px(8.))
+                .pb(px(8.))
+                .children(claims),
+        )
         .into_any_element()
 }
 
@@ -612,6 +660,8 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
     };
 
     v_flex()
+        .flex_1()
+        .min_h(px(0.))
         .child(
             h_flex()
                 .gap(px(14.))
@@ -643,9 +693,13 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
         )
         .children(forms(shell, cx))
         .child(
+            // Both panes run the remaining height and scroll independently;
+            // the screen itself never scrolls (see Shell::main).
             h_flex()
+                .flex_1()
+                .min_h(px(0.))
                 .gap(px(16.))
-                .items_start()
+                .items_stretch()
                 .child(list_pane(shell, cx))
                 .child(detail_pane(shell)),
         )

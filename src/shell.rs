@@ -273,10 +273,21 @@ pub struct Shell {
     pub(crate) selected: Option<String>,
     /// Latest full snapshot per watched bounty, straight from the runtime.
     pub(crate) details: HashMap<String, BountyDetail>,
+    /// A just-created bounty, rebuilt from the submitted form values, shown
+    /// until the server list/detail catches up — so the detail pane never
+    /// flashes "Loading bounty…" right after go-live.
+    optimistic: Option<Bounty>,
     pub(crate) bounty_form: Option<BountyForm>,
     pub(crate) claim_form: Option<ClaimForm>,
     /// The bounty half of a submitted form, parked while the DList publishes.
     pending_bounty: Option<CreateBounty>,
+    /// The request as it went to the server (coordinate filled in), kept so
+    /// `BountyCreated` can build the optimistic card from real values.
+    submitted_bounty: Option<CreateBounty>,
+    /// Scrolls the bounty list; `scroll_to` is the id to bring into view once
+    /// the list containing it arrives.
+    pub(crate) bounty_list_scroll: ScrollHandle,
+    scroll_to: Option<String>,
     commands: mpsc::UnboundedSender<Command>,
     chat: Entity<Chat>,
     search: Entity<InputState>,
@@ -342,9 +353,13 @@ impl Shell {
             bounties: Load::Loading,
             selected: None,
             details: HashMap::new(),
+            optimistic: None,
             bounty_form: None,
             claim_form: None,
             pending_bounty: None,
+            submitted_bounty: None,
+            bounty_list_scroll: ScrollHandle::new(),
+            scroll_to: None,
             commands,
             chat,
             search: cx.new(|cx| {
@@ -375,9 +390,23 @@ impl Shell {
         if let Some(detail) = self.details.get(id) {
             return Some(&detail.bounty);
         }
-        match &self.bounties {
-            Load::Ready(list) => list.iter().find(|b| b.id == id),
-            _ => None,
+        if let Load::Ready(list) = &self.bounties
+            && let Some(bounty) = list.iter().find(|b| b.id == id) {
+                return Some(bounty);
+            }
+        // Server data always wins; the optimistic copy only fills the gap
+        // between BountyCreated and the first list/detail that includes it.
+        self.optimistic.as_ref().filter(|b| b.id == id)
+    }
+
+    /// True while the selected bounty renders from the optimistic copy — the
+    /// detail pane says "syncing" instead of pretending claims were checked.
+    pub(crate) fn selected_is_optimistic(&self) -> bool {
+        match (&self.selected, &self.optimistic) {
+            (Some(id), Some(bounty)) => {
+                bounty.id == *id && !self.details.contains_key(id)
+            }
+            _ => false,
         }
     }
 
@@ -436,6 +465,20 @@ impl Shell {
                     && let Some(first) = list.first() {
                         self.select(first.id.clone());
                     }
+                // The server list now carries the just-created bounty: the
+                // optimistic copy has done its job.
+                if let Some(bounty) = &self.optimistic
+                    && list.iter().any(|b| b.id == bounty.id) {
+                        self.optimistic = None;
+                    }
+                // A bounty created this session scrolls into view as soon as
+                // it exists in the list.
+                if let Some(target) = self.scroll_to.take() {
+                    match list.iter().position(|b| b.id == target) {
+                        Some(ix) => self.bounty_list_scroll.scroll_to_item(ix),
+                        None => self.scroll_to = Some(target),
+                    }
+                }
                 self.bounties = Load::Ready(list);
             }
             Update::BountiesFailed(message) => {
@@ -446,6 +489,9 @@ impl Shell {
                 self.push_activity(RED, format!("Bounty list failed: {message}"), now);
             }
             Update::BountyDetail(detail) => {
+                if self.optimistic.as_ref().is_some_and(|b| b.id == detail.bounty.id) {
+                    self.optimistic = None;
+                }
                 self.details.insert(detail.bounty.id.clone(), *detail);
             }
             Update::DListPublished {
@@ -460,6 +506,9 @@ impl Shell {
                 if account == Account::Issuer
                     && let Some(mut req) = self.pending_bounty.take() {
                         req.list_coordinate = coordinate;
+                        // Kept so BountyCreated can build the optimistic card
+                        // from the exact values the server was sent.
+                        self.submitted_bounty = Some(req.clone());
                         let _ = self.commands.unbounded_send(Command::CreateBounty {
                             account: Account::Issuer,
                             req,
@@ -475,6 +524,12 @@ impl Shell {
                 self.bounty_form = None;
                 self.focus.focus(window, cx);
                 self.selected = Some(id.clone());
+                // The detail pane shows the submitted values immediately; the
+                // watch's first snapshot (or the refreshed list) replaces them.
+                if let Some(req) = self.submitted_bounty.take() {
+                    self.optimistic = Some(optimistic_bounty(&id, req, &self.issuer, now));
+                }
+                self.scroll_to = Some(id.clone());
                 let _ = self.commands.unbounded_send(Command::WatchBounty { id });
                 let _ = self.commands.unbounded_send(Command::FetchBounties);
             }
@@ -548,6 +603,7 @@ impl Shell {
                                 form.submitting = false;
                                 form.error = Some(message.clone());
                                 self.pending_bounty = None;
+                                self.submitted_bounty = None;
                             }
                     }
                     ErrorSource::Claim => {
@@ -1105,7 +1161,15 @@ impl Shell {
 
         // The three cards are the issuer's live bounty economics; before the
         // list loads (or when it failed) they say so instead of guessing.
-        let (open_value, committed, paid_out, note): (
+        //
+        // The money-out card counts SETTLED (receipted) payouts only: the
+        // list endpoint's paymentState is the one dataset loaded for every
+        // bounty, and its paidRewardCount excludes paid_unreceipted rows —
+        // sats can leave the wallet before any receipt lands. Per-claim
+        // autoPayment rows exist only for watched bounties, so summing them
+        // would silently undercount. The label says exactly what is counted,
+        // so the sidebar can never contradict a claim card.
+        let (open_value, committed, settled, note): (
             SharedString,
             SharedString,
             SharedString,
@@ -1121,7 +1185,7 @@ impl Shell {
                     .filter_map(|b| b.payment_state.as_ref())
                     .map(|s| s.open_reward_slots * s.reward_amount_sats)
                     .sum();
-                let paid: u64 = list
+                let settled: u64 = list
                     .iter()
                     .filter_map(|b| b.payment_state.as_ref())
                     .map(|s| s.paid_reward_count * s.reward_amount_sats)
@@ -1129,7 +1193,7 @@ impl Shell {
                 (
                     open.len().to_string().into(),
                     timefmt::fmt_sats(committed).into(),
-                    timefmt::fmt_sats(paid).into(),
+                    timefmt::fmt_sats(settled).into(),
                     Some(format!("{} bounties total", list.len()).into()),
                 )
             }
@@ -1236,12 +1300,12 @@ impl Shell {
                 Some("open reward slots".into()),
             ))
             .child(Self::stat_card(
-                "PAID OUT",
-                paid_out,
+                "SETTLED TO DATE",
+                settled,
                 Some("sats"),
                 GREEN,
                 GREEN_DIM,
-                Some("auto-pay to date".into()),
+                Some("receipted auto-pay".into()),
             ))
     }
 
@@ -1343,21 +1407,20 @@ impl Shell {
                         .child(dashboard::render(self, cx)),
                 )
                 .into_any_element(),
-            Screen::Bounties => div()
-                .id("bounties")
+            // The Bounties screen does NOT scroll as one page: the list pane
+            // and the claim list each scroll on their own, so the detail
+            // pane's header (title / status / metrics) stays pinned while the
+            // claims scroll under it.
+            Screen::Bounties => v_flex()
                 .flex_1()
                 .min_h(px(0.))
-                .overflow_y_scroll()
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(980.))
-                        .mx_auto()
-                        .px(px(28.))
-                        .pt(px(26.))
-                        .pb(px(60.))
-                        .child(bounties::render(self, cx)),
-                )
+                .w_full()
+                .max_w(px(980.))
+                .mx_auto()
+                .px(px(28.))
+                .pt(px(26.))
+                .pb(px(20.))
+                .child(bounties::render(self, cx))
                 .into_any_element(),
             Screen::Chat => v_flex()
                 .flex_1()
@@ -1371,6 +1434,30 @@ impl Shell {
                 .into_any_element(),
             other => Self::placeholder(other).into_any_element(),
         }
+    }
+}
+
+/// The just-created bounty, rebuilt from the values the server was actually
+/// sent, so the detail pane renders them instantly. Server data replaces it
+/// as soon as the first list/detail arrives — this is a stopgap for the
+/// seconds in between, never a source of record.
+fn optimistic_bounty(id: &str, req: CreateBounty, issuer: &AccountView, now: u64) -> Bounty {
+    Bounty {
+        id: id.to_string(),
+        issuer_pubkey: issuer.pubkey.clone().unwrap_or_default(),
+        list_coordinate: req.list_coordinate,
+        amount_sats: req.amount_sats,
+        criteria: Some(req.criteria).filter(|c| !c.is_empty()),
+        expiration: None,
+        created_at: Some(now),
+        status: Some("open".into()),
+        bounty_cap_sats: req.bounty_cap_sats,
+        reward_per_item: Some(serde_json::Value::Bool(req.reward_per_item)),
+        max_rewards_per_npub: req.max_rewards_per_npub,
+        auto_pay: Some(serde_json::Value::Bool(req.auto_pay)),
+        auto_pay_min_rank: req.auto_pay_min_rank,
+        derived_status: Some("open".into()),
+        payment_state: None,
     }
 }
 

@@ -670,6 +670,16 @@ impl WatchLedger {
     }
 }
 
+/// Whether a bounty watch may stop for good. `paid_unreceipted`
+/// (`receipt_timeout`) is NOT terminal for the watch while the bounty is
+/// open: the money already left the wallet and the receipt can still import
+/// late, and only the poll notices the server row flip to `settled` (or a
+/// `zapReceipt` appear). The watch stops only when the bounty itself can
+/// never pay again AND nothing is in flight.
+fn watch_done(detail: &BountyDetail, pending: bool) -> bool {
+    TERMINAL_STATUSES.contains(&detail.bounty.effective_status()) && !pending
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -727,10 +737,10 @@ async fn watch_bounty(
                 }
                 // A bounty that can never pay again, with nothing in flight,
                 // needs no watcher at all: stop. A later re-watch (the user
-                // re-selecting it) does one fresh poll and stops again.
-                let terminal =
-                    TERMINAL_STATUSES.contains(&detail.bounty.effective_status());
-                if terminal && !pending {
+                // re-selecting it) does one fresh poll and stops again. An
+                // open bounty with a paid_unreceipted claim is NOT done — the
+                // slow poll below is what catches a late receipt.
+                if watch_done(&detail, pending) {
                     if let Some(sub) = sub_slot.lock().await.take() {
                         let _ = client.unsubscribe(&sub).await;
                     }
@@ -922,6 +932,68 @@ mod tests {
             amount_msats: None,
         };
         assert!(!ledger.note_relay_receipt(&stranger));
+    }
+
+    #[test]
+    fn a_late_receipt_still_lands_after_paid_unreceipted() {
+        // The live failure mode (rehearsal 08-01, "toronto" 08-11): the
+        // server times out waiting for the receipt and parks the row at
+        // paid_unreceipted — then the receipt imports later anyway.
+        let mut early: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        early["bounty"]["derivedStatus"] = "open".into();
+        early["claims"][0]["autoPayment"]["state"] = "paid_unreceipted".into();
+        early["claims"][0]["autoPayment"]["reason"] = "receipt_timeout".into();
+        early["claims"][0].as_object_mut().unwrap().remove("zapReceipt");
+        let early = parse_detail(&early.to_string()).unwrap();
+
+        let mut ledger = WatchLedger::new("5f44688e-fcb3-4c6a-bee6-e287995f7d3e");
+        let (updates, pending) = ledger.ingest_detail(&early, NOW);
+        assert_eq!(
+            updates,
+            vec![Update::PaymentState {
+                bounty_id: "5f44688e-fcb3-4c6a-bee6-e287995f7d3e".into(),
+                claim_event_id: CLAIM_ID.into(),
+                state: "paid_unreceipted".into(),
+                reason: Some("receipt_timeout".into()),
+                ts: 1_786_093_481,
+            }]
+        );
+        assert!(!pending, "no receipt decision is in flight — no fast poll");
+        // The watch must stay LIVE: the bounty is open, so the slow poll
+        // keeps running and can still see the row flip.
+        assert!(
+            !watch_done(&early, pending),
+            "paid_unreceipted on an open bounty must not stop the watch"
+        );
+
+        // Later the server row flips to settled and the receipt imports. The
+        // pristine fixture IS that snapshot: exactly one PaymentState
+        // (settled) and one ReceiptSeen come out — the card and feed update.
+        let late = parse_detail(FIXTURE).unwrap();
+        let (updates, _) = ledger.ingest_detail(&late, NOW);
+        assert_eq!(
+            updates,
+            vec![
+                Update::PaymentState {
+                    bounty_id: "5f44688e-fcb3-4c6a-bee6-e287995f7d3e".into(),
+                    claim_event_id: CLAIM_ID.into(),
+                    state: "settled".into(),
+                    reason: None,
+                    ts: 1_786_093_481,
+                },
+                Update::ReceiptSeen {
+                    bounty_id: "5f44688e-fcb3-4c6a-bee6-e287995f7d3e".into(),
+                    receipt_id:
+                        "b3b3f887aab52d97796777aeac056f72ddaf745fd98329a3fcdb9ac37ba332c7".into(),
+                    secs_from_claim: 27,
+                    at: 1_786_093_481,
+                },
+            ]
+        );
+
+        // And only once: the same settled snapshot again stays silent.
+        let (updates, _) = ledger.ingest_detail(&late, NOW);
+        assert!(updates.is_empty());
     }
 
     /// A one-claim detail with no payment row, shaped like the live API.

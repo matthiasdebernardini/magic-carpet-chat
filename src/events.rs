@@ -4,8 +4,10 @@
 //! - d-tags mirror magic-carpet-v2/src/lib/dtag.js (`slug`, `hash8`,
 //!   `headerDTag`, `childDTag`) — SHA-256, first 8 hex chars.
 //! - The DList header mirrors ui/src/pages/lists/NewDList.jsx.
-//! - The claim mirrors ui/src/pages/lists/NewDListItem.jsx (the UI shape, so
-//!   demo-audit shows the claim name).
+//! - The claim carries the item name in BOTH the content (the shape the
+//!   proven CLI-paid claims used) and the `name` tag (the shape
+//!   NewDListItem.jsx publishes and the tapestry web UI reads), so every
+//!   consumer — server, web UI, demo-audit, older tooling — sees the name.
 //! - Receipt parsing mirrors src/api/bounties.js: the payer identity is the
 //!   pubkey inside the description-tag JSON, never the receipt's own pubkey
 //!   (that one belongs to the LNURL provider's zapper).
@@ -123,10 +125,13 @@ pub fn dlist_header(
         .map_err(|e| EventError::Sign(e.to_string()))
 }
 
-/// Signed kind-39999 claim, the shape NewDListItem.jsx publishes: content "",
-/// `["d", childDTag]`, exactly one `["z", coordinate]`, `["name", name]`.
-/// Must go out through POST /api/strfry/publish — a claim published anywhere
-/// else is invisible to the bounty machinery.
+/// Signed kind-39999 claim: `["d", childDTag]`, exactly one
+/// `["z", coordinate]`, `["name", name]` — and the item name in the content
+/// as well. The proven CLI-paid claims carried the name in the content while
+/// the web UI reads the `name` tag; writing both is harmless and keeps the
+/// claim legible to every consumer. Must go out through
+/// POST /api/strfry/publish — a claim published anywhere else is invisible to
+/// the bounty machinery.
 pub fn claim(keys: &Keys, name: &str, list_coordinate: &str) -> Result<Event, EventError> {
     let name = name.trim();
     if name.is_empty() {
@@ -142,7 +147,7 @@ pub fn claim(keys: &Keys, name: &str, list_coordinate: &str) -> Result<Event, Ev
             "\"{name}\" slugs to an empty d-tag"
         )));
     }
-    EventBuilder::new(Kind::Custom(CLAIM_KIND), "")
+    EventBuilder::new(Kind::Custom(CLAIM_KIND), name)
         .tags([
             tag(["d", dtag.as_str()])?,
             tag(["z", list_coordinate])?,
@@ -295,11 +300,13 @@ mod tests {
     }
 
     #[test]
-    fn claim_matches_the_ui_shape_exactly() {
+    fn claim_carries_the_name_in_both_content_and_tag() {
         let keys = Keys::generate();
         let event = claim(&keys, "Memphis", COORD).unwrap();
         assert_eq!(event.kind.as_u16(), CLAIM_KIND);
-        assert_eq!(event.content, "");
+        // The proven CLI-paid claims put the item name in the content; the
+        // web UI reads the name tag. The claim carries both.
+        assert_eq!(event.content, "Memphis");
         assert!(event.verify().is_ok());
         assert_eq!(
             tags_of(&event),
