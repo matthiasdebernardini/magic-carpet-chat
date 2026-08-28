@@ -13,7 +13,7 @@ use magic_carpet_chat::nostr;
 use magic_carpet_chat::secrets::Account;
 
 use crate::palette::*;
-use crate::shell::{ActivityItem, Load, Shell, fallback_name};
+use crate::shell::{ActivityItem, Load, Shell};
 use crate::timefmt;
 
 /// The mock's monospace face, used for every sats figure and every npub.
@@ -96,22 +96,25 @@ struct Attention {
 /// list renders as an explicit all-clear instead of an empty card.
 fn attention_rows(shell: &Shell) -> Vec<Attention> {
     let mut rows = Vec::new();
-    for account in Account::ALL {
-        if shell.view(account).missing {
-            rows.push(Attention {
-                dot: RED,
-                title: format!("Import the {account} key"),
-                description: format!(
-                    "No key stored for {} — run --import-keys with {} set, then relaunch.",
-                    fallback_name(account),
-                    match account {
-                        Account::Issuer => "MC_ISSUER_NSEC",
-                        Account::Claimant => "MC_CLAIMANT_NSEC",
-                    }
-                ),
-                retry: false,
-            });
-        }
+    // Only the CLAIMANT key gates anything a user can do here — claims are
+    // signed with it. A missing ISSUER key is deliberately NOT a row: the
+    // app lists the house issuer's bounties without one, claiming never
+    // needs it, and steering a claimant at the issuer slot would replace
+    // the bounty list with their own (empty) one.
+    if shell.view(Account::Claimant).missing {
+        let description = if shell.account == Account::Claimant {
+            "No key for the Claimant account — paste your nsec in the sidebar \
+             input to claim and get paid. It stays in this Mac's keychain."
+        } else {
+            "No key for the Claimant account — press ⌘] to switch to it, then \
+             paste your nsec in the sidebar input."
+        };
+        rows.push(Attention {
+            dot: TEXT_DIM,
+            title: "Read-only — import a key to claim".into(),
+            description: description.into(),
+            retry: false,
+        });
     }
     if !shell.relay_connected {
         rows.push(Attention {
@@ -187,10 +190,18 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
 }
 
 fn all_clear(shell: &Shell) -> AnyElement {
+    // "Keys loaded" may only be claimed when it is true of BOTH accounts —
+    // an issuer-keyless claimant still reaches this row (that gap is not an
+    // attention item), so the text drops the claim instead of lying.
+    let all_keys = Account::ALL
+        .into_iter()
+        .all(|account| shell.view(account).npub.is_some());
     let (dot, text): (u32, &str) = if matches!(shell.bounties, Load::Loading) {
         (TEXT_DIM, "Loading the bounty list…")
-    } else {
+    } else if all_keys {
         (GREEN, "All clear — keys loaded, relay connected, bounty list live.")
+    } else {
+        (GREEN, "All clear — relay connected, bounty list live.")
     };
     h_flex()
         .gap(px(11.))
@@ -306,6 +317,9 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
         Account::Issuer => "+ New DList + bounty",
         Account::Claimant => "+ Claim an item",
     };
+    // With no key for the active account the CTA cannot do what it says —
+    // it dims, and a click (like ⌘N) routes to the sidebar key input.
+    let keyless = shell.view(shell.account).missing;
 
     v_flex()
         .child(
@@ -333,14 +347,22 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                         .px(px(18.))
                         .py(px(9.))
                         .rounded(px(9.))
-                        .bg(grad(ACCENT, ACCENT_DEEP))
                         .cursor_pointer()
-                        .shadow(vec![
-                            BoxShadow::new(px(0.), px(4.), wash(ACCENT_GLOW)).blur_radius(px(14.)),
-                        ])
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(BG_RAIL))
+                        .when(!keyless, |this| {
+                            this.bg(grad(ACCENT, ACCENT_DEEP))
+                                .shadow(vec![
+                                    BoxShadow::new(px(0.), px(4.), wash(ACCENT_GLOW))
+                                        .blur_radius(px(14.)),
+                                ])
+                                .text_color(rgb(BG_RAIL))
+                        })
+                        .when(keyless, |this| {
+                            this.border_1()
+                                .border_color(rgb(BORDER_3))
+                                .text_color(rgb(TEXT_DIM))
+                        })
                         .child(action_label)
                         .on_click(cx.listener(|this, _, window, cx| this.new_item(window, cx))),
                 ),

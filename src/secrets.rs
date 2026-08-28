@@ -58,6 +58,17 @@ pub enum SecretError {
     /// pieces of its input, and this message may end up in a log.
     #[error("{0} is not an nsec or 64-char hex secret key")]
     InvalidKey(&'static str),
+    /// The pasted-key path. Same rule as `InvalidKey`: no parser detail, no
+    /// echo of the input — this string is shown on screen and may be logged.
+    #[error("That doesn't look like a key — paste an nsec1… string or 64 hex characters")]
+    NotAKey,
+    /// An npub — the half every client shows on the profile page. Right key
+    /// family, wrong half: say so, and say where the right one lives.
+    #[error(
+        "That's your public key — the app needs your secret key, which starts \
+         with nsec1. Find it in your Nostr app under Settings > Keys."
+    )]
+    PublicKeyPasted,
 }
 
 /// A string that refuses to print itself.
@@ -105,6 +116,37 @@ pub fn store_nsec(account: Account, nsec: &Secret) -> Result<(), SecretError> {
     entry(account)?
         .set_password(nsec.expose())
         .map_err(|e| SecretError::Keyring(e.to_string()))
+}
+
+/// "Forget this key": delete the keychain entry. An entry that was never
+/// stored is already forgotten, so `NoEntry` is success. An env override is
+/// NOT touched — env wins on the next load, and lying about that would be
+/// worse than showing the key come back.
+pub fn forget_nsec(account: Account) -> Result<(), SecretError> {
+    match entry(account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(SecretError::Keyring(e.to_string())),
+    }
+}
+
+/// Validate a user-pasted secret: `nsec1…` bech32 or 64 hex characters.
+/// The shape is checked here, before nostr's parser, so the error can be
+/// specific without ever carrying the input.
+pub fn parse_secret(secret: &Secret) -> Result<Keys, SecretError> {
+    let raw = secret.expose().trim();
+    // bech32 is case-insensitive in practice for a paste: normalise once so
+    // an uppercased nsec/npub is recognised too.
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("npub1") {
+        // The most likely wrong paste from a non-technical user: their
+        // public key, copied off any client's profile screen.
+        return Err(SecretError::PublicKeyPasted);
+    }
+    let is_hex = raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit());
+    if !lower.starts_with("nsec1") && !is_hex {
+        return Err(SecretError::NotAKey);
+    }
+    Keys::parse(&lower).map_err(|_| SecretError::NotAKey)
 }
 
 /// Env override first, then the keychain. `Ok(None)` means no key anywhere.
@@ -183,5 +225,80 @@ mod tests {
             err.to_string(),
             "MC_ISSUER_NSEC is not an nsec or 64-char hex secret key"
         );
+    }
+
+    #[test]
+    fn parse_secret_accepts_a_valid_nsec() {
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        let parsed = parse_secret(&Secret::new(nsec)).unwrap();
+        assert_eq!(parsed.public_key(), keys.public_key());
+    }
+
+    #[test]
+    fn parse_secret_accepts_64_char_hex_in_either_case() {
+        let keys = Keys::generate();
+        let hex = keys.secret_key().to_secret_hex();
+        assert_eq!(hex.len(), 64);
+        let parsed = parse_secret(&Secret::new(hex.clone())).unwrap();
+        assert_eq!(parsed.public_key(), keys.public_key());
+        // Uppercase hex is the same key.
+        let parsed = parse_secret(&Secret::new(hex.to_ascii_uppercase())).unwrap();
+        assert_eq!(parsed.public_key(), keys.public_key());
+    }
+
+    #[test]
+    fn parse_secret_trims_surrounding_whitespace() {
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        let parsed = parse_secret(&Secret::new(format!("  {nsec}\n"))).unwrap();
+        assert_eq!(parsed.public_key(), keys.public_key());
+    }
+
+    #[test]
+    fn parse_secret_rejects_garbage_without_echoing_it() {
+        for bad in [
+            "hello world",
+            "nsec1qqqqqqqq",               // nsec-shaped, bad checksum
+            "abc123",                      // hex, wrong length
+            &"a".repeat(63),               // one short of 64
+            &"a".repeat(65),               // one past 64
+            &"g".repeat(64),               // 64 chars, not hex
+            "",
+        ] {
+            let err = parse_secret(&Secret::new(bad)).unwrap_err();
+            let message = err.to_string();
+            assert_eq!(
+                message,
+                "That doesn't look like a key — paste an nsec1… string or 64 hex characters"
+            );
+            if !bad.is_empty() {
+                assert!(!message.contains(bad), "echoed input: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_secret_tells_a_pasted_npub_apart() {
+        // A real npub, an npub-shaped junk string, and an uppercased npub all
+        // get the "that's your public key" message — never the generic one,
+        // and never an echo.
+        let real = Keys::generate().public_key().to_bech32().unwrap();
+        for npub in [real.clone(), "npub1xyz".to_string(), real.to_ascii_uppercase()] {
+            let err = parse_secret(&Secret::new(npub.clone())).unwrap_err();
+            assert!(matches!(err, SecretError::PublicKeyPasted));
+            let message = err.to_string();
+            assert!(message.contains("public key"), "wrong message: {message}");
+            assert!(message.contains("nsec1"), "no pointer to the fix: {message}");
+            assert!(!message.contains(&npub), "echoed input: {message}");
+        }
+    }
+
+    #[test]
+    fn parse_secret_accepts_an_uppercased_nsec() {
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap().to_ascii_uppercase();
+        let parsed = parse_secret(&Secret::new(nsec)).unwrap();
+        assert_eq!(parsed.public_key(), keys.public_key());
     }
 }

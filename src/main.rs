@@ -14,6 +14,7 @@ mod bounties;
 mod chat;
 mod dashboard;
 mod icons;
+mod onboarding;
 mod palette;
 mod shell;
 mod timefmt;

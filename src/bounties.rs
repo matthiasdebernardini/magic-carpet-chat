@@ -658,6 +658,9 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
         Account::Issuer => "+ New DList + bounty (⌘N)",
         Account::Claimant => "+ Claim selected (⌘N)",
     };
+    // No key for the active account: the CTA dims, and a click (like ⌘N)
+    // routes to the sidebar key input instead of a form that cannot submit.
+    let keyless = shell.view(shell.account).missing;
 
     v_flex()
         .flex_1()
@@ -682,11 +685,17 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                         .px(px(16.))
                         .py(px(8.))
                         .rounded(px(9.))
-                        .bg(grad(ACCENT, ACCENT_DEEP))
                         .cursor_pointer()
                         .text_size(px(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(BG_RAIL))
+                        .when(!keyless, |this| {
+                            this.bg(grad(ACCENT, ACCENT_DEEP)).text_color(rgb(BG_RAIL))
+                        })
+                        .when(keyless, |this| {
+                            this.border_1()
+                                .border_color(rgb(BORDER_3))
+                                .text_color(rgb(TEXT_DIM))
+                        })
                         .child(action_label)
                         .on_click(cx.listener(|this, _, window, cx| this.new_item(window, cx))),
                 ),

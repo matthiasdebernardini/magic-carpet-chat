@@ -5,7 +5,24 @@ path is also the only one automation can drive. The app never pays anything —
 the prod watcher pays; this app publishes lists and claims and watches the
 money move.
 
-## One-time setup
+## First launch (David)
+
+1. **Get past Gatekeeper once.** The app is not signed, so macOS blocks the
+   first open: double-click the app, click **Done** on the "could not verify"
+   dialog (NOT "Move to Trash"), then open **System Settings →
+   Privacy & Security**, scroll to *"Magic Carpet Chat" was blocked*, click
+   **Open Anyway**, then **Open**. macOS asks this once. (The zip ships a
+   "READ ME FIRST.txt" with the same steps.)
+2. The app opens on the onboarding screen when no key is stored anywhere.
+3. Paste your Nostr secret key into the masked field and press `Enter`. It
+   starts with `nsec1` — copy it from your Nostr app (Settings > Keys in
+   Primal or Damus). The app stores it in the Mac keychain, shows your npub,
+   your profile name, and whether the profile has a Lightning address
+   (payouts need one — without it, claims are accepted but never paid).
+4. Press `Enter` again (Start) — or press `esc` at any point to just look
+   around read-only.
+
+## One-time setup (operator)
 
 1. Import both keys (secrets live in `magic-carpet-v2/.fallow/` — never print them):
 
@@ -14,7 +31,9 @@ money move.
    ```
 
    It prints the two npubs and exits. Keys land in the macOS keychain under
-   `magic-carpet-chat`.
+   `magic-carpet-chat`. The `MC_ISSUER_NSEC`/`MC_CLAIMANT_NSEC` env vars also
+   work directly at launch — env wins over the keychain, and a key in the env
+   skips the onboarding.
 
 2. Build fresh: `/Users/md/.cargo/bin/cargo build --release`.
 
@@ -43,6 +62,18 @@ money move.
 
 - `esc` inside a field cancels the form only when the field has nothing of its
   own to do with it; `⌘.` cancels from anywhere, always.
+- `⌘]` into an account with no key opens the sidebar's paste-a-key input with
+  the caret in it — and while that input has focus, `⌘[`/`⌘]` indent instead of
+  switching accounts. `esc` closes the input and hands focus back.
+- On the onboarding screen, `esc` is "just look around" (read-only dashboard).
+- The ISSUER key slot is operator-only: importing a key there changes whose
+  bounties the app lists (a claimant who pastes their own nsec as issuer sees
+  an empty list). Claiming never needs an issuer key — the app reads the house
+  issuer's bounties without one, and the issuer input says so in amber.
+- `⌘N` (or the claim/new-bounty button) with no key for the active account
+  opens the sidebar key input instead of a form.
+- "Forget this key" (under the account name in the sidebar) deletes the
+  keychain entry only. A key set through the env vars survives it — env wins.
 - Selecting an old bounty replays its historical payment facts into the
   activity feed once, with their real (old) timestamps. That is the watch
   reporting each fact exactly once, not a bug.

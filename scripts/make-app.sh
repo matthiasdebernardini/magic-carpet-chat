@@ -5,8 +5,16 @@
 #   binary      defaults to target/release/magic-carpet-chat
 #   output-dir  defaults to dist
 #
-# Writes "<output-dir>/Magic Carpet.app" and prints its path.
-# The bundle is unsigned. Sign it after this script runs.
+# Writes "<output-dir>/Magic Carpet Chat.app" and prints its path, plus a
+# "READ ME FIRST.txt" with the Gatekeeper steps — add that file to the zip
+# root when distributing (macOS blocks unsigned apps on first open, and the
+# recipient has no other way to learn the Open Anyway dance):
+#
+#   ditto -c -k --keepParent "<output-dir>/Magic Carpet Chat.app" app.zip
+#   (cd "<output-dir>" && zip -X app.zip "READ ME FIRST.txt")
+#
+# The bundle is unsigned. Sign and notarize it after this script runs if a
+# Developer ID is available.
 set -euo pipefail
 
 BIN=${1:-target/release/magic-carpet-chat}
@@ -71,5 +79,22 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# The first-open instructions. Ships at the zip root, because a non-technical
+# recipient hits Gatekeeper before the app can show them anything.
+cat > "$OUT_DIR/READ ME FIRST.txt" <<'TXT'
+Magic Carpet Chat — how to open it the first time
+
+This app is not signed with an Apple Developer ID yet, so macOS blocks the
+first launch. This is expected. To open it:
+
+1. Double-click "Magic Carpet Chat.app". macOS says it could not verify the
+   app. Click "Done" — NOT "Move to Trash".
+2. Open System Settings > Privacy & Security.
+3. Scroll down to: "Magic Carpet Chat" was blocked to protect your Mac.
+4. Click "Open Anyway", then "Open" (enter your Mac password if asked).
+
+macOS asks this once. After that, the app opens normally.
+TXT
 
 echo "$APP"

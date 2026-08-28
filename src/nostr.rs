@@ -22,9 +22,15 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::api::{Api, ApiError, Bounty, BountyDetail, CreateBounty};
 use crate::events::{self, EventError};
-use crate::secrets::{self, Account, SecretError};
+use crate::secrets::{self, Account, Secret, SecretError};
 
 pub const INSTANCE_RELAY: &str = "wss://magic-carpet.brainstorm.world/relay";
+
+/// The instance's house issuer — PUBLIC key material only. Read-only browsing
+/// lists this issuer's bounties when no issuer key is imported, so the app
+/// works with no key at all. `MC_ISSUER_NPUB` overrides it.
+pub const HOUSE_ISSUER_HEX: &str =
+    "853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba";
 
 /// How long a claim with no `auto_payments` row keeps the fast poll. On prod
 /// the watcher creates the row within one tick, so a rowless claim older than
@@ -72,6 +78,15 @@ pub enum Command {
         name: String,
         list_coordinate: String,
     },
+    /// Validate a pasted secret, store it in the keychain, and announce the
+    /// account: `AccountLoaded` (+ `ProfileLoaded` when a kind-0 exists), then
+    /// `ImportReady` with the onboarding summary — or `ImportFailed` with a
+    /// message that never echoes the input. The secret rides the channel
+    /// inside [`Secret`], so a stray `{:?}` on a `Command` cannot leak it.
+    ImportKey { account: Account, secret: Secret },
+    /// Delete the account's keychain entry, then re-announce whatever is
+    /// still true (an env override survives a forget — env wins).
+    ForgetKey { account: Account },
     /// Follow one bounty: receipts by `#e` on the relay, plus the API's
     /// payment state machine while a claim is pending. Idempotent — a bounty
     /// already being watched is left alone. At most one bounty is watched at
@@ -111,8 +126,8 @@ pub enum Update {
         pubkey: String,
         npub: String,
     },
-    /// No key stored for this account — the UI shows the --import-keys setup
-    /// state instead of inventing an identity.
+    /// No key stored for this account — the UI offers the paste-a-key import
+    /// instead of inventing an identity.
     AccountMissing { account: Account },
     /// The account's kind-0, as far as it goes. Missing fields stay `None`
     /// and the UI falls back to its local labels.
@@ -120,6 +135,27 @@ pub enum Update {
         account: Account,
         name: Option<String>,
         picture: Option<String>,
+        /// The Lightning address payouts go to. Its absence is a first-class
+        /// fact: the onboarding warns, because a payout needs one.
+        lud16: Option<String>,
+    },
+    /// A pasted key was rejected. The message is fixed text from
+    /// [`SecretError`] — it never echoes the input.
+    ImportFailed { account: Account, message: String },
+    /// A pasted key is stored and its profile probe finished. Only public
+    /// material: the npub, and what the kind-0 said.
+    ImportReady {
+        account: Account,
+        npub: String,
+        name: Option<String>,
+        lud16: Option<String>,
+        /// False when the profile probe itself failed (network, API): the
+        /// lud16 line then says "couldn't check" instead of claiming "none".
+        profile_checked: bool,
+        /// The probe worked but found NO kind-0 at all — the strongest hint
+        /// the pasted key is not the one its owner thinks it is (e.g. a hex
+        /// PUBLIC key, which parses as a plausible secret key).
+        profile_found: bool,
     },
     /// The issuer's bounty list, freshly fetched.
     Bounties(Vec<Bounty>),
@@ -171,7 +207,7 @@ pub struct NostrHandle {
 
 #[derive(thiserror::Error, Debug)]
 enum BridgeError {
-    #[error("no {0} key stored — run with --import-keys first")]
+    #[error("You need a {0} key for this — paste your nsec in the sidebar first")]
     NoKey(Account),
     #[error(transparent)]
     Secret(#[from] SecretError),
@@ -281,6 +317,16 @@ async fn run(
             }
             Command::FetchBounties => {
                 tokio::spawn(fetch_bounties(updates.clone()));
+            }
+            Command::ImportKey { account, secret } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(import_key(sessions, account, secret, updates));
+            }
+            Command::ForgetKey { account } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(forget_key(sessions, account, updates));
             }
             Command::PublishDList {
                 account,
@@ -460,72 +506,220 @@ async fn publish_claim(
     Ok(event.id.to_hex())
 }
 
-/// Resolve both accounts to public material, then fetch each kind-0 through
-/// the instance's public scan endpoint (kind 0 is replaceable, so the relay
-/// holds at most the latest). Secrets never leave [`crate::secrets`].
-async fn load_accounts(updates: mpsc::UnboundedSender<Update>) {
-    for account in Account::ALL {
-        let keys = match secrets::keys(account) {
-            Ok(Some(keys)) => keys,
-            Ok(None) => {
-                let _ = updates.unbounded_send(Update::AccountMissing { account });
-                continue;
-            }
-            Err(e) => {
-                let _ = updates.unbounded_send(Update::Error {
-                    source: ErrorSource::Accounts,
-                    message: e.to_string(),
-                });
-                let _ = updates.unbounded_send(Update::AccountMissing { account });
-                continue;
-            }
-        };
-        let pubkey = keys.public_key().to_hex();
-        let npub = keys
-            .public_key()
-            .to_bech32()
-            .unwrap_or_else(|_| pubkey.clone());
-        if updates
-            .unbounded_send(Update::AccountLoaded {
-                account,
-                pubkey: pubkey.clone(),
-                npub,
-            })
-            .is_err()
-        {
+/// What one kind-0 said, trimmed to the fields the UI uses.
+struct Kind0Profile {
+    name: Option<String>,
+    picture: Option<String>,
+    lud16: Option<String>,
+}
+
+/// One account's kind-0 through the instance's public scan endpoint (kind 0
+/// is replaceable, so the relay holds at most the latest). `Ok(None)`: the
+/// scan worked and found no profile. `Err(())`: the scan itself failed — the
+/// caller decides whether that is silent (startup) or shown (onboarding).
+async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<Kind0Profile>, ()> {
+    let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
+    let events = api.scan(&filter).await.map_err(|_| ())?;
+    let Some(event) = events.first() else {
+        return Ok(None);
+    };
+    let content: serde_json::Value = serde_json::from_str(&event.content).unwrap_or_default();
+    let field = |key: &str| {
+        content
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    Ok(Some(Kind0Profile {
+        name: field("display_name").or_else(|| field("name")),
+        picture: field("picture"),
+        lud16: field("lud16"),
+    }))
+}
+
+/// Resolve one account to public material and announce it, then its kind-0.
+/// Secrets never leave [`crate::secrets`].
+async fn load_one_account(account: Account, updates: &mpsc::UnboundedSender<Update>) {
+    let keys = match secrets::keys(account) {
+        Ok(Some(keys)) => keys,
+        Ok(None) => {
+            let _ = updates.unbounded_send(Update::AccountMissing { account });
             return;
         }
-
-        let Ok(api) = Api::new() else { continue };
-        let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
-        // A scan failure is not an error state: the UI's fallback labels are
-        // the defined behaviour when no profile is known.
-        if let Ok(events) = api.scan(&filter).await
-            && let Some(event) = events.first() {
-                let content: serde_json::Value =
-                    serde_json::from_str(&event.content).unwrap_or_default();
-                let field = |key: &str| {
-                    content
-                        .get(key)
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                };
-                let _ = updates.unbounded_send(Update::ProfileLoaded {
-                    account,
-                    name: field("display_name").or_else(|| field("name")),
-                    picture: field("picture"),
-                });
-            }
+        Err(e) => {
+            let _ = updates.unbounded_send(Update::Error {
+                source: ErrorSource::Accounts,
+                message: e.to_string(),
+            });
+            let _ = updates.unbounded_send(Update::AccountMissing { account });
+            return;
+        }
+    };
+    let pubkey = keys.public_key().to_hex();
+    let npub = keys
+        .public_key()
+        .to_bech32()
+        .unwrap_or_else(|_| pubkey.clone());
+    if updates
+        .unbounded_send(Update::AccountLoaded {
+            account,
+            pubkey: pubkey.clone(),
+            npub,
+        })
+        .is_err()
+    {
+        return;
     }
+
+    // A scan failure is not an error state: the UI's fallback labels are
+    // the defined behaviour when no profile is known.
+    let Ok(api) = Api::new() else { return };
+    if let Ok(Some(profile)) = fetch_kind0(&api, &pubkey).await {
+        let _ = updates.unbounded_send(Update::ProfileLoaded {
+            account,
+            name: profile.name,
+            picture: profile.picture,
+            lud16: profile.lud16,
+        });
+    }
+}
+
+async fn load_accounts(updates: mpsc::UnboundedSender<Update>) {
+    for account in Account::ALL {
+        load_one_account(account, &updates).await;
+    }
+}
+
+/// The pasted-key import, run entirely on the runtime thread so the UI never
+/// touches the keychain: validate, store, drop any stale session, then
+/// announce the account and probe its profile. Every message that leaves here
+/// is public material or fixed text.
+async fn import_key(
+    sessions: SharedSessions,
+    account: Account,
+    secret: Secret,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let parsed = match secrets::parse_secret(&secret) {
+        Ok(keys) => keys,
+        Err(e) => {
+            let _ = updates.unbounded_send(Update::ImportFailed {
+                account,
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+    // Store the trimmed text, so the keychain never holds stray whitespace.
+    let trimmed = Secret::new(secret.expose().trim());
+    if let Err(e) = secrets::store_nsec(account, &trimmed) {
+        // This message lands on the first-launch screen: a locked keychain
+        // gets a recovery step, not the keyring crate's platform detail.
+        let message = match e {
+            SecretError::Keyring(_) => "This Mac's keychain is locked — unlock it \
+                 (or log out and back in) and try again."
+                .to_string(),
+            other => other.to_string(),
+        };
+        let _ = updates.unbounded_send(Update::ImportFailed { account, message });
+        return;
+    }
+    // A cached session signs with the old key; drop it.
+    sessions.lock().await.remove(&account);
+
+    // Env wins over the keychain, so announce the EFFECTIVE key — normally
+    // the one just pasted, but an automated run's env override stays honest.
+    let keys = match secrets::keys(account) {
+        Ok(Some(keys)) => keys,
+        _ => parsed,
+    };
+    let pubkey = keys.public_key().to_hex();
+    let npub = keys
+        .public_key()
+        .to_bech32()
+        .unwrap_or_else(|_| pubkey.clone());
+    if updates
+        .unbounded_send(Update::AccountLoaded {
+            account,
+            pubkey: pubkey.clone(),
+            npub: npub.clone(),
+        })
+        .is_err()
+    {
+        return;
+    }
+
+    let probe = match Api::new() {
+        Ok(api) => fetch_kind0(&api, &pubkey).await,
+        Err(_) => Err(()),
+    };
+    let (profile, profile_checked) = match probe {
+        Ok(profile) => (profile, true),
+        Err(()) => (None, false),
+    };
+    let profile_found = profile.is_some();
+    let (name, lud16) = match profile {
+        Some(profile) => {
+            let name = profile.name.clone();
+            let lud16 = profile.lud16.clone();
+            let _ = updates.unbounded_send(Update::ProfileLoaded {
+                account,
+                name: profile.name,
+                picture: profile.picture,
+                lud16: profile.lud16,
+            });
+            (name, lud16)
+        }
+        None => (None, None),
+    };
+    let _ = updates.unbounded_send(Update::ImportReady {
+        account,
+        npub,
+        name,
+        lud16,
+        profile_checked,
+        profile_found,
+    });
+}
+
+/// Delete the keychain entry, drop the cached session, then re-announce
+/// whatever is still true — an env override survives and wins.
+async fn forget_key(
+    sessions: SharedSessions,
+    account: Account,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    if let Err(e) = secrets::forget_nsec(account) {
+        let _ = updates.unbounded_send(Update::Error {
+            source: ErrorSource::Accounts,
+            message: e.to_string(),
+        });
+        return;
+    }
+    sessions.lock().await.remove(&account);
+    load_one_account(account, &updates).await;
+}
+
+/// The pubkey whose bounties the read paths list: the imported issuer key if
+/// any, else `MC_ISSUER_NPUB`, else the instance's house issuer. Public
+/// material only — read-only browsing needs no secret.
+fn issuer_pubkey_for_reads() -> String {
+    if let Ok(Some(keys)) = secrets::keys(Account::Issuer) {
+        return keys.public_key().to_hex();
+    }
+    if let Ok(value) = std::env::var("MC_ISSUER_NPUB")
+        && let Ok(pubkey) = PublicKey::parse(value.trim())
+    {
+        return pubkey.to_hex();
+    }
+    HOUSE_ISSUER_HEX.to_string()
 }
 
 async fn fetch_bounties(updates: mpsc::UnboundedSender<Update>) {
     let result = async {
-        let keys =
-            secrets::keys(Account::Issuer)?.ok_or(BridgeError::NoKey(Account::Issuer))?;
         let api = Api::new()?;
-        Ok::<_, BridgeError>(api.list_bounties(&keys.public_key().to_hex()).await?)
+        Ok::<_, BridgeError>(api.list_bounties(&issuer_pubkey_for_reads()).await?)
     }
     .await;
     let update = match result {
@@ -994,6 +1188,19 @@ mod tests {
         // And only once: the same settled snapshot again stays silent.
         let (updates, _) = ledger.ingest_detail(&late, NOW);
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn an_import_command_debugs_without_its_secret() {
+        // The command channel is the one place a pasted key travels outside
+        // `secrets`; a `{:?}` on it must stay clean.
+        let command = Command::ImportKey {
+            account: Account::Claimant,
+            secret: Secret::new("nsec1extremelysecretvalue"),
+        };
+        let printed = format!("{command:?}");
+        assert!(!printed.contains("extremelysecret"), "leaked: {printed}");
+        assert!(printed.contains("<redacted>"), "not redacted: {printed}");
     }
 
     /// A one-claim detail with no payment row, shaped like the live API.

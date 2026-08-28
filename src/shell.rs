@@ -21,17 +21,21 @@ use gpui_component::{
 
 use magic_carpet_chat::api::{Bounty, BountyDetail, CreateBounty};
 use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update};
-use magic_carpet_chat::secrets::Account;
+use magic_carpet_chat::secrets::{Account, Secret};
 
 use crate::bounties;
 use crate::chat::Chat;
 use crate::dashboard::{self, MONO, avatar};
 use crate::icons::icon;
+use crate::onboarding::{ImportSummary, Onboarding};
 use crate::palette::*;
-use crate::timefmt;
+use crate::{onboarding, timefmt};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
+    /// First launch with no key anywhere: paste a key or continue read-only.
+    /// Never in the nav — reachable only through the first-screen decision.
+    Onboarding,
     Dashboard,
     Bounties,
     Payments,
@@ -47,6 +51,7 @@ pub enum Screen {
 impl Screen {
     fn label(self) -> &'static str {
         match self {
+            Screen::Onboarding => "Welcome",
             Screen::Dashboard => "Dashboard",
             Screen::Bounties => "Bounties",
             Screen::Payments => "Payments",
@@ -62,6 +67,7 @@ impl Screen {
 
     fn icon(self) -> &'static str {
         match self {
+            Screen::Onboarding => "accounts",
             Screen::Dashboard => "overview",
             Screen::Bounties => "bounties",
             Screen::Payments => "payments",
@@ -91,7 +97,7 @@ actions!(
     shell,
     [
         GoDashboard, GoBounties, GoPayments, GoClaimants, GoBoards, GoWallet, GoTags, GoChat,
-        PrevAccount, NextAccount, Refresh, NewItem, CloseForm, SelectPrev, SelectNext
+        PrevAccount, NextAccount, Refresh, NewItem, CloseForm, SelectPrev, SelectNext, Confirm
     ]
 );
 
@@ -117,8 +123,16 @@ pub fn keybindings() -> Vec<KeyBinding> {
         // have nothing to do; cmd-. is the cancel that no input ever eats.
         KeyBinding::new("escape", CloseForm, None),
         KeyBinding::new("cmd-.", CloseForm, None),
-        KeyBinding::new("up", SelectPrev, None),
-        KeyBinding::new("down", SelectNext, None),
+        // Scoped to the Shell node: a focused text input is deeper in the
+        // key-context stack, so its own up/down/enter bindings win there.
+        // Context-less (None) versions of these would shadow every input's
+        // Enter — GPUI treats no-context bindings as deepest-context and
+        // resolves ties by later registration, and these are registered
+        // after gpui_component::init.
+        KeyBinding::new("up", SelectPrev, Some("Shell")),
+        KeyBinding::new("down", SelectNext, Some("Shell")),
+        // Onboarding's "Start": only fires when the shell itself has focus.
+        KeyBinding::new("enter", Confirm, Some("Shell")),
     ]
 }
 
@@ -155,6 +169,38 @@ pub(crate) struct AccountView {
     /// From the account's kind-0 on the instance relay, when one exists.
     pub kind0_name: Option<String>,
     pub picture: Option<String>,
+    /// The kind-0's Lightning address — payouts need one.
+    pub lud16: Option<String>,
+}
+
+impl AccountView {
+    /// `Some(true)` = a key exists, `Some(false)` = confirmed missing,
+    /// `None` = the runtime has not answered yet.
+    fn key_resolved(&self) -> Option<bool> {
+        if self.npub.is_some() {
+            Some(true)
+        } else if self.missing {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// First-launch routing, decided once per launch: `None` until enough is
+/// known, `Some(true)` when NO account has a key anywhere (onboarding),
+/// `Some(false)` as soon as any key exists (straight to the dashboard).
+/// A single loaded key decides early; a single missing key waits for the
+/// other account's answer.
+pub(crate) fn onboarding_needed(
+    issuer: Option<bool>,
+    claimant: Option<bool>,
+) -> Option<bool> {
+    match (issuer, claimant) {
+        (Some(true), _) | (_, Some(true)) => Some(false),
+        (Some(false), Some(false)) => Some(true),
+        _ => None,
+    }
 }
 
 /// The label shown before (or without) a kind-0: the account's ROLE, never a
@@ -259,6 +305,18 @@ pub(crate) struct ClaimForm {
     _sub: Subscription,
 }
 
+/// The slim in-sidebar key import — the onboarding input's second home.
+/// Opens when the active account has no key (switch accounts with ⌘] to
+/// reach it); Enter imports, esc closes.
+pub(crate) struct SidebarImport {
+    pub account: Account,
+    pub input: Entity<InputState>,
+    /// Fixed text from the runtime — never an echo of the input.
+    pub error: Option<String>,
+    pub submitting: bool,
+    _sub: Subscription,
+}
+
 // -------------------------------------------------------------------- shell
 
 pub struct Shell {
@@ -279,6 +337,14 @@ pub struct Shell {
     optimistic: Option<Bounty>,
     pub(crate) bounty_form: Option<BountyForm>,
     pub(crate) claim_form: Option<ClaimForm>,
+    /// First-launch key setup; rendered only while `screen` is Onboarding.
+    pub(crate) onboarding: Onboarding,
+    /// Set once the first-screen decision is made, so a later ⌘R (which
+    /// re-runs LoadAccounts) can never bounce the app back to onboarding.
+    first_screen_decided: bool,
+    /// The slim import input in the sidebar, open while the ACTIVE account
+    /// has no key.
+    pub(crate) sidebar_import: Option<SidebarImport>,
     /// The bounty half of a submitted form, parked while the DList publishes.
     pending_bounty: Option<CreateBounty>,
     /// The request as it went to the server (coordinate filled in), kept so
@@ -343,6 +409,8 @@ impl Shell {
             }
         });
 
+        let onboarding = Onboarding::new(window, cx);
+
         Self {
             screen: Screen::Dashboard,
             account: Account::Issuer,
@@ -356,6 +424,9 @@ impl Shell {
             optimistic: None,
             bounty_form: None,
             claim_form: None,
+            onboarding,
+            first_screen_decided: false,
+            sidebar_import: None,
             pending_bounty: None,
             submitted_bounty: None,
             bounty_list_scroll: ScrollHandle::new(),
@@ -447,18 +518,86 @@ impl Shell {
                 view.pubkey = Some(pubkey);
                 view.npub = Some(npub);
                 view.missing = false;
+                // The account has a key now; its import input has no job left.
+                if self
+                    .sidebar_import
+                    .as_ref()
+                    .is_some_and(|form| form.account == account)
+                {
+                    self.sidebar_import = None;
+                    self.focus.focus(window, cx);
+                }
+                self.decide_first_screen(window, cx);
             }
             Update::AccountMissing { account } => {
                 self.view_mut(account).missing = true;
+                self.decide_first_screen(window, cx);
+                // The startup path: the app opens on the issuer with no key
+                // (but another key exists, so onboarding is skipped). Offer
+                // the sidebar import without stealing the caret.
+                if self.screen != Screen::Onboarding
+                    && account == self.account
+                    && self.sidebar_import.is_none()
+                {
+                    self.open_sidebar_import(account, false, window, cx);
+                }
             }
             Update::ProfileLoaded {
                 account,
                 name,
                 picture,
+                lud16,
             } => {
                 let view = self.view_mut(account);
                 view.kind0_name = name;
                 view.picture = picture;
+                view.lud16 = lud16;
+            }
+            Update::ImportFailed { account, message } => {
+                // `message` is fixed text from the runtime; it never echoes
+                // what was pasted.
+                if self.screen == Screen::Onboarding && account == Account::Claimant {
+                    self.onboarding.submitting = false;
+                    self.onboarding.error = Some(message);
+                } else if let Some(form) = &mut self.sidebar_import
+                    && form.account == account
+                {
+                    form.submitting = false;
+                    form.error = Some(message);
+                }
+            }
+            Update::ImportReady {
+                account,
+                npub,
+                name,
+                lud16,
+                profile_checked,
+                profile_found,
+            } => {
+                self.push_activity(
+                    GREEN,
+                    format!("Imported the {account} key ({})", short_npub(&npub)),
+                    now,
+                );
+                if self.screen == Screen::Onboarding && account == Account::Claimant {
+                    self.onboarding.submitting = false;
+                    self.onboarding.error = None;
+                    self.onboarding.ready = Some(ImportSummary {
+                        npub,
+                        name,
+                        lud16,
+                        profile_checked,
+                        profile_found,
+                    });
+                    // The key is in the keychain; the input has no reason to
+                    // keep holding it.
+                    self.onboarding
+                        .input
+                        .update(cx, |state, cx| state.set_value("", window, cx));
+                    // Enter now means "Start" — the Confirm binding needs the
+                    // shell to hold the focus.
+                    self.focus.focus(window, cx);
+                }
             }
             Update::Bounties(list) => {
                 if self.selected.is_none()
@@ -640,7 +779,181 @@ impl Shell {
             self.account = account;
             // An open form belongs to the account that opened it.
             self.close_forms(window, cx);
+            // Switching into a keyless account IS the import path (⌘] from
+            // the dashboard): the sidebar input opens with the caret in it.
+            // Trap: while it has focus, ⌘[/⌘] indent — esc hands focus back.
+            if self.view(account).missing {
+                self.open_sidebar_import(account, true, window, cx);
+            }
         }
+        cx.notify();
+    }
+
+    // ------------------------------------------------------- first launch
+
+    /// The first-screen decision, made once per launch as the account
+    /// answers arrive: no key anywhere → onboarding; any key → dashboard.
+    fn decide_first_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.first_screen_decided {
+            return;
+        }
+        let Some(needed) =
+            onboarding_needed(self.issuer.key_resolved(), self.claimant.key_resolved())
+        else {
+            return;
+        };
+        self.first_screen_decided = true;
+        if needed {
+            self.screen = Screen::Onboarding;
+            // A sidebar import opened by an earlier AccountMissing would sit
+            // stale behind the full-screen onboarding — drop it.
+            self.sidebar_import = None;
+            // A pasted key becomes the claimant — the person who claims and
+            // gets paid — so that is the active account from here on.
+            self.account = Account::Claimant;
+            self.onboarding
+                .input
+                .update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+        }
+    }
+
+    /// Enter inside the onboarding input: import the pasted key, or — once
+    /// the import came back — start the app.
+    pub(crate) fn onboarding_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.onboarding.ready.is_some() {
+            self.leave_onboarding(window, cx);
+        } else {
+            self.submit_onboarding_key(cx);
+        }
+    }
+
+    fn submit_onboarding_key(&mut self, cx: &mut Context<Self>) {
+        if self.onboarding.submitting {
+            return;
+        }
+        // Wrapped immediately: the pasted key exists on this thread only
+        // inside `Secret`, which redacts itself everywhere.
+        let secret = Secret::new(self.onboarding.input.read(cx).value().trim().to_string());
+        if secret.expose().is_empty() {
+            self.onboarding.error = Some("Paste a key first — or just look around.".into());
+            cx.notify();
+            return;
+        }
+        self.onboarding.error = None;
+        self.onboarding.submitting = true;
+        let _ = self.commands.unbounded_send(Command::ImportKey {
+            account: Account::Claimant,
+            secret,
+        });
+        cx.notify();
+    }
+
+    /// Both doors out of onboarding — Start after an import, or "just look
+    /// around" — land on the dashboard as the claimant.
+    pub(crate) fn leave_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen != Screen::Onboarding {
+            return;
+        }
+        // The input may still hold a pasted key: esc with text in the field,
+        // or esc while an import is in flight (whose ImportReady would then
+        // arrive too late to clear it — its handler is gated on this screen).
+        // `set_value` also clears the input's undo history, so nothing keeps
+        // the secret alive after this. Runs on BOTH exits; on the Start path
+        // the field is already empty and this is a no-op.
+        self.onboarding
+            .input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.onboarding.error = None;
+        self.onboarding.submitting = false;
+        self.account = Account::Claimant;
+        self.go(Screen::Dashboard, window, cx);
+        // "You can add a key later from the sidebar" — make that visibly
+        // true: leaving without a key shows the claimant input, unfocused.
+        if self.view(Account::Claimant).missing && self.sidebar_import.is_none() {
+            self.open_sidebar_import(Account::Claimant, false, window, cx);
+        }
+    }
+
+    /// The global Enter binding: only onboarding's Start listens to it.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen == Screen::Onboarding && self.onboarding.ready.is_some() {
+            self.leave_onboarding(window, cx);
+        }
+    }
+
+    /// esc / ⌘.: on onboarding this is "just look around"; everywhere else
+    /// it cancels whichever form is open.
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen == Screen::Onboarding {
+            self.leave_onboarding(window, cx);
+        } else {
+            self.close_forms(window, cx);
+        }
+    }
+
+    // ------------------------------------------------------ sidebar import
+
+    fn open_sidebar_import(
+        &mut self,
+        account: Account,
+        focus_input: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("nsec1… or hex")
+        });
+        let sub = cx.subscribe_in(&input, window, |this: &mut Self, _, event, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.submit_sidebar_import(window, cx);
+            }
+        });
+        if focus_input {
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
+        self.sidebar_import = Some(SidebarImport {
+            account,
+            input,
+            error: None,
+            submitting: false,
+            _sub: sub,
+        });
+        cx.notify();
+    }
+
+    fn submit_sidebar_import(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.sidebar_import else {
+            return;
+        };
+        if form.submitting {
+            return;
+        }
+        let account = form.account;
+        let secret = Secret::new(form.input.read(cx).value().trim().to_string());
+        if secret.expose().is_empty() {
+            if let Some(form) = &mut self.sidebar_import {
+                form.error = Some("Paste a key first.".into());
+            }
+            cx.notify();
+            return;
+        }
+        let _ = self
+            .commands
+            .unbounded_send(Command::ImportKey { account, secret });
+        if let Some(form) = &mut self.sidebar_import {
+            form.error = None;
+            form.submitting = true;
+        }
+        cx.notify();
+    }
+
+    /// "Forget this key": the runtime deletes the keychain entry and then
+    /// re-announces whatever is still true (an env override survives).
+    fn forget_key(&mut self, account: Account, cx: &mut Context<Self>) {
+        let _ = self.commands.unbounded_send(Command::ForgetKey { account });
         cx.notify();
     }
 
@@ -701,6 +1014,18 @@ impl Shell {
     /// cmd-N: as the issuer, a new DList+bounty; as the claimant, a claim on
     /// the selected bounty. From any screen — it navigates to Bounties first.
     pub(crate) fn new_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No key for the active account: the honest response is the key
+        // input, not a form whose submit can only fail.
+        if self.view(self.account).missing {
+            let account = self.account;
+            match &self.sidebar_import {
+                Some(form) if form.account == account => {
+                    form.input.update(cx, |state, cx| state.focus(window, cx));
+                }
+                _ => self.open_sidebar_import(account, true, window, cx),
+            }
+            return;
+        }
         if self.screen != Screen::Bounties {
             self.go(Screen::Bounties, window, cx);
         }
@@ -711,9 +1036,13 @@ impl Shell {
     }
 
     pub(crate) fn close_forms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.bounty_form.is_some() || self.claim_form.is_some() {
+        if self.bounty_form.is_some()
+            || self.claim_form.is_some()
+            || self.sidebar_import.is_some()
+        {
             self.bounty_form = None;
             self.claim_form = None;
+            self.sidebar_import = None;
             self.pending_bounty = None;
             self.focus.focus(window, cx);
             cx.notify();
@@ -1155,9 +1484,12 @@ impl Shell {
         let name = display_name(account, view);
         let identity: SharedString = match (&view.npub, view.missing) {
             (Some(npub), _) => short_npub(npub).into(),
-            (None, true) => "no key — run --import-keys".into(),
+            // Quiet, not alarming: browsing works without a key. The import
+            // input below (⌘], or a click here) is the fix path.
+            (None, true) => "read-only — no key".into(),
             (None, false) => "loading key…".into(),
         };
+        let has_key = view.npub.is_some();
 
         // The three cards are the issuer's live bounty economics; before the
         // list loads (or when it failed) they say so instead of guessing.
@@ -1223,11 +1555,13 @@ impl Shell {
                     .border_color(rgb(LINE))
                     .child(
                         h_flex()
+                            .id("account-header")
                             .gap(px(8.))
                             .items_center()
                             .px(px(11.))
                             .py(px(6.))
                             .rounded(px(9.))
+                            .cursor_pointer()
                             .child(
                                 v_flex()
                                     .flex_1()
@@ -1245,10 +1579,100 @@ impl Shell {
                                             .text_size(px(10.5))
                                             .text_color(rgb(TEXT_DIM))
                                             .child(identity),
-                                    ),
+                                    )
+                                    .when(has_key, |this| {
+                                        this.child(
+                                            div()
+                                                .id("forget-key")
+                                                .mt(px(3.))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(TEXT_DIM))
+                                                .cursor_pointer()
+                                                .hover(|this| this.text_color(rgb(RED)))
+                                                .child("Forget this key")
+                                                .on_click(cx.listener(
+                                                    move |this, _, _, cx| {
+                                                        this.forget_key(account, cx)
+                                                    },
+                                                )),
+                                        )
+                                    }),
                             )
-                            .child(div().text_color(rgb(TEXT_DIM)).child("›")),
+                            .child(div().text_color(rgb(TEXT_DIM)).child("›"))
+                            // A click on a keyless account header opens the
+                            // same import input ⌘] would.
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let account = this.account;
+                                if this.view(account).missing
+                                    && this.sidebar_import.is_none()
+                                {
+                                    this.open_sidebar_import(account, true, window, cx);
+                                }
+                            })),
                     ),
+            )
+            .when_some(
+                self.sidebar_import
+                    .as_ref()
+                    .filter(|form| form.account == account),
+                |this, form| {
+                    this.child(
+                        v_flex()
+                            .mx(px(2.))
+                            .mb(px(8.))
+                            .px(px(9.))
+                            .py(px(9.))
+                            .gap(px(5.))
+                            .rounded(px(10.))
+                            .bg(rgb(BG_APP))
+                            .border_1()
+                            .border_color(rgb(BORDER_3))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(SharedString::from(match form.account {
+                                        Account::Claimant => "PASTE YOUR KEY (NSEC)".to_string(),
+                                        Account::Issuer => "PASTE THE ISSUER KEY".to_string(),
+                                    })),
+                            )
+                            // The issuer slot is for operators only: a
+                            // claimant who pastes their own nsec here makes
+                            // the app list THEIR (empty) bounties.
+                            .when(form.account == Account::Issuer, |this| {
+                                this.child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(AMBER))
+                                        .child(
+                                            "Operator only — this changes whose \
+                                             bounties the app shows. Claiming \
+                                             never needs it.",
+                                        ),
+                                )
+                            })
+                            .child(div().text_size(px(12.)).child(Input::new(&form.input)))
+                            .when_some(form.error.clone(), |this, error| {
+                                this.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(RED))
+                                        .child(SharedString::from(error)),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(if form.submitting {
+                                        "Checking the key…"
+                                    } else {
+                                        "Enter imports · esc closes"
+                                    }),
+                            ),
+                    )
+                },
             )
             .children(NAV.iter().map(|&screen| {
                 let on = self.screen == screen;
@@ -1473,9 +1897,39 @@ fn parse_sats(value: &str) -> Option<u64> {
 
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Onboarding takes the whole window: no rail, no sidebar, no top bar
+        // — one decision at a time.
+        let body: AnyElement = if self.screen == Screen::Onboarding {
+            onboarding::render(self, cx).into_any_element()
+        } else {
+            h_flex()
+                .flex_1()
+                .min_h(px(0.))
+                // h_flex centres its children; the three columns must each
+                // run the full height instead.
+                .items_stretch()
+                .child(self.rail(cx))
+                .child(self.sidebar(cx))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(self.top_bar())
+                        .child(self.main(cx)),
+                )
+                .into_any_element()
+        };
+
         v_flex()
             .size_full()
             .track_focus(&self.focus)
+            // Names this node in the key-context stack so the enter/up/down
+            // bindings below only fire here. A focused text input sits deeper
+            // in the stack, so its own bindings win — without this, a
+            // context-less "enter" registered after gpui_component::init
+            // shadows the input's Enter everywhere (GPUI treats no-context
+            // bindings as deepest-context, later registration wins).
+            .key_context("Shell")
             .on_action(cx.listener(|this, _: &GoDashboard, w, cx| this.go(Screen::Dashboard, w, cx)))
             .on_action(cx.listener(|this, _: &GoBounties, w, cx| this.go(Screen::Bounties, w, cx)))
             .on_action(cx.listener(|this, _: &GoPayments, w, cx| this.go(Screen::Payments, w, cx)))
@@ -1488,9 +1942,10 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &NextAccount, w, cx| this.step_account(w, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &NewItem, w, cx| this.new_item(w, cx)))
-            .on_action(cx.listener(|this, _: &CloseForm, w, cx| this.close_forms(w, cx)))
+            .on_action(cx.listener(|this, _: &CloseForm, w, cx| this.cancel(w, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.select_step(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.select_step(1, cx)))
+            .on_action(cx.listener(|this, _: &Confirm, w, cx| this.confirm(w, cx)))
             .bg(rgb(BG_APP))
             .text_color(rgb(TEXT))
             .text_size(px(13.))
@@ -1506,22 +1961,36 @@ impl Render for Shell {
                         .child("Magic Carpet"),
                 ),
             )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h(px(0.))
-                    // h_flex centres its children; the three columns must each
-                    // run the full height instead.
-                    .items_stretch()
-                    .child(self.rail(cx))
-                    .child(self.sidebar(cx))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(self.top_bar())
-                            .child(self.main(cx)),
-                    ),
-            )
+            .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::onboarding_needed;
+
+    // `Some(true)` = key present, `Some(false)` = confirmed missing,
+    // `None` = the runtime has not answered for that account yet.
+
+    #[test]
+    fn onboarding_shows_only_when_no_account_has_a_key() {
+        assert_eq!(onboarding_needed(Some(false), Some(false)), Some(true));
+    }
+
+    #[test]
+    fn any_key_skips_onboarding_without_waiting_for_the_other_account() {
+        assert_eq!(onboarding_needed(Some(true), Some(true)), Some(false));
+        assert_eq!(onboarding_needed(Some(true), Some(false)), Some(false));
+        assert_eq!(onboarding_needed(Some(false), Some(true)), Some(false));
+        // One key confirmed decides early — the other answer cannot change it.
+        assert_eq!(onboarding_needed(Some(true), None), Some(false));
+        assert_eq!(onboarding_needed(None, Some(true)), Some(false));
+    }
+
+    #[test]
+    fn a_single_missing_key_waits_for_the_other_answer() {
+        assert_eq!(onboarding_needed(Some(false), None), None);
+        assert_eq!(onboarding_needed(None, Some(false)), None);
+        assert_eq!(onboarding_needed(None, None), None);
     }
 }
