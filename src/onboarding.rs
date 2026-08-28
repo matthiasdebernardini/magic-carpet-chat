@@ -43,6 +43,9 @@ pub struct Onboarding {
     pub submitting: bool,
     /// The key is stored and probed; Enter (or the Start button) finishes.
     pub ready: Option<ImportSummary>,
+    /// The in-flight key was generated here, not pasted — a missing profile
+    /// is then expected, not a wrong-key symptom.
+    pub generated: bool,
     _sub: Subscription,
 }
 
@@ -63,6 +66,7 @@ impl Onboarding {
             error: None,
             submitting: false,
             ready: None,
+            generated: false,
             _sub: sub,
         }
     }
@@ -142,7 +146,7 @@ fn dot_row(dot: u32, text: impl Into<SharedString>, color: u32) -> AnyElement {
 }
 
 /// The success panel: what the key resolved to, and the Start button.
-fn ready_panel(summary: &ImportSummary, cx: &mut Context<Shell>) -> AnyElement {
+fn ready_panel(summary: &ImportSummary, generated: bool, cx: &mut Context<Shell>) -> AnyElement {
     let identity: SharedString = match &summary.name {
         Some(name) => format!("{name} · {}", short_npub(&summary.npub)).into(),
         None => short_npub(&summary.npub).into(),
@@ -156,15 +160,26 @@ fn ready_panel(summary: &ImportSummary, cx: &mut Context<Shell>) -> AnyElement {
             TEXT_MUTED,
         )
     } else if !summary.profile_found {
-        // No kind-0 at all: for the paste-existing-key path this usually
-        // means the WRONG key (a hex public key parses as a plausible
-        // secret key and lands exactly here).
-        dot_row(
-            AMBER,
-            "No profile found for this key — double-check you pasted the \
-             right one. A brand-new key can browse, but it will not be paid.",
-            AMBER,
-        )
+        if generated {
+            // A fresh key has no kind-0 by definition — no "wrong key" scare.
+            dot_row(
+                AMBER,
+                "New key — it can browse and claim, but claims will NOT be \
+                 paid until this key has a profile with a Lightning address. \
+                 Log in with it in a Nostr app (Primal, Damus) and add one.",
+                AMBER,
+            )
+        } else {
+            // No kind-0 at all: for the paste-existing-key path this usually
+            // means the WRONG key (a hex public key parses as a plausible
+            // secret key and lands exactly here).
+            dot_row(
+                AMBER,
+                "No profile found for this key — double-check you pasted the \
+                 right one. A brand-new key can browse, but it will not be paid.",
+                AMBER,
+            )
+        }
     } else {
         // Consequence first, and at full strength: this is the single most
         // payout-critical fact on the screen.
@@ -218,7 +233,7 @@ fn ready_panel(summary: &ImportSummary, cx: &mut Context<Shell>) -> AnyElement {
 fn key_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let onboarding = &shell.onboarding;
     let body: AnyElement = match &onboarding.ready {
-        Some(summary) => ready_panel(summary, cx),
+        Some(summary) => ready_panel(summary, onboarding.generated, cx),
         None => v_flex()
             .gap(px(8.))
             .child(muted(
@@ -251,6 +266,22 @@ fn key_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                     } else {
                         "Enter continues"
                     }),
+            )
+            .child(
+                div()
+                    .id("onboarding-generate")
+                    .mt(px(4.))
+                    .px(px(14.))
+                    .py(px(8.))
+                    .rounded(px(9.))
+                    .border_1()
+                    .border_color(rgb(BORDER_3))
+                    .cursor_pointer()
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_MUTED))
+                    .text_center()
+                    .child("No key yet? Create a new one")
+                    .on_click(cx.listener(|this, _, _, cx| this.generate_onboarding_key(cx))),
             )
             .into_any_element(),
     };

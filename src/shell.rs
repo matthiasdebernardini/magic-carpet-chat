@@ -842,9 +842,37 @@ impl Shell {
         }
         self.onboarding.error = None;
         self.onboarding.submitting = true;
+        self.onboarding.generated = false;
         let _ = self.commands.unbounded_send(Command::ImportKey {
             account: Account::Claimant,
             secret,
+        });
+        cx.notify();
+    }
+
+    /// "No key yet? Create a new one": generate a fresh key here and run it
+    /// through the exact same import path as a paste — keychain storage,
+    /// profile probe, ready panel. The nsec exists on this thread only
+    /// inside `Secret`.
+    pub(crate) fn generate_onboarding_key(&mut self, cx: &mut Context<Self>) {
+        if self.onboarding.submitting || self.onboarding.ready.is_some() {
+            return;
+        }
+        let keys = nostr_sdk::prelude::Keys::generate();
+        let nsec = match nostr_sdk::prelude::ToBech32::to_bech32(keys.secret_key()) {
+            Ok(nsec) => nsec,
+            Err(e) => {
+                self.onboarding.error = Some(format!("Could not create a key: {e}"));
+                cx.notify();
+                return;
+            }
+        };
+        self.onboarding.error = None;
+        self.onboarding.submitting = true;
+        self.onboarding.generated = true;
+        let _ = self.commands.unbounded_send(Command::ImportKey {
+            account: Account::Claimant,
+            secret: Secret::new(nsec),
         });
         cx.notify();
     }
