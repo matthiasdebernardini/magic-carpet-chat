@@ -29,7 +29,7 @@ use crate::dashboard::{self, MONO, avatar};
 use crate::icons::icon;
 use crate::onboarding::{ImportSummary, Onboarding};
 use crate::palette::*;
-use crate::wallet::{self, WalletCreated, WalletState};
+use crate::wallet::{self, WalletState};
 use crate::{onboarding, timefmt};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -172,9 +172,28 @@ pub(crate) struct AccountView {
     pub picture: Option<String>,
     /// The kind-0's Lightning address — payouts need one.
     pub lud16: Option<String>,
+    /// The Coinos signup, shared by the onboarding ready panel and ⌘6.
+    pub wallet: WalletState,
 }
 
 impl AccountView {
+    /// Where payouts land: this session's Coinos signup first, else the
+    /// profile's lud16 as the relays have it.
+    pub(crate) fn payout_address(&self) -> Option<&str> {
+        self.wallet
+            .created
+            .as_ref()
+            .map(|created| created.lightning_address.as_str())
+            .or(self.lud16.as_deref())
+    }
+
+    /// Keep the funding QR in step with `payout_address`; call after any
+    /// change to `lud16` or `wallet.created`.
+    fn sync_qr(&mut self) {
+        let address = self.payout_address().map(str::to_string);
+        self.wallet.sync_qr(address.as_deref());
+    }
+
     /// `Some(true)` = a key exists, `Some(false)` = confirmed missing,
     /// `None` = the runtime has not answered yet.
     fn key_resolved(&self) -> Option<bool> {
@@ -340,8 +359,6 @@ pub struct Shell {
     pub(crate) claim_form: Option<ClaimForm>,
     /// First-launch key setup; rendered only while `screen` is Onboarding.
     pub(crate) onboarding: Onboarding,
-    /// The Coinos signup, shared by the onboarding ready panel and ⌘6.
-    pub(crate) wallet: WalletState,
     /// Set once the first-screen decision is made, so a later ⌘R (which
     /// re-runs LoadAccounts) can never bounce the app back to onboarding.
     first_screen_decided: bool,
@@ -428,7 +445,6 @@ impl Shell {
             bounty_form: None,
             claim_form: None,
             onboarding,
-            wallet: WalletState::default(),
             first_screen_decided: false,
             sidebar_import: None,
             pending_bounty: None,
@@ -460,18 +476,24 @@ impl Shell {
         }
     }
 
-    pub(crate) fn selected_bounty(&self) -> Option<&Bounty> {
-        let id = self.selected.as_deref()?;
+    /// The bounty by id, from the freshest source that has it: the detail
+    /// snapshot, then the list, then the optimistic copy. Server data always
+    /// wins; the optimistic copy only fills the gap between BountyCreated and
+    /// the first list/detail that includes it.
+    fn bounty(&self, id: &str) -> Option<&Bounty> {
         if let Some(detail) = self.details.get(id) {
             return Some(&detail.bounty);
         }
         if let Load::Ready(list) = &self.bounties
-            && let Some(bounty) = list.iter().find(|b| b.id == id) {
-                return Some(bounty);
-            }
-        // Server data always wins; the optimistic copy only fills the gap
-        // between BountyCreated and the first list/detail that includes it.
+            && let Some(bounty) = list.iter().find(|b| b.id == id)
+        {
+            return Some(bounty);
+        }
         self.optimistic.as_ref().filter(|b| b.id == id)
+    }
+
+    pub(crate) fn selected_bounty(&self) -> Option<&Bounty> {
+        self.bounty(self.selected.as_deref()?)
     }
 
     /// True while the selected bounty renders from the optimistic copy — the
@@ -556,6 +578,7 @@ impl Shell {
                 view.kind0_name = name;
                 view.picture = picture;
                 view.lud16 = lud16;
+                view.sync_qr();
             }
             Update::ImportFailed { account, message } => {
                 // `message` is fixed text from the runtime; it never echoes
@@ -573,8 +596,6 @@ impl Shell {
             Update::ImportReady {
                 account,
                 npub,
-                name,
-                lud16,
                 profile_checked,
                 profile_found,
             } => {
@@ -588,8 +609,6 @@ impl Shell {
                     self.onboarding.error = None;
                     self.onboarding.ready = Some(ImportSummary {
                         npub,
-                        name,
-                        lud16,
                         profile_checked,
                         profile_found,
                     });
@@ -603,38 +622,28 @@ impl Shell {
                     self.focus.focus(window, cx);
                 }
             }
-            Update::WalletCreated {
-                account,
-                username,
-                lightning_address,
-                publish_error,
-            } => {
-                self.wallet.submitting = false;
-                self.wallet.error = None;
+            Update::WalletCreated { account, created } => {
                 // One feed line per event; the panel shows the same error
                 // next to its retry button.
-                match &publish_error {
-                    None => self.push_activity(
-                        GREEN,
-                        format!("Coinos wallet ready: {lightning_address}"),
-                        now,
-                    ),
-                    Some(error) => self.push_activity(
-                        AMBER,
-                        format!("Coinos wallet ready: {lightning_address} — {error}"),
-                        now,
-                    ),
-                }
-                self.wallet.created = Some(WalletCreated {
-                    account,
-                    username,
-                    lightning_address,
-                    publish_error,
-                });
+                let (dot, suffix) = match &created.publish_error {
+                    None => (GREEN, String::new()),
+                    Some(error) => (AMBER, format!(" — {error}")),
+                };
+                self.push_activity(
+                    dot,
+                    format!("Coinos wallet ready: {}{suffix}", created.lightning_address),
+                    now,
+                );
+                let view = self.view_mut(account);
+                view.wallet.submitting = false;
+                view.wallet.error = None;
+                view.wallet.created = Some(created);
+                view.sync_qr();
             }
             Update::WalletFailed { account, message } => {
-                self.wallet.submitting = false;
-                self.wallet.error = Some(message.clone());
+                let wallet = &mut self.view_mut(account).wallet;
+                wallet.submitting = false;
+                wallet.error = Some(message.clone());
                 self.push_activity(RED, format!("Coinos wallet for the {account} failed: {message}"), now);
             }
             Update::Bounties(list) => {
@@ -723,22 +732,18 @@ impl Shell {
                 self.focus.focus(window, cx);
                 // Say how this bounty pays: the claim card alone reads as
                 // "nothing happened" when the payout is manual or gated.
-                let bounty = match &self.bounties {
-                    Load::Ready(list) => list.iter().find(|b| b.id == bounty_id),
-                    _ => None,
-                };
                 // The instance hides claims from keys it ranks below 2, so a
                 // new key's claim is on the relay but invisible in this list.
                 const RANK_NOTE: &str = "This instance only lists claims from keys the \
                     issuer's web of trust ranks 2 or higher. A new key has no rank yet, so \
                     your claim can be on the relay and still not show here.";
-                let (title, message) = match bounty {
+                let (title, message) = match self.bounty(&bounty_id) {
                     Some(b) if b.auto_pay_on() => (
                         "Claim published — auto-pay bounty",
                         format!(
                             "With rank {} or higher, {} sats arrive at your Lightning \
                              address within about a minute. Below that, the issuer reviews \
-                             the claim by hand. {RANK_NOTE}",
+                             the claim by hand.",
                             b.auto_pay_min_rank.unwrap_or(0),
                             timefmt::fmt_sats(b.amount_sats)
                         ),
@@ -747,17 +752,16 @@ impl Shell {
                         "Claim published — manual-pay bounty",
                         format!(
                             "This bounty does not auto-pay: the issuer reviews your claim \
-                             and sends the {} sats by hand. {RANK_NOTE}",
+                             and sends the {} sats by hand.",
                             timefmt::fmt_sats(b.amount_sats)
                         ),
                     ),
-                    None => (
-                        "Claim published",
-                        format!("The issuer's relay has it. {RANK_NOTE}"),
-                    ),
+                    None => ("Claim published", "The issuer's relay has it.".to_string()),
                 };
                 window.push_notification(
-                    Notification::info(message).title(title).autohide(false),
+                    Notification::info(format!("{message} {RANK_NOTE}"))
+                        .title(title)
+                        .autohide(false),
                     cx,
                 );
                 // Watch the bounty the claim went to — the form snapshots it
@@ -958,15 +962,19 @@ impl Shell {
     /// active account. The runtime reuses a login already in the keychain, so
     /// pressing it twice never opens two accounts.
     pub(crate) fn create_wallet(&mut self, cx: &mut Context<Self>) {
-        // The house key's wallet lives on the prod payer, not here.
-        if self.wallet.submitting || self.account != Account::Claimant {
+        let account = self.account;
+        if !account.has_local_wallet() {
             return;
         }
-        self.wallet.submitting = true;
-        self.wallet.error = None;
-        let _ = self.commands.unbounded_send(Command::CreateCoinosWallet {
-            account: self.account,
-        });
+        let wallet = &mut self.view_mut(account).wallet;
+        if wallet.submitting {
+            return;
+        }
+        wallet.submitting = true;
+        wallet.error = None;
+        let _ = self
+            .commands
+            .unbounded_send(Command::CreateCoinosWallet { account });
         cx.notify();
     }
 
@@ -1611,6 +1619,9 @@ impl Shell {
             (None, false) => "loading key…".into(),
         };
         let has_key = view.npub.is_some();
+        // The address payouts go to, as the relays have it (or this
+        // session's Coinos signup). Claimants asked where their sats land.
+        let address = view.payout_address().map(SharedString::new);
 
         // The three cards are the issuer's live bounty economics; before the
         // list loads (or when it failed) they say so instead of guessing.
@@ -1705,6 +1716,16 @@ impl Shell {
                                             .text_color(rgb(TEXT_DIM))
                                             .child(identity),
                                     )
+                                    .when_some(address, |this, address| {
+                                        this.child(
+                                            div()
+                                                .mt(px(1.))
+                                                .font_family(MONO)
+                                                .text_size(px(10.5))
+                                                .text_color(rgb(TEXT_DIM))
+                                                .child(address),
+                                        )
+                                    })
                                     .when(has_key, |this| {
                                         this.child(
                                             div()
@@ -1985,7 +2006,7 @@ impl Shell {
                 .into_any_element(),
             Screen::Wallet => {
                 let account = self.account;
-                let panel = wallet::panel(account, self.view(account), &self.wallet, cx);
+                let panel = wallet::panel(account, self.view(account), cx);
                 div()
                     .id("wallet")
                     .flex_1()

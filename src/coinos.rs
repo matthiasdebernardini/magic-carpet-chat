@@ -15,12 +15,25 @@
 //! needs the token), no NWC (this app never pays). Someone who outgrows a
 //! custodial wallet sets a different lud16 in any Nostr client.
 
+use std::sync::LazyLock;
+
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 use crate::secrets::Secret;
 
 const BASE: &str = "https://coinos.io";
-const USER_AGENT: &str = concat!("magic-carpet-chat/", env!("CARGO_PKG_VERSION"));
+
+/// One client for every call: a connection pool, and the builder runs once.
+/// The TLS backend is chosen at compile time, so the build cannot fail for a
+/// reason a retry would fix.
+static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client with the compiled-in rustls backend")
+});
 
 #[derive(thiserror::Error, Debug)]
 pub enum CoinosError {
@@ -76,31 +89,33 @@ impl Login {
     }
 
     pub fn encode(&self) -> Secret {
-        Secret::new(
-            serde_json::json!({
-                "username": self.username,
-                "password": self.password.expose(),
-                "pubkey": self.pubkey,
-            })
-            .to_string(),
-        )
+        let wire = Wire {
+            username: self.username.clone(),
+            password: self.password.expose().to_string(),
+            pubkey: self.pubkey.clone(),
+        };
+        Secret::new(serde_json::to_string(&wire).expect("three strings serialize"))
     }
 
-    /// `None` for a keychain entry this app did not write.
+    /// `None` for a keychain entry this app did not write. Every field is
+    /// required: a partial entry is unreadable, not half a login.
     pub fn decode(secret: &Secret) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(secret.expose()).ok()?;
-        let field = |key: &str| value.get(key)?.as_str().map(str::to_string);
+        let wire: Wire = serde_json::from_str(secret.expose()).ok()?;
         Some(Self {
-            username: field("username")?,
-            password: Secret::new(field("password")?),
-            pubkey: field("pubkey")?,
+            username: wire.username,
+            password: Secret::new(wire.password),
+            pubkey: wire.pubkey,
         })
     }
 }
 
-pub struct NewWallet {
-    pub username: String,
-    pub lightning_address: String,
+/// The keychain JSON shape of a [`Login`]. Private: the password is a plain
+/// string here, and this struct only ever lives inside `encode`/`decode`.
+#[derive(Serialize, Deserialize)]
+struct Wire {
+    username: String,
+    password: String,
+    pubkey: String,
 }
 
 pub fn lightning_address(username: &str) -> String {
@@ -110,7 +125,7 @@ pub fn lightning_address(username: &str) -> String {
 /// Coinos requires 2-24 letters or digits and lowercases the name itself
 /// (lib/register.ts). A random suffix keeps signup from colliding with an
 /// existing account, which returns an error rather than a login.
-pub fn suggest_username() -> String {
+fn suggest_username() -> String {
     let mut rng = rand::rng();
     let suffix: String = (0..8)
         .map(|_| {
@@ -121,7 +136,7 @@ pub fn suggest_username() -> String {
     format!("carpet{suffix}")
 }
 
-pub fn generate_password() -> Secret {
+fn generate_password() -> Secret {
     let mut rng = rand::rng();
     let alphabet = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     Secret::new(
@@ -131,22 +146,14 @@ pub fn generate_password() -> Secret {
     )
 }
 
-fn http() -> Result<reqwest::Client, CoinosError> {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| CoinosError::Http(e.to_string()))
-}
-
 /// Register `username` bound to `pubkey_hex`. The caller must already hold
 /// the login in the keychain: an `Http` error here leaves the outcome unknown.
 pub async fn create_wallet(
     username: &str,
     password: &Secret,
     pubkey_hex: &str,
-) -> Result<NewWallet, CoinosError> {
-    let resp = http()?
+) -> Result<(), CoinosError> {
+    let resp = CLIENT
         .post(format!("{BASE}/api/register"))
         .json(&serde_json::json!({
             "user": {
@@ -174,18 +181,14 @@ pub async fn create_wallet(
             "unexpected signup response: no token".into(),
         ));
     }
-
-    Ok(NewWallet {
-        username: username.to_string(),
-        lightning_address: lightning_address(username),
-    })
+    Ok(())
 }
 
 /// Does a Coinos account answer at this username? Public endpoint, no token.
 /// Used on retry: a login saved before a signup that never reported back may
 /// or may not name a real account, and this settles it before re-registering.
 pub async fn wallet_exists(username: &str) -> Result<bool, CoinosError> {
-    let resp = http()?
+    let resp = CLIENT
         .get(format!("{BASE}/.well-known/lnurlp/{username}"))
         .send()
         .await

@@ -78,7 +78,7 @@ fn main() {
         // aborts the process with "there is no reactor running". Verified.
         // The connection keep-alives the client sets (TCP 30 s, HTTP/2 15 s) already
         // catch a dead peer, so the timeout buys nothing here anyway.
-        match reqwest_client::ReqwestClient::user_agent("magic-carpet-chat/0.1") {
+        match reqwest_client::ReqwestClient::user_agent(magic_carpet_chat::USER_AGENT) {
             Ok(client) => cx.set_http_client(Arc::new(client)),
             Err(error) => eprintln!("could not build the HTTP client: {error}"),
         }

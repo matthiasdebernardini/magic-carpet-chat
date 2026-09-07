@@ -17,17 +17,16 @@ use gpui_kit::*;
 
 use magic_carpet_chat::secrets::Account;
 
-use crate::dashboard::MONO;
+use crate::dashboard::{MONO, muted};
 use crate::palette::*;
 use crate::shell::{Shell, short_npub};
 use crate::wallet;
 
 /// What the import came back with — public material only, straight from
-/// `Update::ImportReady`.
+/// `Update::ImportReady`. The name and lud16 live on the claimant's
+/// `AccountView`, where `ProfileLoaded` put them just before.
 pub struct ImportSummary {
     pub npub: String,
-    pub name: Option<String>,
-    pub lud16: Option<String>,
     /// False when the profile probe itself failed: the lud16 line then says
     /// "couldn't check" instead of claiming there is none.
     pub profile_checked: bool,
@@ -94,13 +93,6 @@ fn card_title(text: &'static str) -> impl IntoElement {
         .child(text)
 }
 
-fn muted(text: impl Into<SharedString>) -> impl IntoElement {
-    div()
-        .text_size(px(12.))
-        .text_color(rgb(TEXT_MUTED))
-        .child(text.into())
-}
-
 /// The logo tile from the icon rail, drawn a little larger.
 fn logo() -> impl IntoElement {
     div()
@@ -137,18 +129,17 @@ fn dot_row(dot: u32, text: impl Into<SharedString>, color: u32) -> AnyElement {
 }
 
 /// The success panel: what the key resolved to, and the Start button.
-fn ready_panel(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
-    let summary = shell
-        .onboarding
-        .ready
-        .as_ref()
-        .expect("ready_panel is rendered only once the import came back");
+fn ready_panel(shell: &Shell, summary: &ImportSummary, cx: &mut Context<Shell>) -> AnyElement {
     let generated = shell.onboarding.generated;
-    let identity: SharedString = match &summary.name {
+    let view = shell.view(Account::Claimant);
+    let identity: SharedString = match &view.kind0_name {
         Some(name) => format!("{name} · {}", short_npub(&summary.npub)).into(),
         None => short_npub(&summary.npub).into(),
     };
-    let lud16_row = if let Some(lud16) = &summary.lud16 {
+    // A wallet opened from this panel keeps the panel: its address and QR
+    // are the point, and the lud16 it just published would otherwise hide it.
+    let lud16 = view.lud16.as_ref().filter(|_| view.wallet.created.is_none());
+    let lud16_row = if let Some(lud16) = lud16 {
         dot_row(GREEN, format!("Lightning address: {lud16}"), TEXT)
     } else if !summary.profile_checked {
         dot_row(
@@ -160,8 +151,7 @@ fn ready_panel(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         // No lud16, and we know it: instead of sending the person to another
         // app to add one, open a wallet right here. The panel shows the
         // address and a funding QR once the signup lands.
-        let view = shell.view(Account::Claimant);
-        let panel = wallet::panel(Account::Claimant, view, &shell.wallet, cx);
+        let panel = wallet::panel(Account::Claimant, view, cx);
         v_flex()
             .gap(px(8.))
             .when(!summary.profile_found && !generated, |this| {
@@ -225,16 +215,18 @@ fn ready_panel(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
 fn key_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let onboarding = &shell.onboarding;
     let body: AnyElement = match &onboarding.ready {
-        Some(_) => ready_panel(shell, cx),
+        Some(summary) => ready_panel(shell, summary, cx),
         None => v_flex()
             .gap(px(8.))
             .child(muted(
                 "Paste your Nostr secret key. It stays in this Mac's keychain — \
                  the app only ever shares your public identity.",
+                TEXT_MUTED,
             ))
             .child(muted(
                 "It starts with nsec1 — copy it from your Nostr app \
                  (Settings > Keys in Primal or Damus).",
+                TEXT_MUTED,
             ))
             .child(
                 div()
@@ -286,6 +278,7 @@ fn browse_card(cx: &mut Context<Shell>) -> AnyElement {
         .child(card_title("Just look around"))
         .child(muted(
             "Browse the bounties read-only. You can add a key later from the sidebar.",
+            TEXT_MUTED,
         ))
         .child(
             div()

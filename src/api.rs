@@ -376,6 +376,7 @@ impl Api {
 
     pub fn with_base(base: impl Into<String>) -> Result<Self, ApiError> {
         let http = reqwest::Client::builder()
+            .user_agent(crate::USER_AGENT)
             .cookie_store(true)
             .timeout(Duration::from_secs(20))
             .build()

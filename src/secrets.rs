@@ -6,6 +6,9 @@
 //! anywhere in the app, or a secret embedded in an error chain, cannot leak
 //! the value into a log line.
 
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
 use keyring::Entry;
 use nostr_sdk::prelude::*;
 
@@ -33,12 +36,20 @@ impl Account {
 
     /// The Coinos username + password this app opened for the account, as
     /// one JSON string (see `coinos::Login`). Its own entry, so forgetting the
-    /// nsec and forgetting the wallet login stay separate decisions.
-    fn coinos_entry_key(self) -> &'static str {
+    /// nsec and forgetting the wallet login stay separate decisions. Public
+    /// because the UI names the entry when it tells the user where the
+    /// password lives.
+    pub fn coinos_entry_key(self) -> &'static str {
         match self {
             Account::Issuer => "issuer-coinos-login",
             Account::Claimant => "claimant-coinos-login",
         }
+    }
+
+    /// Whether this app opens and shows a wallet for the account. Only the
+    /// claimant: the issuer's wallet is the prod payer's, managed elsewhere.
+    pub fn has_local_wallet(self) -> bool {
+        self == Account::Claimant
     }
 
     /// Env override, checked before the keychain so automated runs never need
@@ -109,6 +120,10 @@ impl std::fmt::Display for Secret {
     }
 }
 
+fn keyring_err(e: impl std::fmt::Display) -> SecretError {
+    SecretError::Keyring(e.to_string())
+}
+
 /// Surfaces a missing or locked OS credential store at startup instead of at
 /// the first save.
 pub fn store_available() -> Result<(), SecretError> {
@@ -118,7 +133,7 @@ pub fn store_available() -> Result<(), SecretError> {
     Entry::store_status()
         .as_ref()
         .copied()
-        .map_err(|e| SecretError::Keyring(e.to_string()))
+        .map_err(keyring_err)
 }
 
 /// Debug builds keep secrets in plain 0600 files instead of the keychain:
@@ -126,14 +141,22 @@ pub fn store_available() -> Result<(), SecretError> {
 /// login password on each launch. Release builds always use the keychain.
 const DEV_STORE: bool = cfg!(debug_assertions);
 
-fn dev_dir() -> Result<std::path::PathBuf, SecretError> {
-    let home = std::env::var("HOME").map_err(|e| SecretError::Keyring(e.to_string()))?;
-    let dir = std::path::PathBuf::from(home)
-        .join("Library/Application Support")
-        .join(SERVICE)
-        .join("dev-secrets");
-    std::fs::create_dir_all(&dir).map_err(|e| SecretError::Keyring(e.to_string()))?;
-    Ok(dir)
+/// The dev-store directory, resolved and created once per process. The
+/// failure is kept as text because `SecretError` does not clone.
+fn dev_dir() -> Result<&'static Path, SecretError> {
+    static DEV_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    DEV_DIR
+        .get_or_init(|| {
+            let dir = std::env::home_dir()
+                .ok_or_else(|| "no home directory".to_string())?
+                .join("Library/Application Support")
+                .join(SERVICE)
+                .join("dev-secrets");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            Ok(dir)
+        })
+        .as_deref()
+        .map_err(keyring_err)
 }
 
 fn get(key: &str) -> Result<Option<String>, SecretError> {
@@ -141,13 +164,13 @@ fn get(key: &str) -> Result<Option<String>, SecretError> {
         return match std::fs::read_to_string(dev_dir()?.join(key)) {
             Ok(value) => Ok(Some(value)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(SecretError::Keyring(e.to_string())),
+            Err(e) => Err(keyring_err(e)),
         };
     }
     match entry(key)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(SecretError::Keyring(e.to_string())),
+        Err(e) => Err(keyring_err(e)),
     }
 }
 
@@ -161,14 +184,10 @@ fn set(key: &str, value: &str) -> Result<(), SecretError> {
             .truncate(true)
             .mode(0o600)
             .open(dev_dir()?.join(key))
-            .map_err(|e| SecretError::Keyring(e.to_string()))?;
-        return file
-            .write_all(value.as_bytes())
-            .map_err(|e| SecretError::Keyring(e.to_string()));
+            .map_err(keyring_err)?;
+        return file.write_all(value.as_bytes()).map_err(keyring_err);
     }
-    entry(key)?
-        .set_password(value)
-        .map_err(|e| SecretError::Keyring(e.to_string()))
+    entry(key)?.set_password(value).map_err(keyring_err)
 }
 
 /// An entry that was never stored is already forgotten, so "not found" is success.
@@ -177,17 +196,17 @@ fn del(key: &str) -> Result<(), SecretError> {
         return match std::fs::remove_file(dev_dir()?.join(key)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(SecretError::Keyring(e.to_string())),
+            Err(e) => Err(keyring_err(e)),
         };
     }
     match entry(key)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(SecretError::Keyring(e.to_string())),
+        Err(e) => Err(keyring_err(e)),
     }
 }
 
 fn entry(key: &str) -> Result<Entry, SecretError> {
-    Entry::new(SERVICE, key).map_err(|e| SecretError::Keyring(e.to_string()))
+    Entry::new(SERVICE, key).map_err(keyring_err)
 }
 
 pub fn store_nsec(account: Account, nsec: &Secret) -> Result<(), SecretError> {

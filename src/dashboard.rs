@@ -19,6 +19,15 @@ use crate::timefmt;
 /// The mock's monospace face, used for every sats figure and every npub.
 pub const MONO: &str = "Menlo";
 
+/// One line of small secondary text in `color`.
+pub(crate) fn muted(text: impl Into<SharedString>, color: u32) -> AnyElement {
+    div()
+        .text_size(px(12.5))
+        .text_color(rgb(color))
+        .child(text.into())
+        .into_any_element()
+}
+
 /// A round account marker. `size` is the diameter; the initials scale with it.
 pub fn avatar(
     initials: impl Into<SharedString>,
@@ -315,7 +324,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
 
     let action_label = match shell.account {
         Account::Issuer => "+ New DList + bounty",
-        Account::Claimant => "+ Claim an item",
+        Account::Claimant => "+ Submit a bounty claim",
     };
     // With no key for the active account the CTA cannot do what it says —
     // it dims, and a click (like ⌘N) routes to the sidebar key input.

@@ -657,7 +657,7 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
 pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
     let action_label = match shell.account {
         Account::Issuer => "+ New DList + bounty (⌘N)",
-        Account::Claimant => "+ Claim selected (⌘N)",
+        Account::Claimant => "+ Submit a bounty claim (⌘N)",
     };
     // No key for the active account: the CTA dims, and a click (like ⌘N)
     // routes to the sidebar key input instead of a form that cannot submit.

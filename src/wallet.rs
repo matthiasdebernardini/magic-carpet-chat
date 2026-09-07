@@ -7,30 +7,23 @@
 //! only sends `Command::CreateCoinosWallet` and draws what came back. The
 //! Coinos password never reaches this module — it lives in the keychain.
 
+use std::sync::Arc;
+
 use gpui_kit::component::{Sizable as _, h_flex, spinner::Spinner, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use qrcode::{Color, QrCode};
 
 use magic_carpet_chat::coinos::lnurl_pay;
+use magic_carpet_chat::nostr::WalletCreated;
 use magic_carpet_chat::secrets::Account;
 
-use crate::dashboard::MONO;
+use crate::dashboard::{MONO, muted};
 use crate::palette::*;
 use crate::shell::{AccountView, Shell};
 
-/// What `Update::WalletCreated` said — public material only.
-pub struct WalletCreated {
-    pub account: Account,
-    pub username: String,
-    pub lightning_address: String,
-    /// Set when the wallet exists but the kind-0 write failed: fixed text
-    /// from the runtime, shown in amber under the retry button.
-    pub publish_error: Option<String>,
-}
-
-/// The signup as the UI sees it. One per app, not per account: the flow is
-/// for the claimant only. The issuer's wallet is the prod payer's, so its
+/// The signup as the UI sees it, one per account view. The flow only ever
+/// runs for the claimant; the issuer's wallet is the prod payer's, so its
 /// panel never offers the button.
 #[derive(Default)]
 pub struct WalletState {
@@ -38,20 +31,35 @@ pub struct WalletState {
     pub created: Option<WalletCreated>,
     /// Fixed text from the runtime — never the password.
     pub error: Option<String>,
+    /// The funding QR for the address on screen, keyed by that address so it
+    /// is encoded when the address changes, not on every frame. The inner
+    /// `None` is an address the QR encoder refused.
+    qr: Option<(String, Option<Arc<QrCode>>)>,
+}
+
+impl WalletState {
+    /// Re-encode the QR if `address` is not the one it was built for. Called
+    /// from the shell whenever the address can change; a no-op otherwise.
+    pub fn sync_qr(&mut self, address: Option<&str>) {
+        let Some(address) = address else {
+            self.qr = None;
+            return;
+        };
+        if self.qr.as_ref().is_some_and(|(known, _)| known == address) {
+            return;
+        }
+        // No LNURL means no QR and no hint, exactly as if nothing was known.
+        self.qr = lnurl_pay(address).map(|lnurl| {
+            let code = QrCode::new(format!("lightning:{lnurl}").as_bytes()).ok().map(Arc::new);
+            (address.to_string(), code)
+        });
+    }
 }
 
 /// The QR square's edge, including the quiet zone.
 const QR_SIZE: f32 = 220.;
 /// LUD-01 asks for a 4-module quiet zone around the code.
 const QUIET_ZONE: usize = 4;
-
-fn muted(text: impl Into<SharedString>, color: u32) -> AnyElement {
-    div()
-        .text_size(px(12.5))
-        .text_color(rgb(color))
-        .child(text.into())
-        .into_any_element()
-}
 
 fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div> {
     let base = div()
@@ -80,15 +88,14 @@ fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div>
 /// `lightning:<LNURL>` painted module by module: white square, one quad per
 /// dark module, no image crate and no asset. Modules snap to whole pixels so
 /// the grid has no hairline seams a camera could misread.
-fn qr(text: &str) -> AnyElement {
-    let Ok(code) = QrCode::new(text.as_bytes()) else {
+fn qr(code: Option<Arc<QrCode>>) -> AnyElement {
+    let Some(code) = code else {
         return muted("Could not draw the QR code.", RED);
     };
-    let width = code.width();
-    let modules: Vec<Color> = code.to_colors();
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
+            let width = code.width();
             window.paint_quad(fill(bounds, rgb(0xffffff)));
             let total = (width + 2 * QUIET_ZONE) as f32;
             let cell = (bounds.size.width / total).floor();
@@ -97,7 +104,7 @@ fn qr(text: &str) -> AnyElement {
             let origin = bounds.origin + point(inset, inset);
             for y in 0..width {
                 for x in 0..width {
-                    if modules[y * width + x] == Color::Dark {
+                    if code[(x, y)] == Color::Dark {
                         let corner = origin
                             + point(
                                 cell * (x + QUIET_ZONE) as f32,
@@ -116,21 +123,13 @@ fn qr(text: &str) -> AnyElement {
     .into_any_element()
 }
 
-/// The panel for `account`. `view.lud16` is the profile as the relays have
-/// it; `state` is this session's signup, if any.
-pub fn panel(
-    account: Account,
-    view: &AccountView,
-    state: &WalletState,
-    cx: &mut Context<Shell>,
-) -> AnyElement {
-    let created = state
-        .created
-        .as_ref()
-        .filter(|created| created.account == account);
-    let address = created
-        .map(|created| created.lightning_address.clone())
-        .or_else(|| view.lud16.clone());
+/// The panel for `account`: `view.lud16` is the profile as the relays have
+/// it, `view.wallet` this session's signup, if any.
+pub fn panel(account: Account, view: &AccountView, cx: &mut Context<Shell>) -> AnyElement {
+    let local = account.has_local_wallet();
+    let state = &view.wallet;
+    let created = state.created.as_ref();
+    let address = view.payout_address();
 
     let body = if state.submitting {
         h_flex()
@@ -139,7 +138,6 @@ pub fn panel(
             .child(Spinner::new().small().color(rgb(TEXT_MUTED).into()))
             .child(muted("Opening a Coinos wallet…", TEXT_MUTED))
     } else if let Some(address) = address {
-        let lnurl = lnurl_pay(&address);
         v_flex()
             .gap(px(10.))
             .child(
@@ -152,11 +150,11 @@ pub fn panel(
                             .font_family(MONO)
                             .text_size(px(13.))
                             .text_color(rgb(TEXT))
-                            .child(SharedString::from(address.clone())),
+                            .child(SharedString::new(address)),
                     ),
             )
-            .when_some(lnurl, |this, lnurl| {
-                this.child(qr(&format!("lightning:{lnurl}"))).child(muted(
+            .when_some(state.qr.as_ref().map(|(_, code)| code.clone()), |this, code| {
+                this.child(qr(code)).child(muted(
                     "Scan with Strike or any Lightning wallet to add sats.",
                     TEXT_MUTED,
                 ))
@@ -170,8 +168,9 @@ pub fn panel(
                         .child(muted(
                             format!(
                                 "Coinos username {} — password saved in this Mac's keychain \
-                                 under {account}-coinos-login.",
-                                created.username
+                                 under {}.",
+                                created.username,
+                                account.coinos_entry_key()
                             ),
                             TEXT_MUTED,
                         ))
@@ -191,7 +190,7 @@ pub fn panel(
                          claims will not be paid until it is.",
                         AMBER,
                     ))
-                    .when(account == Account::Claimant, |this| {
+                    .when(local, |this| {
                         this.child(
                             button("wallet-retry-publish", "Retry publishing", false)
                                 .on_click(cx.listener(|this, _, _, cx| this.create_wallet(cx))),
@@ -200,7 +199,7 @@ pub fn panel(
                     .child(muted(error, AMBER))
                 })
             })
-    } else if account == Account::Claimant {
+    } else if local {
         v_flex()
             .gap(px(10.))
             .child(muted(

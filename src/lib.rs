@@ -6,6 +6,9 @@
 //! [`nostr::spawn_runtime`] and never touches a tokio-dependent future on the
 //! gpui executor.
 
+/// What every HTTP client this app builds announces itself as.
+pub const USER_AGENT: &str = concat!("magic-carpet-chat/", env!("CARGO_PKG_VERSION"));
+
 pub mod api;
 pub mod coinos;
 pub mod events;

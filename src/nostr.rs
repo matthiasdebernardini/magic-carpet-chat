@@ -162,12 +162,11 @@ pub enum Update {
     /// [`SecretError`] — it never echoes the input.
     ImportFailed { account: Account, message: String },
     /// A pasted key is stored and its profile probe finished. Only public
-    /// material: the npub, and what the kind-0 said.
+    /// material: the npub, and whether a kind-0 was found (its fields went
+    /// out in `ProfileLoaded` just before).
     ImportReady {
         account: Account,
         npub: String,
-        name: Option<String>,
-        lud16: Option<String>,
         /// False when the profile probe itself failed (network, API): the
         /// lud16 line then says "couldn't check" instead of claiming "none".
         profile_checked: bool,
@@ -213,15 +212,10 @@ pub enum Update {
         /// receipt learned late never masquerades as an instant payout.
         at: u64,
     },
-    /// A Coinos account exists for this key. `publish_error` is set when the
-    /// kind-0 write did not reach the relays: the wallet is real, but the
-    /// payer cannot see the address yet, so the UI offers a retry. Public
-    /// material only — fixed text, and the password stays in the keychain.
+    /// A Coinos account exists for the account's key; see [`WalletCreated`].
     WalletCreated {
         account: Account,
-        username: String,
-        lightning_address: String,
-        publish_error: Option<String>,
+        created: WalletCreated,
     },
     /// Fixed text from `coinos::CoinosError` or [`SecretError`]; never the
     /// password.
@@ -230,6 +224,17 @@ pub enum Update {
         source: ErrorSource,
         message: String,
     },
+}
+
+/// What the wallet signup came back with. `publish_error` is set when the
+/// kind-0 write did not reach the relays: the wallet is real, but the payer
+/// cannot see the address yet, so the UI offers a retry. Public material
+/// only — fixed text, and the password stays in the keychain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WalletCreated {
+    pub username: String,
+    pub lightning_address: String,
+    pub publish_error: Option<String>,
 }
 
 pub struct NostrHandle {
@@ -548,48 +553,72 @@ async fn publish_claim(
     Ok(event.id.to_hex())
 }
 
-/// What one kind-0 said, trimmed to the fields the UI uses.
-struct Kind0Profile {
+/// One account's kind-0 content through the instance's public scan endpoint
+/// (kind 0 is replaceable, so the relay holds at most the latest). `Ok(None)`:
+/// the scan worked and found no profile. `Err(())`: the scan itself failed —
+/// the caller decides whether that is silent (startup) or shown (onboarding).
+async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<String>, ()> {
+    let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
+    let events = api.scan(&filter).await.map_err(|_| ())?;
+    Ok(events.into_iter().next().map(|event| event.content))
+}
+
+/// The kind-0 fields the UI shows, read field by field from the JSON so one
+/// odd value elsewhere in the profile hides nothing else. `name` is
+/// `display_name` first, then `name`; a non-string or blank value counts as
+/// absent, so a profile holding `"name": ""` still falls back to the local
+/// label. Unparseable or non-object content is an empty profile: the
+/// fallback labels are the defined behaviour when nothing is known.
+#[derive(Debug, Default, PartialEq)]
+struct Profile {
     name: Option<String>,
     picture: Option<String>,
     lud16: Option<String>,
 }
 
-/// One account's kind-0 through the instance's public scan endpoint (kind 0
-/// is replaceable, so the relay holds at most the latest). `Ok(None)`: the
-/// scan worked and found no profile. `Err(())`: the scan itself failed — the
-/// caller decides whether that is silent (startup) or shown (onboarding).
-async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<Kind0Profile>, ()> {
-    let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
-    let events = api.scan(&filter).await.map_err(|_| ())?;
-    let Some(event) = events.first() else {
-        return Ok(None);
-    };
-    let content: serde_json::Value = serde_json::from_str(&event.content).unwrap_or_default();
-    Ok(Some(profile_fields(&content)))
-}
-
-fn profile_fields(content: &serde_json::Value) -> Kind0Profile {
-    let field = |key: &str| {
-        content
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    Kind0Profile {
-        name: field("display_name").or_else(|| field("name")),
-        picture: field("picture"),
-        lud16: field("lud16"),
+impl Profile {
+    fn from_value(value: &serde_json::Value) -> Self {
+        let field = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            name: field("display_name").or_else(|| field("name")),
+            picture: field("picture"),
+            lud16: field("lud16"),
+        }
     }
 }
 
-/// The new kind-0 content: the existing profile with ONLY `lud16` changed.
+/// A kind-0's content read field by field; see [`Profile`].
+fn parse_profile(content: &str) -> Profile {
+    serde_json::from_str(content)
+        .map(|value: serde_json::Value| Profile::from_value(&value))
+        .unwrap_or_default()
+}
+
+/// The `ProfileLoaded` an account's kind-0 amounts to.
+fn profile_loaded(account: Account, profile: Profile) -> Update {
+    Update::ProfileLoaded {
+        account,
+        name: profile.name,
+        picture: profile.picture,
+        lud16: profile.lud16,
+    }
+}
+
+/// The new kind-0: the existing profile with ONLY `lud16` changed.
 ///
 /// The same nsec may also live in a phone app or a browser extension, so this
 /// app is not the only writer of this profile. Merge, never rebuild — a
 /// kind-0 made from nothing wipes the name and picture set elsewhere on every
-/// relay that accepts it. `None` existing content means "confirmed no
+/// relay that accepts it. The content is handled field by field as plain
+/// JSON: every other key is carried through untouched, `null` values and
+/// wrong-typed fields included. `None` existing content means "confirmed no
 /// profile", and only that may start from a blank one; anything that is not
 /// a JSON object is left alone rather than overwritten.
 fn merge_lud16(
@@ -598,19 +627,16 @@ fn merge_lud16(
 ) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
     let mut profile = match existing.map(str::trim) {
         None | Some("") => serde_json::Map::new(),
-        Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+        Some(text) => match serde_json::from_str(text) {
             Ok(serde_json::Value::Object(map)) => map,
             _ => {
                 return Err(BridgeError::Profile(
-                    "Your current profile is not a JSON object, so it was left alone",
+                    "Your current profile could not be read, so it was left alone",
                 ));
             }
         },
     };
-    profile.insert(
-        "lud16".to_string(),
-        serde_json::Value::String(lud16.to_string()),
-    );
+    profile.insert("lud16".into(), serde_json::Value::String(lud16.to_string()));
     Ok(profile)
 }
 
@@ -625,13 +651,12 @@ async fn publish_lud16(
     api: &Api,
     lud16: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
-    let pubkey = keys.public_key().to_hex();
-    let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
-    let events = api.scan(&filter).await.map_err(|_| {
-        BridgeError::Profile("Could not read your current profile from the instance")
-    })?;
-    let existing = events.first().map(|event| event.content.as_str());
-    let profile = merge_lud16(existing, lud16)?;
+    let existing = fetch_kind0(api, &keys.public_key().to_hex())
+        .await
+        .map_err(|_| {
+            BridgeError::Profile("Could not read your current profile from the instance")
+        })?;
+    let profile = merge_lud16(existing.as_deref(), lud16)?;
     let content = serde_json::Value::Object(profile.clone()).to_string();
     let event = EventBuilder::new(Kind::Metadata, content)
         .finalize(keys)
@@ -696,7 +721,8 @@ async fn create_coinos_wallet(
             None => {
                 return fail(format!(
                     "The saved Coinos login for this account is unreadable — remove the \
-                     {account}-coinos-login keychain entry and try again."
+                     {} keychain entry and try again.",
+                    account.coinos_entry_key()
                 ));
             }
         },
@@ -734,18 +760,15 @@ async fn create_coinos_wallet(
     // `WalletCreated` so the panel can show it next to the retry button.
     let _ = updates.unbounded_send(Update::WalletCreated {
         account,
-        username: login.username.clone(),
-        lightning_address: lightning_address.clone(),
-        publish_error: published.as_ref().err().map(ToString::to_string),
+        created: WalletCreated {
+            username: login.username,
+            lightning_address,
+            publish_error: published.as_ref().err().map(ToString::to_string),
+        },
     });
     if let Ok(profile) = published {
-        let fields = profile_fields(&serde_json::Value::Object(profile));
-        let _ = updates.unbounded_send(Update::ProfileLoaded {
-            account,
-            name: fields.name,
-            picture: fields.picture,
-            lud16: Some(lightning_address),
-        });
+        let profile = Profile::from_value(&serde_json::Value::Object(profile));
+        let _ = updates.unbounded_send(profile_loaded(account, profile));
     }
 }
 
@@ -786,13 +809,8 @@ async fn load_one_account(account: Account, updates: &mpsc::UnboundedSender<Upda
     // A scan failure is not an error state: the UI's fallback labels are
     // the defined behaviour when no profile is known.
     let Ok(api) = Api::new() else { return };
-    if let Ok(Some(profile)) = fetch_kind0(&api, &pubkey).await {
-        let _ = updates.unbounded_send(Update::ProfileLoaded {
-            account,
-            name: profile.name,
-            picture: profile.picture,
-            lud16: profile.lud16,
-        });
+    if let Ok(Some(content)) = fetch_kind0(&api, &pubkey).await {
+        let _ = updates.unbounded_send(profile_loaded(account, parse_profile(&content)));
     }
 }
 
@@ -870,25 +888,14 @@ async fn import_key(
         Err(()) => (None, false),
     };
     let profile_found = profile.is_some();
-    let (name, lud16) = match profile {
-        Some(profile) => {
-            let name = profile.name.clone();
-            let lud16 = profile.lud16.clone();
-            let _ = updates.unbounded_send(Update::ProfileLoaded {
-                account,
-                name: profile.name,
-                picture: profile.picture,
-                lud16: profile.lud16,
-            });
-            (name, lud16)
-        }
-        None => (None, None),
-    };
+    // The profile lands on the account view first, so the onboarding summary
+    // that follows can read the name and lud16 from there.
+    if let Some(content) = profile {
+        let _ = updates.unbounded_send(profile_loaded(account, parse_profile(&content)));
+    }
     let _ = updates.unbounded_send(Update::ImportReady {
         account,
         npub,
-        name,
-        lud16,
         profile_checked,
         profile_found,
     });
@@ -1411,22 +1418,48 @@ mod tests {
         assert_eq!(merged["nip05"], "m@x.io");
         assert_eq!(merged["custom"]["deep"], 1);
         assert_eq!(merged["lud16"], "carpet1234@coinos.io");
+        // What goes on the wire: every original key plus lud16, nothing else.
         assert_eq!(merged.len(), 6);
 
         // An existing lud16 is replaced, not duplicated.
         let merged = merge_lud16(Some(r#"{"lud16":"old@strike.me","name":"M"}"#), "new@coinos.io").unwrap();
         assert_eq!(merged["lud16"], "new@coinos.io");
         assert_eq!(merged["name"], "M");
+        assert_eq!(merged.len(), 2);
+
+        // A wrong-typed field elsewhere survives as it was.
+        let merged = merge_lud16(Some(r#"{"name":"Alice","about":42}"#), "a@coinos.io").unwrap();
+        assert_eq!(merged["name"], "Alice");
+        assert_eq!(merged["about"], 42);
+
+        // A wrong-typed lud16 is replaced and the rest kept.
+        let merged = merge_lud16(Some(r#"{"name":"Alice","lud16":123}"#), "a@coinos.io").unwrap();
+        assert_eq!(merged["lud16"], "a@coinos.io");
+        assert_eq!(merged["name"], "Alice");
+
+        // A null value keeps its key.
+        let merged = merge_lud16(Some(r#"{"about":null}"#), "a@coinos.io").unwrap();
+        assert!(merged.contains_key("about"));
+        assert!(merged["about"].is_null());
 
         // Only a confirmed-absent profile may start from blank.
-        let merged = merge_lud16(None, "new@coinos.io").unwrap();
-        assert_eq!(merged.len(), 1);
-        let merged = merge_lud16(Some(""), "new@coinos.io").unwrap();
-        assert_eq!(merged.len(), 1);
+        let blank = serde_json::json!({ "lud16": "new@coinos.io" });
+        assert_eq!(merge_lud16(None, "new@coinos.io").unwrap(), *blank.as_object().unwrap());
+        assert_eq!(merge_lud16(Some(""), "new@coinos.io").unwrap(), *blank.as_object().unwrap());
 
         // Content that is not an object is left alone rather than clobbered.
         assert!(merge_lud16(Some("[1,2]"), "x@y.z").is_err());
         assert!(merge_lud16(Some("not json"), "x@y.z").is_err());
+    }
+
+    #[test]
+    fn a_profile_is_read_field_by_field() {
+        let profile = parse_profile(r#"{"name":"Alice","about":42}"#);
+        assert_eq!(profile.name.as_deref(), Some("Alice"));
+        let profile = parse_profile(r#"{"display_name":"","name":"A"}"#);
+        assert_eq!(profile.name.as_deref(), Some("A"));
+        assert_eq!(parse_profile("[1,2]"), Profile::default());
+        assert_eq!(parse_profile("not json"), Profile::default());
     }
 
     #[test]
@@ -1442,9 +1475,11 @@ mod tests {
         assert_eq!(printed, "CreateCoinosWallet { account: Claimant }");
         let update = Update::WalletCreated {
             account: Account::Claimant,
-            username: "carpetab12cd34".into(),
-            lightning_address: "carpetab12cd34@coinos.io".into(),
-            publish_error: Some("The relays did not accept the profile update".into()),
+            created: WalletCreated {
+                username: "carpetab12cd34".into(),
+                lightning_address: "carpetab12cd34@coinos.io".into(),
+                publish_error: Some("The relays did not accept the profile update".into()),
+            },
         };
         assert!(!format!("{update:?}").contains("password"));
     }

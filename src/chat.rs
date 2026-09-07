@@ -279,8 +279,8 @@ fn api_key() -> Option<Secret> {
     std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .or_else(|| {
-            let home = std::env::var("HOME").ok()?;
-            std::fs::read_to_string(format!("{home}/.config/anthropic/key")).ok()
+            let home = std::env::home_dir()?;
+            std::fs::read_to_string(home.join(".config/anthropic/key")).ok()
         })
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty())
