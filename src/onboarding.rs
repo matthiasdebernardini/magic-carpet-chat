@@ -7,17 +7,20 @@
 //! the key again after the send. The input is masked, and a rejected paste is
 //! answered with fixed text that never echoes what was typed.
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use magic_carpet_chat::secrets::Account;
 
 use crate::dashboard::MONO;
 use crate::palette::*;
 use crate::shell::{Shell, short_npub};
+use crate::wallet;
 
 /// What the import came back with — public material only, straight from
 /// `Update::ImportReady`.
@@ -100,26 +103,14 @@ fn muted(text: impl Into<SharedString>) -> impl IntoElement {
 
 /// The logo tile from the icon rail, drawn a little larger.
 fn logo() -> impl IntoElement {
-    let bar = |width: f32, alpha: u32| {
-        div()
-            .w(px(width))
-            .h(px(5.))
-            .rounded(px(2.5))
-            .bg(rgba(0x0d0d1400 | alpha))
-    };
-    v_flex()
+    div()
         .size(px(52.))
         .rounded(px(14.))
-        .bg(grad(ACCENT_DEEP, ACCENT_PALE))
-        .items_center()
-        .justify_center()
-        .gap(px(4.))
+        .overflow_hidden()
         .shadow(vec![
             BoxShadow::new(px(0.), px(6.), wash(ACCENT_GLOW)).blur_radius(px(22.)),
         ])
-        .child(bar(26., 0xcc))
-        .child(bar(18., 0x99))
-        .child(bar(10., 0x66))
+        .child(img(crate::icons::icon("logo")).size_full())
 }
 
 fn dot_row(dot: u32, text: impl Into<SharedString>, color: u32) -> AnyElement {
@@ -146,7 +137,13 @@ fn dot_row(dot: u32, text: impl Into<SharedString>, color: u32) -> AnyElement {
 }
 
 /// The success panel: what the key resolved to, and the Start button.
-fn ready_panel(summary: &ImportSummary, generated: bool, cx: &mut Context<Shell>) -> AnyElement {
+fn ready_panel(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
+    let summary = shell
+        .onboarding
+        .ready
+        .as_ref()
+        .expect("ready_panel is rendered only once the import came back");
+    let generated = shell.onboarding.generated;
     let identity: SharedString = match &summary.name {
         Some(name) => format!("{name} · {}", short_npub(&summary.npub)).into(),
         None => short_npub(&summary.npub).into(),
@@ -159,53 +156,48 @@ fn ready_panel(summary: &ImportSummary, generated: bool, cx: &mut Context<Shell>
             "Could not check the profile right now. You can still continue.",
             TEXT_MUTED,
         )
-    } else if !summary.profile_found {
-        if generated {
-            // A fresh key has no kind-0 by definition — no "wrong key" scare.
-            dot_row(
-                AMBER,
-                "New key — it can browse and claim, but claims will NOT be \
-                 paid until this key has a profile with a Lightning address. \
-                 Log in with it in a Nostr app (Primal, Damus) and add one.",
-                AMBER,
-            )
-        } else {
-            // No kind-0 at all: for the paste-existing-key path this usually
-            // means the WRONG key (a hex public key parses as a plausible
-            // secret key and lands exactly here).
-            dot_row(
-                AMBER,
-                "No profile found for this key — double-check you pasted the \
-                 right one. A brand-new key can browse, but it will not be paid.",
-                AMBER,
-            )
-        }
     } else {
-        // Consequence first, and at full strength: this is the single most
-        // payout-critical fact on the screen.
-        dot_row(
-            AMBER,
-            "Claims from this key will NOT be paid until your profile has a \
-             Lightning address — add one in your Nostr app, then reopen \
-             Magic Carpet.",
-            AMBER,
-        )
+        // No lud16, and we know it: instead of sending the person to another
+        // app to add one, open a wallet right here. The panel shows the
+        // address and a funding QR once the signup lands.
+        let view = shell.view(Account::Claimant);
+        let panel = wallet::panel(Account::Claimant, view, &shell.wallet, cx);
+        v_flex()
+            .gap(px(8.))
+            .when(!summary.profile_found && !generated, |this| {
+                // No kind-0 at all on the paste-existing-key path usually
+                // means the WRONG key (a hex public key parses as a
+                // plausible secret key and lands exactly here).
+                this.child(dot_row(
+                    AMBER,
+                    "No profile found for this key — double-check you pasted the \
+                     right one.",
+                    AMBER,
+                ))
+            })
+            .child(
+                div()
+                    .mt(px(4.))
+                    .p(px(14.))
+                    .rounded(px(10.))
+                    .bg(rgb(BG_APP))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(panel),
+            )
+            .into_any_element()
     };
     v_flex()
         .gap(px(8.))
         .child(dot_row(GREEN, "Key saved to this Mac's keychain.", TEXT))
         .child(
-            h_flex()
-                .gap(px(9.))
-                .items_center()
-                .pl(px(17.))
-                .child(
-                    div()
-                        .font_family(MONO)
-                        .text_size(px(12.))
-                        .text_color(rgb(ACCENT_LIGHT))
-                        .child(identity),
-                ),
+            h_flex().gap(px(9.)).items_center().pl(px(17.)).child(
+                div()
+                    .font_family(MONO)
+                    .text_size(px(12.))
+                    .text_color(rgb(ACCENT_LIGHT))
+                    .child(identity),
+            ),
         )
         .child(lud16_row)
         .child(
@@ -233,7 +225,7 @@ fn ready_panel(summary: &ImportSummary, generated: bool, cx: &mut Context<Shell>
 fn key_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let onboarding = &shell.onboarding;
     let body: AnyElement = match &onboarding.ready {
-        Some(summary) => ready_panel(summary, onboarding.generated, cx),
+        Some(_) => ready_panel(shell, cx),
         None => v_flex()
             .gap(px(8.))
             .child(muted(
@@ -257,16 +249,13 @@ fn key_card(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                         .child(SharedString::from(error)),
                 )
             })
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
-                    .child(if onboarding.submitting {
-                        "Checking the key…"
-                    } else {
-                        "Enter continues"
-                    }),
-            )
+            .child(div().text_size(px(11.)).text_color(rgb(TEXT_DIM)).child(
+                if onboarding.submitting {
+                    "Checking the key…"
+                } else {
+                    "Enter continues"
+                },
+            ))
             .child(
                 div()
                     .id("onboarding-generate")
@@ -318,35 +307,43 @@ fn browse_card(cx: &mut Context<Shell>) -> AnyElement {
 }
 
 pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
-    v_flex()
+    // Scrolls when the wallet panel makes the page taller than the window;
+    // the auto vertical margin still centers it when it fits.
+    div()
+        .id("onboarding")
+        .flex()
+        .flex_col()
         .flex_1()
         .min_h(px(0.))
-        .items_center()
-        .justify_center()
-        .gap(px(26.))
+        .overflow_y_scroll()
         .child(
             v_flex()
+                .w_full()
                 .items_center()
-                .gap(px(14.))
-                .child(logo())
+                .my_auto()
+                .py(px(32.))
+                .gap(px(26.))
                 .child(
-                    div()
-                        .text_size(px(22.))
-                        .font_weight(FontWeight::BOLD)
-                        .child("Magic Carpet"),
+                    v_flex()
+                        .items_center()
+                        .gap(px(14.))
+                        .child(logo())
+                        .child(
+                            div()
+                                .text_size(px(22.))
+                                .font_weight(FontWeight::BOLD)
+                                .child("Magic Carpet"),
+                        )
+                        .child(div().text_size(px(13.)).text_color(rgb(TEXT_MUTED)).child(
+                            "Claim items on live bounties and get paid in sats, automatically.",
+                        )),
                 )
                 .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(rgb(TEXT_MUTED))
-                        .child("Claim items on live bounties and get paid in sats, automatically."),
+                    v_flex()
+                        .w(px(470.))
+                        .gap(px(14.))
+                        .child(key_card(shell, cx))
+                        .child(browse_card(cx)),
                 ),
-        )
-        .child(
-            v_flex()
-                .w(px(470.))
-                .gap(px(14.))
-                .child(key_card(shell, cx))
-                .child(browse_card(cx)),
         )
 }

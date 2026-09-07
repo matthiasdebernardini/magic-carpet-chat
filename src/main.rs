@@ -1,14 +1,14 @@
 //! Magic Carpet — a desktop shell for a Nostr bounty instance, built on
-//! gpui-component.
+//! gpui-kit.
 //!
 //! The window opens on the Dashboard. The nav's "Chat" row swaps the main pane
 //! for a transcript and a composer that streams from the Anthropic Messages API.
 
 use std::sync::Arc;
 
-use gpui::*;
-use gpui_component::{Theme, ThemeMode, TitleBar};
-use gpui_component::Root;
+use gpui_kit::*;
+use gpui_kit::component::{Theme, ThemeMode, TitleBar};
+use gpui_kit::component::Root;
 
 mod bounties;
 mod chat;
@@ -18,6 +18,7 @@ mod onboarding;
 mod palette;
 mod shell;
 mod timefmt;
+mod wallet;
 
 fn main() {
     // `--import-keys`: read MC_ISSUER_NSEC / MC_CLAIMANT_NSEC, store them in
@@ -56,11 +57,11 @@ fn main() {
         eprintln!("credential store unavailable ({error}); relying on env keys");
     }
 
-    let app = gpui_platform::application().with_assets(icons::Assets);
+    let app = gpui_kit::application().with_assets(icons::Assets);
 
     app.run(move |cx| {
         // Must run before anything else from gpui-component.
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         // The design mock is its own palette, not a tint of a stock theme, so
         // the controls gpui-component draws are repainted to match.
@@ -75,7 +76,7 @@ fn main() {
         // `tokio::time::sleep` on every poll. We poll the body from gpui's
         // foreground executor, which is not a tokio runtime, so the first chunk
         // aborts the process with "there is no reactor running". Verified.
-        // The connection keep-alives zed sets (TCP 30 s, HTTP/2 15 s) already
+        // The connection keep-alives the client sets (TCP 30 s, HTTP/2 15 s) already
         // catch a dead peer, so the timeout buys nothing here anyway.
         match reqwest_client::ReqwestClient::user_agent("magic-carpet-chat/0.1") {
             Ok(client) => cx.set_http_client(Arc::new(client)),

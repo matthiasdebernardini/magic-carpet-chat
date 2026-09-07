@@ -21,6 +21,13 @@ money move.
    (payouts need one — without it, claims are accepted but never paid).
 4. Press `Enter` again (Start) — or press `esc` at any point to just look
    around read-only.
+5. **No Lightning address?** The ready panel offers **Create a Coinos wallet
+   for this key** (also on the Wallet screen, `⌘6`). One click opens a
+   hosted Coinos wallet bound to the key, writes its address into the
+   profile, and shows a QR: scan it with Strike or any Lightning wallet to
+   add sats. Coinos holds the funds — keep the balance small. The login is
+   in the Mac keychain under `magic-carpet-chat` / `claimant-coinos-login`
+   (Copy username is on the panel; the password is in Keychain Access).
 
 ## One-time setup (operator)
 
@@ -80,7 +87,7 @@ money move.
 - The claim's trust gate is server-side and silent: a claimant below the min
   rank gets **no** payment row ("No auto-payment row yet" stays). Preflight
   with `configure-prod.yml preflight_claimants=…` before the show.
-- The search field and the Payments/Claimants/Leaderboards/Wallet/Tags/
+- The search field and the Payments/Claimants/Leaderboards/Tags/
   Accounts/Settings screens are not built; they say so on screen.
 - Chat (`⌘8`) needs `ANTHROPIC_API_KEY` in the launching shell.
 - NEVER start the laptop `agent-wallet` daemon while the prod instance is

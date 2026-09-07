@@ -4,9 +4,9 @@
 //! (missing keys, relay down, list failures) and "Recent activity" is the feed
 //! the nostr runtime's updates write, newest first.
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::{h_flex, v_flex};
 
 use magic_carpet_chat::api;
 use magic_carpet_chat::nostr;

@@ -21,10 +21,22 @@ use nostr_sdk::prelude::*;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::api::{Api, ApiError, Bounty, BountyDetail, CreateBounty};
+use crate::coinos;
 use crate::events::{self, EventError};
 use crate::secrets::{self, Account, Secret, SecretError};
 
 pub const INSTANCE_RELAY: &str = "wss://magic-carpet.brainstorm.world/relay";
+
+/// Where a fresh lud16 must also land: Strike, Primal, and the prod payer's
+/// own lookups read the public relays, not our instance. Used only by a
+/// throwaway client in `publish_lud16` — the runtime's main `client` stays
+/// on the instance relay, which feeds the receipt subscriptions and the
+/// status dot.
+const PUBLIC_RELAYS: [&str; 3] = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+];
 
 /// The instance's house issuer — PUBLIC key material only. Read-only browsing
 /// lists this issuer's bounties when no issuer key is imported, so the app
@@ -87,6 +99,13 @@ pub enum Command {
     /// Delete the account's keychain entry, then re-announce whatever is
     /// still true (an env override survives a forget — env wins).
     ForgetKey { account: Account },
+    /// Open a Coinos wallet bound to the account's key and write its
+    /// Lightning address into the account's kind-0. Emits `WalletCreated`
+    /// (then `ProfileLoaded` once the lud16 is on the relays) or
+    /// `WalletFailed`. Idempotent: a login already in the keychain for the
+    /// same pubkey is reused, so a retry after a publish failure never opens
+    /// a second account.
+    CreateCoinosWallet { account: Account },
     /// Follow one bounty: receipts by `#e` on the relay, plus the API's
     /// payment state machine while a claim is pending. Idempotent — a bounty
     /// already being watched is left alone. At most one bounty is watched at
@@ -194,6 +213,19 @@ pub enum Update {
         /// receipt learned late never masquerades as an instant payout.
         at: u64,
     },
+    /// A Coinos account exists for this key. `publish_error` is set when the
+    /// kind-0 write did not reach the relays: the wallet is real, but the
+    /// payer cannot see the address yet, so the UI offers a retry. Public
+    /// material only — fixed text, and the password stays in the keychain.
+    WalletCreated {
+        account: Account,
+        username: String,
+        lightning_address: String,
+        publish_error: Option<String>,
+    },
+    /// Fixed text from `coinos::CoinosError` or [`SecretError`]; never the
+    /// password.
+    WalletFailed { account: Account, message: String },
     Error {
         source: ErrorSource,
         message: String,
@@ -215,15 +247,20 @@ enum BridgeError {
     Event(#[from] EventError),
     #[error(transparent)]
     Api(#[from] ApiError),
+    /// The kind-0 write. Fixed text only: the profile may hold anything its
+    /// owner put there, and this string reaches the feed and the wallet panel.
+    #[error("{0}")]
+    Profile(&'static str),
 }
 
 /// Start the named runtime thread. Returns immediately; a thread or runtime
 /// failure arrives as `Update::Error`.
 pub fn spawn_runtime() -> NostrHandle {
-    // The dep graph carries two rustls crypto backends (ring through zed's
-    // http stack, aws-lc-rs through reqwest's rustls-tls), and rustls panics
-    // at the first TLS handshake rather than guess between them. Pick ring
-    // before any client exists; Err just means someone chose first.
+    // The dep graph carries two rustls crypto backends: gpui-kit's http stack
+    // pulls ring and aws-lc-rs through rustls's default features, and
+    // reqwest's rustls-tls adds aws-lc-rs again. rustls panics at the first
+    // TLS handshake rather than guess between them. Pick ring before any
+    // client exists; Err just means someone chose first.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let (command_tx, command_rx) = mpsc::unbounded();
@@ -327,6 +364,11 @@ async fn run(
                 let sessions = sessions.clone();
                 let updates = updates.clone();
                 tokio::spawn(forget_key(sessions, account, updates));
+            }
+            Command::CreateCoinosWallet { account } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(create_coinos_wallet(sessions, account, updates));
             }
             Command::PublishDList {
                 account,
@@ -524,6 +566,10 @@ async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<Kind0Profile>, ()
         return Ok(None);
     };
     let content: serde_json::Value = serde_json::from_str(&event.content).unwrap_or_default();
+    Ok(Some(profile_fields(&content)))
+}
+
+fn profile_fields(content: &serde_json::Value) -> Kind0Profile {
     let field = |key: &str| {
         content
             .get(key)
@@ -531,11 +577,176 @@ async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<Kind0Profile>, ()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    Ok(Some(Kind0Profile {
+    Kind0Profile {
         name: field("display_name").or_else(|| field("name")),
         picture: field("picture"),
         lud16: field("lud16"),
-    }))
+    }
+}
+
+/// The new kind-0 content: the existing profile with ONLY `lud16` changed.
+///
+/// The same nsec may also live in a phone app or a browser extension, so this
+/// app is not the only writer of this profile. Merge, never rebuild — a
+/// kind-0 made from nothing wipes the name and picture set elsewhere on every
+/// relay that accepts it. `None` existing content means "confirmed no
+/// profile", and only that may start from a blank one; anything that is not
+/// a JSON object is left alone rather than overwritten.
+fn merge_lud16(
+    existing: Option<&str>,
+    lud16: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
+    let mut profile = match existing.map(str::trim) {
+        None | Some("") => serde_json::Map::new(),
+        Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => {
+                return Err(BridgeError::Profile(
+                    "Your current profile is not a JSON object, so it was left alone",
+                ));
+            }
+        },
+    };
+    profile.insert(
+        "lud16".to_string(),
+        serde_json::Value::String(lud16.to_string()),
+    );
+    Ok(profile)
+}
+
+/// Write `lud16` into the account's kind-0 and push it to the instance AND the
+/// public relays. Returns the merged profile so the caller can announce it.
+///
+/// A scan failure is an error, not an empty profile: a timed-out read used to
+/// look exactly like "no profile" in the desktop app, and the merge then
+/// published a kind-0 holding nothing but lud16.
+async fn publish_lud16(
+    keys: &Keys,
+    api: &Api,
+    lud16: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
+    let pubkey = keys.public_key().to_hex();
+    let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
+    let events = api.scan(&filter).await.map_err(|_| {
+        BridgeError::Profile("Could not read your current profile from the instance")
+    })?;
+    let existing = events.first().map(|event| event.content.as_str());
+    let profile = merge_lud16(existing, lud16)?;
+    let content = serde_json::Value::Object(profile.clone()).to_string();
+    let event = EventBuilder::new(Kind::Metadata, content)
+        .finalize(keys)
+        .map_err(|_| BridgeError::Profile("Could not sign the profile update"))?;
+
+    // The instance first: it is what the prod payer reads.
+    api.publish_event(&event)
+        .await
+        .map_err(|_| BridgeError::Profile("The instance relay did not accept the profile update"))?;
+
+    // Then the public relays, through a client that lives for this one send.
+    // A relay that refuses is fine as long as one accepts; none accepting is
+    // a publish failure, because Strike-side lookups would still miss it.
+    let client = Client::default();
+    for url in PUBLIC_RELAYS {
+        let _ = client.add_relay(url).await;
+    }
+    client.connect().and_wait(Duration::from_secs(10)).await;
+    let sent = client.send_event(&event).await;
+    client.disconnect().await;
+    match sent {
+        Ok(output) if !output.success.is_empty() => Ok(profile),
+        _ => Err(BridgeError::Profile(
+            "The relays did not accept the profile update",
+        )),
+    }
+}
+
+/// The wallet signup, entirely on the runtime thread. Order matters:
+///
+/// 1. Store the login in the keychain.
+/// 2. `POST /api/register`. A refusal deletes the login (nothing was
+///    created); any other failure keeps it (the account may exist).
+/// 3. Merge the lud16 into the kind-0 and publish it.
+///
+/// A login already in the keychain for this pubkey (a retry) skips step 1 and
+/// probes coinos before deciding whether step 2 is still needed — so a signup
+/// that timed out on the way back never becomes two accounts, and one that
+/// never happened is not skipped. A login for a different pubkey (the slot
+/// was re-imported) is replaced; an entry this app cannot read is left alone
+/// and reported, because it may be the only copy of a real password.
+async fn create_coinos_wallet(
+    sessions: SharedSessions,
+    account: Account,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let fail = |message: String| {
+        let _ = updates.unbounded_send(Update::WalletFailed { account, message });
+    };
+    let (keys, api) = match session(&sessions, account).await {
+        Ok(session) => {
+            let session = session.lock().await;
+            (session.keys.clone(), session.api.clone())
+        }
+        Err(e) => return fail(e.to_string()),
+    };
+    let pubkey = keys.public_key().to_hex();
+
+    let stored = match secrets::load_coinos_login(account) {
+        Ok(Some(secret)) => match coinos::Login::decode(&secret) {
+            Some(login) => Some(login),
+            None => {
+                return fail(format!(
+                    "The saved Coinos login for this account is unreadable — remove the \
+                     {account}-coinos-login keychain entry and try again."
+                ));
+            }
+        },
+        Ok(None) => None,
+        Err(e) => return fail(e.to_string()),
+    };
+    let (login, fresh) = coinos::Login::reuse_or_fresh(stored, &pubkey);
+    if fresh && let Err(e) = secrets::store_coinos_login(account, &login.encode()) {
+        return fail(e.to_string());
+    }
+
+    let needs_register = if fresh {
+        true
+    } else {
+        match coinos::wallet_exists(&login.username).await {
+            Ok(exists) => !exists,
+            Err(e) => return fail(e.to_string()),
+        }
+    };
+    if needs_register {
+        match coinos::create_wallet(&login.username, &login.password, &pubkey).await {
+            Ok(_) => {}
+            Err(e) => {
+                if e.account_definitely_not_created() {
+                    let _ = secrets::forget_coinos_login(account);
+                }
+                return fail(e.to_string());
+            }
+        }
+    }
+
+    let lightning_address = coinos::lightning_address(&login.username);
+    let published = publish_lud16(&keys, &api, &lightning_address).await;
+    // The wallet exists either way; a publish failure travels inside
+    // `WalletCreated` so the panel can show it next to the retry button.
+    let _ = updates.unbounded_send(Update::WalletCreated {
+        account,
+        username: login.username.clone(),
+        lightning_address: lightning_address.clone(),
+        publish_error: published.as_ref().err().map(ToString::to_string),
+    });
+    if let Ok(profile) = published {
+        let fields = profile_fields(&serde_json::Value::Object(profile));
+        let _ = updates.unbounded_send(Update::ProfileLoaded {
+            account,
+            name: fields.name,
+            picture: fields.picture,
+            lud16: Some(lightning_address),
+        });
+    }
 }
 
 /// Resolve one account to public material and announce it, then its kind-0.
@@ -1188,6 +1399,54 @@ mod tests {
         // And only once: the same settled snapshot again stays silent.
         let (updates, _) = ledger.ingest_detail(&late, NOW);
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn merging_lud16_keeps_every_other_profile_field() {
+        let existing = r#"{"name":"Matthias","picture":"https://x/p.png","about":"hi","nip05":"m@x.io","custom":{"deep":1}}"#;
+        let merged = merge_lud16(Some(existing), "carpet1234@coinos.io").unwrap();
+        assert_eq!(merged["name"], "Matthias");
+        assert_eq!(merged["picture"], "https://x/p.png");
+        assert_eq!(merged["about"], "hi");
+        assert_eq!(merged["nip05"], "m@x.io");
+        assert_eq!(merged["custom"]["deep"], 1);
+        assert_eq!(merged["lud16"], "carpet1234@coinos.io");
+        assert_eq!(merged.len(), 6);
+
+        // An existing lud16 is replaced, not duplicated.
+        let merged = merge_lud16(Some(r#"{"lud16":"old@strike.me","name":"M"}"#), "new@coinos.io").unwrap();
+        assert_eq!(merged["lud16"], "new@coinos.io");
+        assert_eq!(merged["name"], "M");
+
+        // Only a confirmed-absent profile may start from blank.
+        let merged = merge_lud16(None, "new@coinos.io").unwrap();
+        assert_eq!(merged.len(), 1);
+        let merged = merge_lud16(Some(""), "new@coinos.io").unwrap();
+        assert_eq!(merged.len(), 1);
+
+        // Content that is not an object is left alone rather than clobbered.
+        assert!(merge_lud16(Some("[1,2]"), "x@y.z").is_err());
+        assert!(merge_lud16(Some("not json"), "x@y.z").is_err());
+    }
+
+    #[test]
+    fn a_wallet_command_and_update_carry_no_secret() {
+        // Neither side of the wallet channel may hold the password: the
+        // command names an account, the update names public material only.
+        let printed = format!(
+            "{:?}",
+            Command::CreateCoinosWallet {
+                account: Account::Claimant
+            }
+        );
+        assert_eq!(printed, "CreateCoinosWallet { account: Claimant }");
+        let update = Update::WalletCreated {
+            account: Account::Claimant,
+            username: "carpetab12cd34".into(),
+            lightning_address: "carpetab12cd34@coinos.io".into(),
+            publish_error: Some("The relays did not accept the profile update".into()),
+        };
+        assert!(!format!("{update:?}").contains("password"));
     }
 
     #[test]

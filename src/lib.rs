@@ -7,6 +7,7 @@
 //! gpui executor.
 
 pub mod api;
+pub mod coinos;
 pub mod events;
 pub mod nostr;
 pub mod secrets;

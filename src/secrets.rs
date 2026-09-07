@@ -31,6 +31,16 @@ impl Account {
         }
     }
 
+    /// The Coinos username + password this app opened for the account, as
+    /// one JSON string (see `coinos::Login`). Its own entry, so forgetting the
+    /// nsec and forgetting the wallet login stay separate decisions.
+    fn coinos_entry_key(self) -> &'static str {
+        match self {
+            Account::Issuer => "issuer-coinos-login",
+            Account::Claimant => "claimant-coinos-login",
+        }
+    }
+
     /// Env override, checked before the keychain so automated runs never need
     /// an unlocked credential store.
     pub fn env_var(self) -> &'static str {
@@ -102,31 +112,109 @@ impl std::fmt::Display for Secret {
 /// Surfaces a missing or locked OS credential store at startup instead of at
 /// the first save.
 pub fn store_available() -> Result<(), SecretError> {
+    if DEV_STORE {
+        return dev_dir().map(|_| ());
+    }
     Entry::store_status()
         .as_ref()
         .copied()
         .map_err(|e| SecretError::Keyring(e.to_string()))
 }
 
-fn entry(account: Account) -> Result<Entry, SecretError> {
-    Entry::new(SERVICE, account.entry_key()).map_err(|e| SecretError::Keyring(e.to_string()))
+/// Debug builds keep secrets in plain 0600 files instead of the keychain:
+/// every unsigned debug binary is a new app to macOS, which re-prompts for the
+/// login password on each launch. Release builds always use the keychain.
+const DEV_STORE: bool = cfg!(debug_assertions);
+
+fn dev_dir() -> Result<std::path::PathBuf, SecretError> {
+    let home = std::env::var("HOME").map_err(|e| SecretError::Keyring(e.to_string()))?;
+    let dir = std::path::PathBuf::from(home)
+        .join("Library/Application Support")
+        .join(SERVICE)
+        .join("dev-secrets");
+    std::fs::create_dir_all(&dir).map_err(|e| SecretError::Keyring(e.to_string()))?;
+    Ok(dir)
 }
 
-pub fn store_nsec(account: Account, nsec: &Secret) -> Result<(), SecretError> {
-    entry(account)?
-        .set_password(nsec.expose())
+fn get(key: &str) -> Result<Option<String>, SecretError> {
+    if DEV_STORE {
+        return match std::fs::read_to_string(dev_dir()?.join(key)) {
+            Ok(value) => Ok(Some(value)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(SecretError::Keyring(e.to_string())),
+        };
+    }
+    match entry(key)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(SecretError::Keyring(e.to_string())),
+    }
+}
+
+fn set(key: &str, value: &str) -> Result<(), SecretError> {
+    if DEV_STORE {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dev_dir()?.join(key))
+            .map_err(|e| SecretError::Keyring(e.to_string()))?;
+        return file
+            .write_all(value.as_bytes())
+            .map_err(|e| SecretError::Keyring(e.to_string()));
+    }
+    entry(key)?
+        .set_password(value)
         .map_err(|e| SecretError::Keyring(e.to_string()))
 }
 
-/// "Forget this key": delete the keychain entry. An entry that was never
-/// stored is already forgotten, so `NoEntry` is success. An env override is
-/// NOT touched — env wins on the next load, and lying about that would be
-/// worse than showing the key come back.
-pub fn forget_nsec(account: Account) -> Result<(), SecretError> {
-    match entry(account)?.delete_credential() {
+/// An entry that was never stored is already forgotten, so "not found" is success.
+fn del(key: &str) -> Result<(), SecretError> {
+    if DEV_STORE {
+        return match std::fs::remove_file(dev_dir()?.join(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(SecretError::Keyring(e.to_string())),
+        };
+    }
+    match entry(key)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(SecretError::Keyring(e.to_string())),
     }
+}
+
+fn entry(key: &str) -> Result<Entry, SecretError> {
+    Entry::new(SERVICE, key).map_err(|e| SecretError::Keyring(e.to_string()))
+}
+
+pub fn store_nsec(account: Account, nsec: &Secret) -> Result<(), SecretError> {
+    set(account.entry_key(), nsec.expose())
+}
+
+/// "Forget this key": delete the stored entry. An env override is NOT
+/// touched — env wins on the next load, and lying about that would be worse
+/// than showing the key come back.
+pub fn forget_nsec(account: Account) -> Result<(), SecretError> {
+    del(account.entry_key())
+}
+
+/// Write the Coinos login BEFORE `POST /api/register`, never after: a signup
+/// that succeeds but never reports back would otherwise leave a funded
+/// account nobody can log in to. Delete it only through
+/// [`forget_coinos_login`], and only when coinos refused outright.
+pub fn store_coinos_login(account: Account, login: &Secret) -> Result<(), SecretError> {
+    set(account.coinos_entry_key(), login.expose())
+}
+
+pub fn load_coinos_login(account: Account) -> Result<Option<Secret>, SecretError> {
+    Ok(get(account.coinos_entry_key())?.map(Secret::new))
+}
+
+pub fn forget_coinos_login(account: Account) -> Result<(), SecretError> {
+    del(account.coinos_entry_key())
 }
 
 /// Validate a user-pasted secret: `nsec1…` bech32 or 64 hex characters.
@@ -157,11 +245,7 @@ pub fn load_nsec(account: Account) -> Result<Option<Secret>, SecretError> {
             return Ok(Some(Secret::new(value)));
         }
     }
-    match entry(account)?.get_password() {
-        Ok(value) => Ok(Some(Secret::new(value))),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(SecretError::Keyring(e.to_string())),
-    }
+    Ok(get(account.entry_key())?.map(Secret::new))
 }
 
 /// The stored key as signing keys. `Ok(None)` means no key is stored.
@@ -187,8 +271,7 @@ pub fn import_keys_from_env() -> Result<Vec<(Account, String)>, SecretError> {
         if raw.is_empty() {
             continue;
         }
-        let keys =
-            Keys::parse(raw).map_err(|_| SecretError::InvalidKey(account.env_var()))?;
+        let keys = Keys::parse(raw).map_err(|_| SecretError::InvalidKey(account.env_var()))?;
         store_nsec(account, &Secret::new(raw))?;
         let npub = keys
             .public_key()
@@ -259,11 +342,11 @@ mod tests {
     fn parse_secret_rejects_garbage_without_echoing_it() {
         for bad in [
             "hello world",
-            "nsec1qqqqqqqq",               // nsec-shaped, bad checksum
-            "abc123",                      // hex, wrong length
-            &"a".repeat(63),               // one short of 64
-            &"a".repeat(65),               // one past 64
-            &"g".repeat(64),               // 64 chars, not hex
+            "nsec1qqqqqqqq", // nsec-shaped, bad checksum
+            "abc123",        // hex, wrong length
+            &"a".repeat(63), // one short of 64
+            &"a".repeat(65), // one past 64
+            &"g".repeat(64), // 64 chars, not hex
             "",
         ] {
             let err = parse_secret(&Secret::new(bad)).unwrap_err();
@@ -284,12 +367,19 @@ mod tests {
         // get the "that's your public key" message — never the generic one,
         // and never an echo.
         let real = Keys::generate().public_key().to_bech32().unwrap();
-        for npub in [real.clone(), "npub1xyz".to_string(), real.to_ascii_uppercase()] {
+        for npub in [
+            real.clone(),
+            "npub1xyz".to_string(),
+            real.to_ascii_uppercase(),
+        ] {
             let err = parse_secret(&Secret::new(npub.clone())).unwrap_err();
             assert!(matches!(err, SecretError::PublicKeyPasted));
             let message = err.to_string();
             assert!(message.contains("public key"), "wrong message: {message}");
-            assert!(message.contains("nsec1"), "no pointer to the fix: {message}");
+            assert!(
+                message.contains("nsec1"),
+                "no pointer to the fix: {message}"
+            );
             assert!(!message.contains(&npub), "echoed input: {message}");
         }
     }

@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui_kit::{AssetSource, Result, SharedString};
 
 /// `(request path, file bytes)`. The path is what [`Icon::path`] is given.
 macro_rules! icons {
@@ -31,6 +31,7 @@ icons![
     "settings",
     "accounts",
     "chat",
+    "logo",
 ];
 
 /// A named icon, as a path this app's [`Assets`] can serve.
@@ -45,12 +46,12 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         match ICONS.iter().find(|(name, _)| *name == path) {
             Some((_, bytes)) => Ok(Some(Cow::Borrowed(bytes))),
-            None => gpui_component_assets::Assets.load(path),
+            None => gpui_kit::assets::Assets.load(path),
         }
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut found = gpui_component_assets::Assets.list(path)?;
+        let mut found = gpui_kit::assets::Assets.list(path)?;
         found.extend(
             ICONS
                 .iter()

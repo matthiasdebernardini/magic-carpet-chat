@@ -9,8 +9,8 @@
 //! turns the indigo logo green and the "armed" pill red, so the palette below
 //! is the design as drawn.
 
-use gpui::{App, Background, Hsla, linear_color_stop, linear_gradient, rgb, rgba};
-use gpui_component::Theme;
+use gpui_kit::{App, Background, Hsla, linear_color_stop, linear_gradient, rgb, rgba};
+use gpui_kit::component::Theme;
 
 // ------------------------------------------------------------------ surfaces
 
@@ -49,7 +49,6 @@ pub const TEXT_DIM: u32 = 0x5b5975;
 pub const ACCENT: u32 = 0x8f7df8;
 pub const ACCENT_DEEP: u32 = 0x6d5cf0;
 pub const ACCENT_LIGHT: u32 = 0xa99bfa;
-pub const ACCENT_PALE: u32 = 0xc99df5;
 /// Accent at 13% — a count badge.
 pub const ACCENT_WASH: u32 = 0x8f7df822;
 /// Accent at 24% — the glow under the primary button.
@@ -114,7 +113,7 @@ pub fn apply(cx: &mut App) {
     theme.colors.ring = rgb(ACCENT).into();
     theme.colors.title_bar = rgb(BG_RAIL).into();
     theme.colors.title_bar_border = rgb(LINE).into();
-    theme.radius = gpui::px(9.);
-    theme.radius_lg = gpui::px(14.);
+    theme.radius = gpui_kit::px(9.);
+    theme.radius_lg = gpui_kit::px(14.);
     Theme::sync_base(cx);
 }

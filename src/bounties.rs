@@ -7,9 +7,9 @@
 //! account is active, Enter walks and submits the form, Esc (or ⌘.) cancels.
 //! DEMO.md holds the full path.
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{h_flex, input::Input, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::{h_flex, input::Input, v_flex};
 
 use magic_carpet_chat::api::{Bounty, Claim};
 use magic_carpet_chat::secrets::Account;
@@ -629,18 +629,19 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
         ));
     }
     if let Some(form) = &shell.claim_form {
-        let dtag = shell
-            .details
-            .get(&form.bounty_id)
-            .map(|d| coordinate_dtag(&d.bounty.list_coordinate))
-            .unwrap_or_else(|| coordinate_dtag(&form.coordinate))
-            .to_string();
+        let dtag = coordinate_dtag(&form.coordinate).to_string();
+        // Several bounties can share a list, so name the reward too.
+        let reward = shell
+            .selected_bounty()
+            .filter(|b| b.id == form.bounty_id)
+            .map(|b| format!(" · {} sats per item", timefmt::fmt_sats(b.amount_sats)))
+            .unwrap_or_default();
         let rows = vec![labeled_input(
             "Item name",
             Input::new(&form.name).into_any_element(),
         )];
         return Some(form_card(
-            format!("Claim an item on {dtag}"),
+            format!("Claim an item on {dtag}{reward}"),
             rows,
             form.error.clone(),
             form.submitting,

@@ -4,22 +4,14 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-# gpui-component itself declares `gpui = { git = ".../zed" }` with no rev, so the
-# zed deps here must also stay rev-less: a rev on one side and not the other makes
-# cargo build two copies of gpui and every type stops matching.
-# The exact revisions are pinned by Cargo.lock — see README.md.
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
-    "font-kit",
-] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "6d07863fe7077f85abfa0ec2fcb05f3e17c573b2" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "6d07863fe7077f85abfa0ec2fcb05f3e17c573b2" }
-
-# gpui already speaks `http_client`; reqwest_client is the implementation zed
-# installs into it. Same rev-less rule as the gpui deps above.
-http_client = { git = "https://github.com/zed-industries/zed" }
-reqwest_client = { git = "https://github.com/zed-industries/zed" }
+# The whole UI stack: gpui (published as the gpui-pre-* crates), the platform
+# layer, gpui-base, gpui-component and the assets, at matching versions.
+gpui-kit = "0.6.0"
+# gpui-kit does not re-export the reqwest-backed HttpClient gpui needs, so it
+# is named here. The version must resolve to the same gpui-pre minor gpui-kit uses;
+# cargo refuses to unify two gpui-pre versions, which is the safety net.
+reqwest_client = { package = "gpui-pre-reqwest-client", version = "0.3.4" }
 futures = "0.3"
 serde_json = "1"
 
@@ -32,9 +24,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "cookies",
 ] }
-# Both ring (zed's http stack) and aws-lc-rs (reqwest's rustls-tls default)
-# end up in the graph, and rustls refuses to guess between two providers at
-# runtime. spawn_runtime() installs ring explicitly before any TLS happens.
+# Both ring and aws-lc-rs end up in the graph: gpui-kit's http stack
+# (gpui-pre-http-client-tls, gpui-pre-reqwest) pulls both through rustls's
+# default features, and reqwest's rustls-tls adds aws-lc-rs too. rustls refuses
+# to guess between two providers at runtime, so spawn_runtime() installs ring
+# explicitly before any TLS happens.
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
@@ -47,21 +41,32 @@ serde = { version = "1", features = ["derive"] }
 # via NFD, which needs a real normalizer to match JS String.normalize.
 sha2 = "0.10"
 unicode-normalization = "0.1"
+# Coinos signup (src/coinos.rs): a random username/password, and the LNURL
+# the funding QR encodes (LUD-01 is plain bech32, not bech32m).
+rand = "0.9"
+bech32 = "0.11"
+# Default features pull in `image` and an SVG renderer; the QR is painted
+# module by module with gpui quads, so only the matrix is needed.
+qrcode = { version = "0.14", default-features = false }
 
 # Debug builds of gpui and its text/layout stack are unusably slow without this.
-# Copied from the gpui-component workspace.
+# Copied from the gpui-kit workspace.
 [profile.dev]
 codegen-units = 16
 split-debuginfo = "unpacked"
 
 [profile.dev.package]
-gpui = { opt-level = 3 }
-gpui_platform = { opt-level = 3 }
-gpui_macros = { opt-level = 3 }
 resvg = { opt-level = 3 }
-ropey = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
-smol = { opt-level = 3 }
-sum_tree = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
+smol = { opt-level = 3 }
+gpui-pre = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-sum-tree = { opt-level = 3 }
+ropey = { opt-level = 3 }
+gpui-pre-reqwest-client = { opt-level = 3 }
+markdown = { opt-level = 3 }
+xml5ever = { opt-level = 3 }
+lsp-types = { opt-level = 3 }

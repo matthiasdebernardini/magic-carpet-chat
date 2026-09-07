@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{
-    TitleBar, h_flex,
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::{
+    Root, TitleBar, WindowExt as _, h_flex, notification::Notification,
     input::{Input, InputEvent, InputState},
     v_flex,
 };
@@ -29,6 +29,7 @@ use crate::dashboard::{self, MONO, avatar};
 use crate::icons::icon;
 use crate::onboarding::{ImportSummary, Onboarding};
 use crate::palette::*;
+use crate::wallet::{self, WalletCreated, WalletState};
 use crate::{onboarding, timefmt};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -128,7 +129,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
         // Context-less (None) versions of these would shadow every input's
         // Enter — GPUI treats no-context bindings as deepest-context and
         // resolves ties by later registration, and these are registered
-        // after gpui_component::init.
+        // after gpui_kit::init.
         KeyBinding::new("up", SelectPrev, Some("Shell")),
         KeyBinding::new("down", SelectNext, Some("Shell")),
         // Onboarding's "Start": only fires when the shell itself has focus.
@@ -339,6 +340,8 @@ pub struct Shell {
     pub(crate) claim_form: Option<ClaimForm>,
     /// First-launch key setup; rendered only while `screen` is Onboarding.
     pub(crate) onboarding: Onboarding,
+    /// The Coinos signup, shared by the onboarding ready panel and ⌘6.
+    pub(crate) wallet: WalletState,
     /// Set once the first-screen decision is made, so a later ⌘R (which
     /// re-runs LoadAccounts) can never bounce the app back to onboarding.
     first_screen_decided: bool,
@@ -425,6 +428,7 @@ impl Shell {
             bounty_form: None,
             claim_form: None,
             onboarding,
+            wallet: WalletState::default(),
             first_screen_decided: false,
             sidebar_import: None,
             pending_bounty: None,
@@ -599,6 +603,40 @@ impl Shell {
                     self.focus.focus(window, cx);
                 }
             }
+            Update::WalletCreated {
+                account,
+                username,
+                lightning_address,
+                publish_error,
+            } => {
+                self.wallet.submitting = false;
+                self.wallet.error = None;
+                // One feed line per event; the panel shows the same error
+                // next to its retry button.
+                match &publish_error {
+                    None => self.push_activity(
+                        GREEN,
+                        format!("Coinos wallet ready: {lightning_address}"),
+                        now,
+                    ),
+                    Some(error) => self.push_activity(
+                        AMBER,
+                        format!("Coinos wallet ready: {lightning_address} — {error}"),
+                        now,
+                    ),
+                }
+                self.wallet.created = Some(WalletCreated {
+                    account,
+                    username,
+                    lightning_address,
+                    publish_error,
+                });
+            }
+            Update::WalletFailed { account, message } => {
+                self.wallet.submitting = false;
+                self.wallet.error = Some(message.clone());
+                self.push_activity(RED, format!("Coinos wallet for the {account} failed: {message}"), now);
+            }
             Update::Bounties(list) => {
                 if self.selected.is_none()
                     && let Some(first) = list.first() {
@@ -683,6 +721,45 @@ impl Shell {
                 );
                 self.claim_form = None;
                 self.focus.focus(window, cx);
+                // Say how this bounty pays: the claim card alone reads as
+                // "nothing happened" when the payout is manual or gated.
+                let bounty = match &self.bounties {
+                    Load::Ready(list) => list.iter().find(|b| b.id == bounty_id),
+                    _ => None,
+                };
+                // The instance hides claims from keys it ranks below 2, so a
+                // new key's claim is on the relay but invisible in this list.
+                const RANK_NOTE: &str = "This instance only lists claims from keys the \
+                    issuer's web of trust ranks 2 or higher. A new key has no rank yet, so \
+                    your claim can be on the relay and still not show here.";
+                let (title, message) = match bounty {
+                    Some(b) if b.auto_pay_on() => (
+                        "Claim published — auto-pay bounty",
+                        format!(
+                            "With rank {} or higher, {} sats arrive at your Lightning \
+                             address within about a minute. Below that, the issuer reviews \
+                             the claim by hand. {RANK_NOTE}",
+                            b.auto_pay_min_rank.unwrap_or(0),
+                            timefmt::fmt_sats(b.amount_sats)
+                        ),
+                    ),
+                    Some(b) => (
+                        "Claim published — manual-pay bounty",
+                        format!(
+                            "This bounty does not auto-pay: the issuer reviews your claim \
+                             and sends the {} sats by hand. {RANK_NOTE}",
+                            timefmt::fmt_sats(b.amount_sats)
+                        ),
+                    ),
+                    None => (
+                        "Claim published",
+                        format!("The issuer's relay has it. {RANK_NOTE}"),
+                    ),
+                };
+                window.push_notification(
+                    Notification::info(message).title(title).autohide(false),
+                    cx,
+                );
                 // Watch the bounty the claim went to — the form snapshots it
                 // at open, so this is right even if selection moved meanwhile.
                 let _ = self
@@ -877,6 +954,22 @@ impl Shell {
         cx.notify();
     }
 
+    /// "Create a Coinos wallet" and "Retry publishing": one command, for the
+    /// active account. The runtime reuses a login already in the keychain, so
+    /// pressing it twice never opens two accounts.
+    pub(crate) fn create_wallet(&mut self, cx: &mut Context<Self>) {
+        // The house key's wallet lives on the prod payer, not here.
+        if self.wallet.submitting || self.account != Account::Claimant {
+            return;
+        }
+        self.wallet.submitting = true;
+        self.wallet.error = None;
+        let _ = self.commands.unbounded_send(Command::CreateCoinosWallet {
+            account: self.account,
+        });
+        cx.notify();
+    }
+
     /// Both doors out of onboarding — Start after an import, or "just look
     /// around" — land on the dashboard as the claimant.
     pub(crate) fn leave_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1012,6 +1105,18 @@ impl Shell {
             .commands
             .unbounded_send(Command::WatchBounty { id: id.clone() });
         self.selected = Some(id);
+        // An open claim form claims the highlighted bounty, not the one it
+        // was opened on; otherwise "Claim selected" lies once you arrow away.
+        if let Some(bounty) = self.selected_bounty() {
+            let (id, coordinate) = (bounty.id.clone(), bounty.list_coordinate.clone());
+            // A form mid-publish keeps its target so the reply (and a
+            // retry) lands on the bounty it was sent to.
+            if let Some(form) = self.claim_form.as_mut().filter(|f| !f.submitting) {
+                form.bounty_id = id;
+                form.coordinate = coordinate;
+                form.error = None;
+            }
+        }
     }
 
     fn select_step(&mut self, step: isize, cx: &mut Context<Self>) {
@@ -1316,32 +1421,20 @@ impl Shell {
 
     // ------------------------------------------------------------ icon rail
 
-    fn logo(&self) -> impl IntoElement {
-        let bar = |width: f32, alpha: u32| {
-            div()
-                .w(px(width))
-                .h(px(4.))
-                .rounded(px(2.))
-                .bg(rgba(0x0d0d1400 | alpha))
-        };
-
-        v_flex()
+    fn logo(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
             .id("logo")
             .size(px(38.))
             .mb(px(6.))
             .flex_shrink_0()
             .rounded(px(11.))
-            .bg(grad(ACCENT_DEEP, ACCENT_PALE))
-            .items_center()
-            .justify_center()
-            .gap(px(3.))
+            .overflow_hidden()
             .cursor_pointer()
             .shadow(vec![
                 BoxShadow::new(px(0.), px(4.), wash(ACCENT_GLOW)).blur_radius(px(16.)),
             ])
-            .child(bar(20., 0xcc))
-            .child(bar(14., 0x99))
-            .child(bar(8., 0x66))
+            .on_click(cx.listener(|this, _, w, cx| this.go(Screen::Dashboard, w, cx)))
+            .child(img(crate::icons::icon("logo")).size_full())
     }
 
     /// The account's round marker: kind-0 picture when there is one, initials
@@ -1402,7 +1495,7 @@ impl Shell {
             .items_center()
             .gap(px(12.))
             .py(px(16.))
-            .child(self.logo())
+            .child(self.logo(cx))
             .child(div().w(px(32.)).h(px(1.)).bg(rgb(LINE)))
             .children(Account::ALL.into_iter().enumerate().map(|(ix, account)| {
                 let view = self.view(account);
@@ -1567,8 +1660,12 @@ impl Shell {
         };
 
         v_flex()
+            .id("sidebar")
             .w(px(218.))
             .flex_shrink_0()
+            .min_h(px(0.))
+            // Scrolls when the window is shorter than the nav plus the cards.
+            .overflow_y_scroll()
             .bg(rgb(BG_SIDEBAR))
             .border_r_1()
             .border_color(rgb(LINE))
@@ -1620,6 +1717,9 @@ impl Shell {
                                                 .child("Forget this key")
                                                 .on_click(cx.listener(
                                                     move |this, _, _, cx| {
+                                                        // Sits inside the account
+                                                        // switcher; don't switch too.
+                                                        cx.stop_propagation();
                                                         this.forget_key(account, cx)
                                                     },
                                                 )),
@@ -1627,14 +1727,17 @@ impl Shell {
                                     }),
                             )
                             .child(div().text_color(rgb(TEXT_DIM)).child("›"))
-                            // A click on a keyless account header opens the
-                            // same import input ⌘] would.
+                            // The chevron means "next account", like ⌘].
+                            // A keyless account opens the import input on
+                            // the way in (set_account does that).
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let account = this.account;
                                 if this.view(account).missing
                                     && this.sidebar_import.is_none()
                                 {
                                     this.open_sidebar_import(account, true, window, cx);
+                                } else {
+                                    this.step_account(window, cx);
                                 }
                             })),
                     ),
@@ -1657,12 +1760,12 @@ impl Shell {
                             .border_color(rgb(BORDER_3))
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_DIM))
+                                    .text_color(rgb(TEXT))
                                     .child(SharedString::from(match form.account {
-                                        Account::Claimant => "PASTE YOUR KEY (NSEC)".to_string(),
-                                        Account::Issuer => "PASTE THE ISSUER KEY".to_string(),
+                                        Account::Claimant => "Paste your key".to_string(),
+                                        Account::Issuer => "Paste the issuer key".to_string(),
                                     })),
                             )
                             // The issuer slot is for operators only: a
@@ -1671,13 +1774,9 @@ impl Shell {
                             .when(form.account == Account::Issuer, |this| {
                                 this.child(
                                     div()
-                                        .text_size(px(10.))
+                                        .text_size(px(11.5))
                                         .text_color(rgb(AMBER))
-                                        .child(
-                                            "Operator only — this changes whose \
-                                             bounties the app shows. Claiming \
-                                             never needs it.",
-                                        ),
+                                        .child("Operators only. Claiming never needs it."),
                                 )
                             })
                             .child(div().text_size(px(12.)).child(Input::new(&form.input)))
@@ -1691,12 +1790,12 @@ impl Shell {
                             })
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(px(11.5))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(if form.submitting {
                                         "Checking the key…"
                                     } else {
-                                        "Enter imports · esc closes"
+                                        "Enter to save · esc to close"
                                     }),
                             ),
                     )
@@ -1884,6 +1983,46 @@ impl Shell {
                 .py(px(18.))
                 .child(self.chat.clone())
                 .into_any_element(),
+            Screen::Wallet => {
+                let account = self.account;
+                let panel = wallet::panel(account, self.view(account), &self.wallet, cx);
+                div()
+                    .id("wallet")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(560.))
+                            .mx_auto()
+                            .px(px(28.))
+                            .pt(px(26.))
+                            .pb(px(60.))
+                            .gap(px(14.))
+                            .child(
+                                div()
+                                    .text_size(px(21.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(format!(
+                                        "Wallet — {}",
+                                        display_name(account, self.view(account))
+                                    )),
+                            )
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .bg(rgb(BG_CARD))
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .rounded(px(14.))
+                                    .px(px(22.))
+                                    .py(px(20.))
+                                    .child(panel),
+                            ),
+                    )
+                    .into_any_element()
+            }
             other => Self::placeholder(other).into_any_element(),
         }
     }
@@ -1924,7 +2063,7 @@ fn parse_sats(value: &str) -> Option<u64> {
 }
 
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Onboarding takes the whole window: no rail, no sidebar, no top bar
         // — one decision at a time.
         let body: AnyElement = if self.screen == Screen::Onboarding {
@@ -1954,7 +2093,7 @@ impl Render for Shell {
             // Names this node in the key-context stack so the enter/up/down
             // bindings below only fire here. A focused text input sits deeper
             // in the stack, so its own bindings win — without this, a
-            // context-less "enter" registered after gpui_component::init
+            // context-less "enter" registered after gpui_kit::init
             // shadows the input's Enter everywhere (GPUI treats no-context
             // bindings as deepest-context, later registration wins).
             .key_context("Shell")
@@ -1990,6 +2129,8 @@ impl Render for Shell {
                 ),
             )
             .child(body)
+            // Toasts live in Root; the view has to draw the layer.
+            .children(Root::render_notification_layer(window, cx))
     }
 }
 

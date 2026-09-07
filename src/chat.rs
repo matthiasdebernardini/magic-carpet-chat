@@ -8,15 +8,15 @@
 use std::sync::Arc;
 
 use futures::{AsyncBufReadExt as _, AsyncReadExt as _, StreamExt as _};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::{
     input::{InputEvent, Textarea, TextareaState},
     scroll::ScrollableElement as _,
     text::TextView,
     v_flex,
 };
-use http_client::{AsyncBody, HttpClient, Method, Request, StatusCode};
+use gpui_kit::http_client::{AsyncBody, HttpClient, Method, Request, StatusCode};
 use magic_carpet_chat::secrets::Secret;
 use serde_json::json;
 
@@ -28,10 +28,10 @@ const MODEL: &str = "claude-sonnet-5";
 const MAX_TOKENS: u32 = 64_000;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
-const NO_KEY: &str = "**No API key.** Set `ANTHROPIC_API_KEY` in the shell that \
+const NO_KEY: &str = "**No API key.** Put it in `~/.config/anthropic/key` or set `ANTHROPIC_API_KEY` in the shell that \
     launches this app, then start it again.";
-const NO_KEY_CAUSE: &str = "ANTHROPIC_API_KEY is not set. Export it in the shell \
-    that launches this app, then start it again.";
+const NO_KEY_CAUSE: &str = "No API key: ~/.config/anthropic/key is missing and \
+    ANTHROPIC_API_KEY is not set. Fix one, then start the app again.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -275,8 +275,13 @@ impl Render for Chat {
 fn api_key() -> Option<Secret> {
     // Trim: a key read from a file usually carries a newline, and a header value
     // with one fails to build with a message that says nothing about why.
+    // Env first; else the machine's key file, so the app works from Finder too.
     std::env::var("ANTHROPIC_API_KEY")
         .ok()
+        .or_else(|| {
+            let home = std::env::var("HOME").ok()?;
+            std::fs::read_to_string(format!("{home}/.config/anthropic/key")).ok()
+        })
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty())
         .map(Secret::new)

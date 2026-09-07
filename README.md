@@ -1,6 +1,6 @@
 # Magic Carpet Chat
 
-A desktop chat shell in Rust on [gpui-component](https://github.com/longbridge/gpui-component).
+A desktop chat shell in Rust on [gpui-kit](https://github.com/longbridge/gpui-kit).
 One window, a scrolling transcript, and a composer. Enter streams a reply from the
 Anthropic Messages API.
 
@@ -16,34 +16,26 @@ export ANTHROPIC_API_KEY=sk-ant-…
 
 Without the key the app still opens and says what to set.
 
-## Pinned versions
+## Dependencies
 
-`Cargo.toml` names three git dependencies. Only gpui-component carries a `rev`.
-gpui-component's own manifest asks for `gpui = { git = ".../zed" }` with no rev,
-so a rev on our zed lines would build a second copy of gpui and every type would
-stop matching. `Cargo.lock` holds the zed revision instead.
+The UI stack is one crates.io dependency, `gpui-kit` 0.6.0. It bundles gpui
+(published as the `gpui-pre-*` crates), the platform layer, gpui-base,
+gpui-component and the icon assets at matching versions. The only other UI
+crate is `gpui-pre-reqwest-client`, the HTTP client gpui-kit does not
+re-export; its version must resolve to the same `gpui-pre` minor gpui-kit uses.
 
-| Crate | Source | Revision |
-| --- | --- | --- |
-| `gpui-component` 0.5.2 | github.com/longbridge/gpui-component | `6d07863fe7077f85abfa0ec2fcb05f3e17c573b2` |
-| `gpui-component-assets` 0.5.1 | github.com/longbridge/gpui-component | `6d07863fe7077f85abfa0ec2fcb05f3e17c573b2` |
-| `gpui` 0.2.2 | github.com/zed-industries/zed | `f66ed399cdde86092af8af3dc7b418abf45f37f8` |
-| `gpui_platform` 0.1.0 | github.com/zed-industries/zed | `f66ed399cdde86092af8af3dc7b418abf45f37f8` |
-| `http_client` 0.1.0 | github.com/zed-industries/zed | `f66ed399cdde86092af8af3dc7b418abf45f37f8` |
-| `reqwest_client` 0.1.0 | github.com/zed-industries/zed | `f66ed399cdde86092af8af3dc7b418abf45f37f8` |
+## Coinos wallet
 
-The zed revision is the one in gpui-component's own `Cargo.lock` at that commit,
-so the pair is the combination their CI builds. Cargo first resolved zed to its
-branch head; `cargo update gpui --precise f66ed399…` moved the whole zed git
-source back to the tested revision.
-
-Adding any new zed crate re-resolves that git source to the branch head, so run
-the `--precise` command again afterwards and check `Cargo.lock` still says
-`f66ed399`.
-
-To move to a newer gpui-component: change both `rev` values, run
-`cargo update`, then read the new gpui-component `Cargo.lock` for the zed
-revision it expects and pass that to `cargo update gpui --precise`.
+A generated key has no Lightning address, so its claims are accepted but never
+paid. Onboarding and the Wallet screen (⌘6) can open a hosted
+[Coinos](https://coinos.io) wallet bound to the key. `src/coinos.rs` registers
+`carpet<random>@coinos.io`; the runtime merges that `lud16` into the existing
+kind-0 (never a rebuilt profile) and publishes it to the instance, damus,
+nos.lol and primal; the panel shows a `lightning:` LNURL QR to fund it from any
+Lightning wallet. Coinos holds the sats, so keep balances small. The login is
+in the Mac keychain under `magic-carpet-chat` / `claimant-coinos-login`,
+written before the signup request and deleted only when Coinos refuses
+outright, so a signup that times out on the way back is never lost.
 
 ## What is here
 
