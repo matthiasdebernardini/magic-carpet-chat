@@ -1,0 +1,168 @@
+name: release
+
+# Push a tag like v0.2.0 and this builds every download and attaches it to a
+# GitHub release. David downloads from the release page, no toolchain needed.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS universal app
+    runs-on: macos-latest
+    env:
+      ZIP: dist/Magic-Carpet-Chat-${{ github.ref_name }}-macos.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Test
+        run: cargo test --release --locked --target aarch64-apple-darwin
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Merge into one universal binary
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/magic-carpet-chat \
+            target/aarch64-apple-darwin/release/magic-carpet-chat \
+            target/x86_64-apple-darwin/release/magic-carpet-chat
+          lipo -info dist/magic-carpet-chat
+
+      - name: Build the app bundle
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: bash scripts/make-app.sh dist/magic-carpet-chat dist
+
+      # No Developer ID yet. arm64 refuses to run a binary with no signature
+      # at all, so ad-hoc sign; the user still does the Open Anyway step.
+      - name: Ad-hoc sign the app
+        run: |
+          codesign --force -s - "dist/Magic Carpet Chat.app"
+          codesign --verify --deep --strict --verbose=2 "dist/Magic Carpet Chat.app"
+
+      # ditto keeps the bundle's resource forks and permissions; zip does not.
+      - name: Zip the app with the first-open instructions
+        run: |
+          ditto -c -k --keepParent "dist/Magic Carpet Chat.app" "$ZIP"
+          (cd dist && zip -X "$(basename "$ZIP")" "READ ME FIRST.txt")
+          unzip -l "$ZIP"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned to 22.04, not latest: the runner's glibc is the floor the
+          # binary needs, and 24.04 would shut out Ubuntu 22.04 LTS users.
+          - os: ubuntu-22.04
+            arch: x86_64
+          - os: ubuntu-22.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+
+      # gpui on Linux talks to X11, Wayland, xkbcommon, fontconfig and Vulkan.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake pkg-config \
+            libasound2-dev libfontconfig-dev libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-xkb-dev \
+            libxcb-xinput-dev libxcb-cursor-dev libvulkan-dev
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="magic-carpet-chat-${{ github.ref_name }}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp target/release/magic-carpet-chat "dist/$name/"
+          cat > "dist/$name/README.txt" <<'TXT'
+          Magic Carpet Chat for Linux
+
+          1. Install the runtime libraries (Ubuntu/Debian):
+             sudo apt install libxkbcommon-x11-0 libx11-xcb1 libwayland-client0 \
+               libfontconfig1 libasound2 libvulkan1 mesa-vulkan-drivers
+          2. Run it:
+             ./magic-carpet-chat
+
+          The app draws with Vulkan, so a GPU driver with Vulkan support is
+          needed (mesa-vulkan-drivers covers Intel and AMD).
+          TXT
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          tar -tzf "dist/$name.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - run: ls -la dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Downloads
+
+            | Computer | File |
+            |---|---|
+            | Mac (Apple Silicon or Intel) | `Magic-Carpet-Chat-*-macos.zip` |
+            | Linux, Intel/AMD (x86_64) | `magic-carpet-chat-*-linux-x86_64.tar.gz` |
+            | Linux, ARM (aarch64) | `magic-carpet-chat-*-linux-aarch64.tar.gz` |
+
+            **Mac:** unzip, then follow `READ ME FIRST.txt`. The app is not
+            signed with an Apple Developer ID yet, so macOS blocks the first
+            open until you click Open Anyway in System Settings > Privacy & Security.
+
+            **Linux:** extract the tarball and read `README.txt` inside for the
+            one `apt install` line, then run `./magic-carpet-chat`.

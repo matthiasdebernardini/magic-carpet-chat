@@ -1,6 +1,6 @@
 [package]
 name = "magic-carpet-chat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 
@@ -33,7 +33,6 @@ rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
 ] }
-keyring = "4"
 lightning-invoice = { version = "0.34", features = ["std"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
