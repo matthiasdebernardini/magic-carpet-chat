@@ -8,8 +8,7 @@
 //!   UI ── Command ──▶ [nostr-runtime thread: tokio + Client + Api] ── Update ──▶ UI
 //!
 //! The thread owns the nostr-sdk client (instance relay) and one `Api` per
-//! account (per-account cookie jars, so the issuer's and the claimant's
-//! sessions never mix).
+//! account (per-account cookie jars, so two accounts' sessions never mix).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -23,7 +22,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::api::{Api, ApiError, Bounty, BountyDetail, CreateBounty};
 use crate::coinos;
 use crate::events::{self, EventError};
-use crate::secrets::{self, Account, Secret, SecretError};
+use crate::secrets::{self, Secret, SecretError};
 
 pub const INSTANCE_RELAY: &str = "wss://magic-carpet.brainstorm.world/relay";
 
@@ -38,9 +37,9 @@ const PUBLIC_RELAYS: [&str; 3] = [
     "wss://relay.primal.net",
 ];
 
-/// The instance's house issuer — PUBLIC key material only. Read-only browsing
-/// lists this issuer's bounties when no issuer key is imported, so the app
-/// works with no key at all. `MC_ISSUER_NPUB` overrides it.
+/// The instance's house issuer — PUBLIC key material only. The read paths
+/// list this issuer's bounties whatever keys are stored, so the app works
+/// with no key at all. `MC_ISSUER_NPUB` overrides it.
 pub const HOUSE_ISSUER_HEX: &str =
     "853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba";
 
@@ -67,45 +66,65 @@ pub fn relay_url() -> String {
 pub enum Command {
     /// Open the relay connection. Idempotent.
     Connect,
-    /// Read both account keys (keychain or env), then each account's kind-0
-    /// from the instance. Emits `AccountLoaded`/`AccountMissing`, then
-    /// `ProfileLoaded` for whichever accounts have a profile.
+    /// Read the store, then each account's kind-0 from the instance. Emits
+    /// `AccountsLoaded`, then `ProfileLoaded` for whichever accounts have a
+    /// profile (a failed scan is silent).
     LoadAccounts,
     /// GET the issuer's bounty list (status=all). Emits `Bounties` or
     /// `BountiesFailed`.
     FetchBounties,
     PublishDList {
-        account: Account,
+        pubkey: String,
         singular: String,
         plural: String,
         description: Option<String>,
     },
     CreateBounty {
-        account: Account,
+        pubkey: String,
         req: CreateBounty,
     },
     PublishClaim {
-        account: Account,
+        pubkey: String,
         bounty_id: String,
         name: String,
         list_coordinate: String,
     },
-    /// Validate a pasted secret, store it in the keychain, and announce the
-    /// account: `AccountLoaded` (+ `ProfileLoaded` when a kind-0 exists), then
-    /// `ImportReady` with the onboarding summary — or `ImportFailed` with a
-    /// message that never echoes the input. The secret rides the channel
-    /// inside [`Secret`], so a stray `{:?}` on a `Command` cannot leak it.
-    ImportKey { account: Account, secret: Secret },
-    /// Delete the account's keychain entry, then re-announce whatever is
-    /// still true (an env override survives a forget — env wins).
-    ForgetKey { account: Account },
+    /// Validate a secret (pasted or generated — the UI cannot tell the
+    /// runtime apart, and need not), store it, and announce the account:
+    /// `AccountAdded` (+ `ProfileLoaded` when a kind-0 exists) — or
+    /// `AddAccountFailed` with a message that never echoes the input. With
+    /// `open_wallet` the same task continues straight into
+    /// `CreateCoinosWallet`, so one click does everything; `name` then goes
+    /// into the kind-0 that step writes, when the key has none yet. The
+    /// secret rides the channel inside [`Secret`], so a stray `{:?}` on a
+    /// `Command` cannot leak it.
+    AddAccount {
+        secret: Secret,
+        name: Option<String>,
+        open_wallet: bool,
+    },
+    /// Delete the account (nsec and Coinos login) from the store, drop its
+    /// session, re-emit `AccountsLoaded`.
+    RemoveAccount { pubkey: String },
+    /// Persist which account the app opens on. Nothing is emitted.
+    SetActive { pubkey: String },
     /// Open a Coinos wallet bound to the account's key and write its
     /// Lightning address into the account's kind-0. Emits `WalletCreated`
     /// (then `ProfileLoaded` once the lud16 is on the relays) or
-    /// `WalletFailed`. Idempotent: a login already in the keychain for the
-    /// same pubkey is reused, so a retry after a publish failure never opens
-    /// a second account.
-    CreateCoinosWallet { account: Account },
+    /// `WalletFailed`. Idempotent: a login already stored for the account is
+    /// reused, so a retry after a publish failure never opens a second one.
+    CreateCoinosWallet { pubkey: String },
+    /// Read the wallet balance with the stored token. Emits `Balance`, or
+    /// nothing (one feed line per failure streak).
+    FetchBalance { pubkey: String },
+    /// Pay `sats` from this account's Coinos wallet to the Lightning address
+    /// `to` (any domain: another account here, Strike, …). Emits `Sent` and
+    /// then a fresh `Balance`, or `SendFailed`.
+    Send {
+        pubkey: String,
+        to: String,
+        sats: u64,
+    },
     /// Follow one bounty: receipts by `#e` on the relay, plus the API's
     /// payment state machine while a claim is pending. Idempotent — a bounty
     /// already being watched is left alone. At most one bounty is watched at
@@ -122,7 +141,7 @@ pub enum Command {
 pub enum ErrorSource {
     /// The runtime itself (thread, tokio, relay URL).
     Runtime,
-    /// LoadAccounts (keychain reads, profile fetches).
+    /// LoadAccounts / RemoveAccount / SetActive (store reads and writes).
     Accounts,
     /// PublishDList.
     DList,
@@ -132,6 +151,8 @@ pub enum ErrorSource {
     Claim,
     /// Background bounty watching (API polls, receipt subscriptions).
     Watch,
+    /// FetchBalance.
+    Wallet,
 }
 
 /// Runtime → UI. Every variant is a deduplicated fact, safe to render as-is.
@@ -139,33 +160,30 @@ pub enum ErrorSource {
 pub enum Update {
     /// Honest relay connectivity, emitted on every change.
     RelayStatus(bool),
-    /// An account's key exists; only public material leaves the runtime.
-    AccountLoaded {
-        account: Account,
-        pubkey: String,
-        npub: String,
+    /// The store, as public material: every account in rail order, and
+    /// which one the app opens on. Re-emitted after a remove.
+    AccountsLoaded {
+        accounts: Vec<AccountInfo>,
+        active: Option<String>,
     },
-    /// No key stored for this account — the UI offers the paste-a-key import
-    /// instead of inventing an identity.
-    AccountMissing { account: Account },
     /// The account's kind-0, as far as it goes. Missing fields stay `None`
     /// and the UI falls back to its local labels.
     ProfileLoaded {
-        account: Account,
+        pubkey: String,
         name: Option<String>,
         picture: Option<String>,
         /// The Lightning address payouts go to. Its absence is a first-class
-        /// fact: the onboarding warns, because a payout needs one.
+        /// fact: the account screen warns, because a payout needs one.
         lud16: Option<String>,
     },
-    /// A pasted key was rejected. The message is fixed text from
+    /// A secret was rejected or could not be stored. Fixed text from
     /// [`SecretError`] — it never echoes the input.
-    ImportFailed { account: Account, message: String },
-    /// A pasted key is stored and its profile probe finished. Only public
-    /// material: the npub, and whether a kind-0 was found (its fields went
-    /// out in `ProfileLoaded` just before).
-    ImportReady {
-        account: Account,
+    AddAccountFailed { message: String },
+    /// A key is stored and its profile probe finished. Only public material:
+    /// the npub, and whether a kind-0 was found (its fields follow in
+    /// `ProfileLoaded`).
+    AccountAdded {
+        pubkey: String,
         npub: String,
         /// False when the profile probe itself failed (network, API): the
         /// lud16 line then says "couldn't check" instead of claiming "none".
@@ -182,7 +200,7 @@ pub enum Update {
     /// Boxed: the snapshot dwarfs every other variant on the channel.
     BountyDetail(Box<BountyDetail>),
     DListPublished {
-        account: Account,
+        pubkey: String,
         coordinate: String,
     },
     BountyCreated {
@@ -214,12 +232,31 @@ pub enum Update {
     },
     /// A Coinos account exists for the account's key; see [`WalletCreated`].
     WalletCreated {
-        account: Account,
+        pubkey: String,
         created: WalletCreated,
     },
     /// Fixed text from `coinos::CoinosError` or [`SecretError`]; never the
     /// password.
-    WalletFailed { account: Account, message: String },
+    WalletFailed { pubkey: String, message: String },
+    /// The Coinos balance, in sats.
+    Balance { pubkey: String, sats: u64 },
+    /// Coinos accepted the payment: `sats` left this account's wallet for
+    /// `to`. A `Balance` follows.
+    Sent {
+        pubkey: String,
+        to: String,
+        sats: u64,
+    },
+    /// Fixed text from `coinos::CoinosError` or the input check; never the
+    /// token or the password. `may_have_paid` is the one failure that is not
+    /// a "no": the payment request went out and no answer came back, so the
+    /// sats may be gone. A `Balance` follows it, and the UI drops the amount
+    /// so a reflex retry cannot pay twice.
+    SendFailed {
+        pubkey: String,
+        message: String,
+        may_have_paid: bool,
+    },
     Error {
         source: ErrorSource,
         message: String,
@@ -229,12 +266,29 @@ pub enum Update {
 /// What the wallet signup came back with. `publish_error` is set when the
 /// kind-0 write did not reach the relays: the wallet is real, but the payer
 /// cannot see the address yet, so the UI offers a retry. Public material
-/// only — fixed text, and the password stays in the keychain.
+/// only — fixed text, and the password stays in the store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalletCreated {
     pub username: String,
     pub lightning_address: String,
     pub publish_error: Option<String>,
+}
+
+/// One stored account, as `AccountsLoaded` announces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountInfo {
+    pub pubkey: String,
+    pub npub: String,
+    pub wallet: Option<WalletInfo>,
+}
+
+/// The public half of a stored Coinos login. `has_token` is false for a
+/// login saved before a register that never answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletInfo {
+    pub username: String,
+    pub lightning_address: String,
+    pub has_token: bool,
 }
 
 pub struct NostrHandle {
@@ -244,8 +298,10 @@ pub struct NostrHandle {
 
 #[derive(thiserror::Error, Debug)]
 enum BridgeError {
-    #[error("You need a {0} key for this — paste your nsec in the sidebar first")]
-    NoKey(Account),
+    /// Unreachable while the UI only names stored accounts; kept so a stale
+    /// pubkey (removed mid-flight) fails with words, not a panic.
+    #[error("This account has no key stored")]
+    NoKey,
     #[error(transparent)]
     Secret(#[from] SecretError),
     #[error(transparent)]
@@ -310,11 +366,15 @@ struct Session {
     logged_in: bool,
 }
 
-/// One session per account, shareable across spawned command tasks: the outer
-/// lock guards the map, the inner lock serialises work per account — so a slow
-/// issuer submit never blocks the claimant's publish, and neither blocks the
-/// command loop.
-type SharedSessions = Arc<TokioMutex<HashMap<Account, Arc<TokioMutex<Session>>>>>;
+/// One session per account (by pubkey hex), shareable across spawned command
+/// tasks: the outer lock guards the map, the inner lock serialises work per
+/// account — so a slow issuer submit never blocks another account's publish,
+/// and neither blocks the command loop.
+type SharedSessions = Arc<TokioMutex<HashMap<String, Arc<TokioMutex<Session>>>>>;
+
+/// Accounts whose last balance read failed: the feed gets one line per
+/// failure streak, not one per 3-second poll.
+type BalanceFailures = Arc<std::sync::Mutex<HashSet<String>>>;
 
 /// A running bounty watcher, as the command loop tracks it. `abort()` kills
 /// the task without running its cleanup, so the current relay subscription is
@@ -343,6 +403,7 @@ async fn run(
     ));
 
     let sessions: SharedSessions = Arc::new(TokioMutex::new(HashMap::new()));
+    let balance_failures: BalanceFailures = Arc::new(std::sync::Mutex::new(HashSet::new()));
     let mut watchers: HashMap<String, Watcher> = HashMap::new();
     // Ledgers outlive their watchers: what was already reported for a bounty
     // is permanent state, so stopping and re-watching never replays history
@@ -360,35 +421,60 @@ async fn run(
             Command::FetchBounties => {
                 tokio::spawn(fetch_bounties(updates.clone()));
             }
-            Command::ImportKey { account, secret } => {
+            Command::AddAccount {
+                secret,
+                name,
+                open_wallet,
+            } => {
                 let sessions = sessions.clone();
                 let updates = updates.clone();
-                tokio::spawn(import_key(sessions, account, secret, updates));
+                tokio::spawn(add_account(sessions, secret, name, open_wallet, updates));
             }
-            Command::ForgetKey { account } => {
+            Command::RemoveAccount { pubkey } => {
                 let sessions = sessions.clone();
                 let updates = updates.clone();
-                tokio::spawn(forget_key(sessions, account, updates));
+                tokio::spawn(remove_account(sessions, pubkey, updates));
             }
-            Command::CreateCoinosWallet { account } => {
+            Command::SetActive { pubkey } => {
+                let updates = updates.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = secrets::set_active(&pubkey) {
+                        let _ = updates.unbounded_send(Update::Error {
+                            source: ErrorSource::Accounts,
+                            message: e.to_string(),
+                        });
+                    }
+                });
+            }
+            Command::CreateCoinosWallet { pubkey } => {
                 let sessions = sessions.clone();
                 let updates = updates.clone();
-                tokio::spawn(create_coinos_wallet(sessions, account, updates));
+                tokio::spawn(create_coinos_wallet(sessions, pubkey, None, updates));
+            }
+            Command::FetchBalance { pubkey } => {
+                let failures = balance_failures.clone();
+                let updates = updates.clone();
+                tokio::spawn(fetch_balance(pubkey, failures, updates));
+            }
+            Command::Send { pubkey, to, sats } => {
+                let failures = balance_failures.clone();
+                let updates = updates.clone();
+                tokio::spawn(send_sats(pubkey, to, sats, failures, updates));
             }
             Command::PublishDList {
-                account,
+                pubkey,
                 singular,
                 plural,
                 description,
             } => {
                 // Spawned: a stalled publish must not block the commands
-                // queued behind it (the other account's work, watches).
+                // queued behind it (another account's work, watches).
                 let sessions = sessions.clone();
                 let updates = updates.clone();
                 tokio::spawn(async move {
                     let result = publish_dlist(
                         &sessions,
-                        account,
+                        &pubkey,
                         &singular,
                         &plural,
                         description.as_deref(),
@@ -396,7 +482,7 @@ async fn run(
                     .await;
                     let update = match result {
                         Ok(coordinate) => Update::DListPublished {
-                            account,
+                            pubkey,
                             coordinate,
                         },
                         Err(e) => Update::Error {
@@ -407,11 +493,11 @@ async fn run(
                     let _ = updates.unbounded_send(update);
                 });
             }
-            Command::CreateBounty { account, req } => {
+            Command::CreateBounty { pubkey, req } => {
                 let sessions = sessions.clone();
                 let updates = updates.clone();
                 tokio::spawn(async move {
-                    let update = match create_bounty(&sessions, account, &req).await {
+                    let update = match create_bounty(&sessions, &pubkey, &req).await {
                         Ok(id) => Update::BountyCreated { id },
                         Err(e) => Update::Error {
                             source: ErrorSource::Bounty,
@@ -422,7 +508,7 @@ async fn run(
                 });
             }
             Command::PublishClaim {
-                account,
+                pubkey,
                 bounty_id,
                 name,
                 list_coordinate,
@@ -431,7 +517,7 @@ async fn run(
                 let updates = updates.clone();
                 tokio::spawn(async move {
                     let update =
-                        match publish_claim(&sessions, account, &name, &list_coordinate).await {
+                        match publish_claim(&sessions, &pubkey, &name, &list_coordinate).await {
                             Ok(event_id) => Update::ClaimPublished {
                                 bounty_id,
                                 event_id,
@@ -487,35 +573,35 @@ async fn run(
     client.disconnect().await;
 }
 
-/// Lazily open one session per account: keys from the keychain (or the env
-/// override), a fresh `Api` with its own cookie jar.
+/// Lazily open one session per account: keys from the store, a fresh `Api`
+/// with its own cookie jar.
 async fn session(
     sessions: &SharedSessions,
-    account: Account,
+    pubkey: &str,
 ) -> Result<Arc<TokioMutex<Session>>, BridgeError> {
     let mut map = sessions.lock().await;
-    if let Some(existing) = map.get(&account) {
+    if let Some(existing) = map.get(pubkey) {
         return Ok(existing.clone());
     }
-    let keys = secrets::keys(account)?.ok_or(BridgeError::NoKey(account))?;
+    let keys = secrets::keys(pubkey)?.ok_or(BridgeError::NoKey)?;
     let api = Api::new()?;
     let session = Arc::new(TokioMutex::new(Session {
         keys,
         api,
         logged_in: false,
     }));
-    map.insert(account, session.clone());
+    map.insert(pubkey.to_string(), session.clone());
     Ok(session)
 }
 
 async fn publish_dlist(
     sessions: &SharedSessions,
-    account: Account,
+    pubkey: &str,
     singular: &str,
     plural: &str,
     description: Option<&str>,
 ) -> Result<String, BridgeError> {
-    let session = session(sessions, account).await?;
+    let session = session(sessions, pubkey).await?;
     let session = session.lock().await;
     let event = events::dlist_header(&session.keys, singular, plural, description)?;
     // Publishing through the instance needs no login; the event is signed.
@@ -526,10 +612,10 @@ async fn publish_dlist(
 
 async fn create_bounty(
     sessions: &SharedSessions,
-    account: Account,
+    pubkey: &str,
     req: &CreateBounty,
 ) -> Result<String, BridgeError> {
-    let session = session(sessions, account).await?;
+    let session = session(sessions, pubkey).await?;
     let mut session = session.lock().await;
     // The bounty issuer is always the session pubkey, so log in first.
     if !session.logged_in {
@@ -542,11 +628,11 @@ async fn create_bounty(
 
 async fn publish_claim(
     sessions: &SharedSessions,
-    account: Account,
+    pubkey: &str,
     name: &str,
     list_coordinate: &str,
 ) -> Result<String, BridgeError> {
-    let session = session(sessions, account).await?;
+    let session = session(sessions, pubkey).await?;
     let session = session.lock().await;
     let event = events::claim(&session.keys, name, list_coordinate)?;
     session.api.publish_event(&event).await?;
@@ -556,7 +642,8 @@ async fn publish_claim(
 /// One account's kind-0 content through the instance's public scan endpoint
 /// (kind 0 is replaceable, so the relay holds at most the latest). `Ok(None)`:
 /// the scan worked and found no profile. `Err(())`: the scan itself failed —
-/// the caller decides whether that is silent (startup) or shown (onboarding).
+/// the caller decides whether that is silent (startup) or shown (the account
+/// screen).
 async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<String>, ()> {
     let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
     let events = api.scan(&filter).await.map_err(|_| ())?;
@@ -602,16 +689,18 @@ fn parse_profile(content: &str) -> Profile {
 }
 
 /// The `ProfileLoaded` an account's kind-0 amounts to.
-fn profile_loaded(account: Account, profile: Profile) -> Update {
+fn profile_loaded(pubkey: String, profile: Profile) -> Update {
     Update::ProfileLoaded {
-        account,
+        pubkey,
         name: profile.name,
         picture: profile.picture,
         lud16: profile.lud16,
     }
 }
 
-/// The new kind-0: the existing profile with ONLY `lud16` changed.
+/// The new kind-0: the existing profile with ONLY `lud16` changed — plus
+/// `name`, when one was given and the profile has none (the create-account
+/// path; a name set elsewhere always wins).
 ///
 /// The same nsec may also live in a phone app or a browser extension, so this
 /// app is not the only writer of this profile. Merge, never rebuild — a
@@ -624,6 +713,7 @@ fn profile_loaded(account: Account, profile: Profile) -> Update {
 fn merge_lud16(
     existing: Option<&str>,
     lud16: &str,
+    name: Option<&str>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
     let mut profile = match existing.map(str::trim) {
         None | Some("") => serde_json::Map::new(),
@@ -637,6 +727,13 @@ fn merge_lud16(
         },
     };
     profile.insert("lud16".into(), serde_json::Value::String(lud16.to_string()));
+    if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty())
+        && Profile::from_value(&serde_json::Value::Object(profile.clone()))
+            .name
+            .is_none()
+    {
+        profile.insert("name".into(), serde_json::Value::String(name.to_string()));
+    }
     Ok(profile)
 }
 
@@ -650,13 +747,14 @@ async fn publish_lud16(
     keys: &Keys,
     api: &Api,
     lud16: &str,
+    name: Option<&str>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
     let existing = fetch_kind0(api, &keys.public_key().to_hex())
         .await
         .map_err(|_| {
             BridgeError::Profile("Could not read your current profile from the instance")
         })?;
-    let profile = merge_lud16(existing.as_deref(), lud16)?;
+    let profile = merge_lud16(existing.as_deref(), lud16, name)?;
     let content = serde_json::Value::Object(profile.clone()).to_string();
     let event = EventBuilder::new(Kind::Metadata, content)
         .finalize(keys)
@@ -685,81 +783,78 @@ async fn publish_lud16(
     }
 }
 
+/// Fixed text for the one state a retry cannot fix: the login was saved
+/// before a register that never answered, the wallet turned out to exist,
+/// and the token it answered with is gone. `/api/login` has a captcha, so
+/// there is no second way to get one.
+const NO_TOKEN: &str = "Wallet exists but this app has no token for it; remove the account and \
+     create a new wallet. Your Coinos username and password still work on coinos.io.";
+
 /// The wallet signup, entirely on the runtime thread. Order matters:
 ///
-/// 1. Store the login in the keychain.
-/// 2. `POST /api/register`. A refusal deletes the login (nothing was
-///    created); any other failure keeps it (the account may exist).
-/// 3. Merge the lud16 into the kind-0 and publish it.
+/// 1. Store the login (empty token) on the account record.
+/// 2. `POST /api/register`; store the token it answers with. A refusal
+///    deletes the login (nothing was created); any other failure keeps it
+///    (the account may exist).
+/// 3. Merge the lud16 (and `name`, if the profile has none) into the kind-0
+///    and publish it.
 ///
-/// A login already in the keychain for this pubkey (a retry) skips step 1 and
-/// probes coinos before deciding whether step 2 is still needed — so a signup
-/// that timed out on the way back never becomes two accounts, and one that
-/// never happened is not skipped. A login for a different pubkey (the slot
-/// was re-imported) is replaced; an entry this app cannot read is left alone
-/// and reported, because it may be the only copy of a real password.
+/// A login already stored with a token (a retry after a publish failure)
+/// skips to step 3. One stored WITHOUT a token probes coinos first: no
+/// wallet → register with the same login; a wallet → [`NO_TOKEN`], never a
+/// second account.
 async fn create_coinos_wallet(
     sessions: SharedSessions,
-    account: Account,
+    pubkey: String,
+    name: Option<String>,
     updates: mpsc::UnboundedSender<Update>,
 ) {
     let fail = |message: String| {
-        let _ = updates.unbounded_send(Update::WalletFailed { account, message });
+        let _ = updates.unbounded_send(Update::WalletFailed {
+            pubkey: pubkey.clone(),
+            message,
+        });
     };
-    let (keys, api) = match session(&sessions, account).await {
+    let (keys, api) = match session(&sessions, &pubkey).await {
         Ok(session) => {
             let session = session.lock().await;
             (session.keys.clone(), session.api.clone())
         }
         Err(e) => return fail(e.to_string()),
     };
-    let pubkey = keys.public_key().to_hex();
 
-    let stored = match secrets::load_coinos_login(account) {
-        Ok(Some(secret)) => match coinos::Login::decode(&secret) {
-            Some(login) => Some(login),
-            None => {
-                return fail(format!(
-                    "The saved Coinos login for this account is unreadable — remove the \
-                     {} keychain entry and try again.",
-                    account.coinos_entry_key()
-                ));
-            }
-        },
-        Ok(None) => None,
+    let stored = match secrets::load_coinos_login(&pubkey) {
+        Ok(stored) => stored,
         Err(e) => return fail(e.to_string()),
     };
-    let (login, fresh) = coinos::Login::reuse_or_fresh(stored, &pubkey);
-    if fresh && let Err(e) = secrets::store_coinos_login(account, &login.encode()) {
-        return fail(e.to_string());
-    }
-
-    let needs_register = if fresh {
-        true
-    } else {
-        match coinos::wallet_exists(&login.username).await {
-            Ok(exists) => !exists,
+    let login = match stored {
+        Some(login) if login.has_token() => login,
+        Some(login) => match coinos::wallet_exists(&login.username).await {
+            Ok(true) => return fail(NO_TOKEN.into()),
+            Ok(false) => match register_wallet(&pubkey, login).await {
+                Ok(login) => login,
+                Err(message) => return fail(message),
+            },
             Err(e) => return fail(e.to_string()),
-        }
-    };
-    if needs_register {
-        match coinos::create_wallet(&login.username, &login.password, &pubkey).await {
-            Ok(_) => {}
-            Err(e) => {
-                if e.account_definitely_not_created() {
-                    let _ = secrets::forget_coinos_login(account);
-                }
+        },
+        None => {
+            let login = coinos::Login::fresh();
+            if let Err(e) = secrets::store_coinos_login(&pubkey, &login) {
                 return fail(e.to_string());
             }
+            match register_wallet(&pubkey, login).await {
+                Ok(login) => login,
+                Err(message) => return fail(message),
+            }
         }
-    }
+    };
 
     let lightning_address = coinos::lightning_address(&login.username);
-    let published = publish_lud16(&keys, &api, &lightning_address).await;
+    let published = publish_lud16(&keys, &api, &lightning_address, name.as_deref()).await;
     // The wallet exists either way; a publish failure travels inside
     // `WalletCreated` so the panel can show it next to the retry button.
     let _ = updates.unbounded_send(Update::WalletCreated {
-        account,
+        pubkey: pubkey.clone(),
         created: WalletCreated {
             username: login.username,
             lightning_address,
@@ -768,38 +863,154 @@ async fn create_coinos_wallet(
     });
     if let Ok(profile) = published {
         let profile = Profile::from_value(&serde_json::Value::Object(profile));
-        let _ = updates.unbounded_send(profile_loaded(account, profile));
+        let _ = updates.unbounded_send(profile_loaded(pubkey, profile));
     }
 }
 
-/// Resolve one account to public material and announce it, then its kind-0.
-/// Secrets never leave [`crate::secrets`].
-async fn load_one_account(account: Account, updates: &mpsc::UnboundedSender<Update>) {
-    let keys = match secrets::keys(account) {
-        Ok(Some(keys)) => keys,
-        Ok(None) => {
-            let _ = updates.unbounded_send(Update::AccountMissing { account });
-            return;
+/// Step 2 of the signup: register, then store the token next to the login.
+/// The error is the fixed text the panel shows.
+async fn register_wallet(pubkey: &str, mut login: coinos::Login) -> Result<coinos::Login, String> {
+    match coinos::create_wallet(&login.username, &login.password, pubkey).await {
+        Ok(token) => {
+            login.token = token;
+            secrets::store_coinos_login(pubkey, &login).map_err(|e| e.to_string())?;
+            Ok(login)
         }
+        Err(e) => {
+            if e.account_definitely_not_created() {
+                let _ = secrets::forget_coinos_login(pubkey);
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+/// The balance read behind the "Waiting for sats…" line. Silent without a
+/// token; on failure, one feed line per streak.
+/// A wallet opened by another install of this app (or on coinos.io itself)
+/// can be funded and shown here, but only the register token pays.
+const CANNOT_SEND: &str = "This wallet cannot send from this app; it was opened elsewhere";
+
+/// `Command::Send`: the stored token pays an invoice pulled from the
+/// recipient's own LNURL endpoint, then the balance is re-read so the panel
+/// drops at once instead of on the next poll.
+async fn send_sats(
+    pubkey: String,
+    to: String,
+    sats: u64,
+    failures: BalanceFailures,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let fail = |message: String| {
+        let _ = updates.unbounded_send(Update::SendFailed {
+            pubkey: pubkey.clone(),
+            message,
+            may_have_paid: false,
+        });
+    };
+    let login = match secrets::load_coinos_login(&pubkey) {
+        Ok(Some(login)) if login.has_token() => login,
+        Ok(_) => return fail(CANNOT_SEND.into()),
+        Err(e) => return fail(e.to_string()),
+    };
+    if sats == 0 {
+        return fail("Enter an amount in sats".into());
+    }
+    let to = to.trim().to_string();
+    if coinos::split_address(&to).is_none() {
+        return fail("Enter a Lightning address like name@domain.com".into());
+    }
+    let bolt11 = match coinos::lnurl_invoice(&to, sats).await {
+        Ok(bolt11) => bolt11,
+        Err(e) => return fail(e.to_string()),
+    };
+    match coinos::pay_invoice(&login.token, &bolt11, sats).await {
+        Ok(()) => {
+            let _ = updates.unbounded_send(Update::Sent {
+                pubkey: pubkey.clone(),
+                to,
+                sats,
+            });
+        }
+        Err(e @ coinos::CoinosError::OutcomeUnknown) => {
+            let _ = updates.unbounded_send(Update::SendFailed {
+                pubkey: pubkey.clone(),
+                message: e.to_string(),
+                may_have_paid: true,
+            });
+        }
+        Err(e) => return fail(e.to_string()),
+    }
+    // Either way the wallet may have changed: the panel shows the new
+    // balance at once, not on the next poll.
+    fetch_balance(pubkey, failures, updates).await;
+}
+
+async fn fetch_balance(
+    pubkey: String,
+    failures: BalanceFailures,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let login = match secrets::load_coinos_login(&pubkey) {
+        Ok(Some(login)) if login.has_token() => login,
+        _ => return,
+    };
+    let mark = |failing: bool| -> bool {
+        let mut set = failures.lock().unwrap_or_else(|p| p.into_inner());
+        if failing {
+            set.insert(pubkey.clone())
+        } else {
+            set.remove(&pubkey)
+        }
+    };
+    match coinos::balance(&login.token).await {
+        Ok(sats) => {
+            mark(false);
+            let _ = updates.unbounded_send(Update::Balance { pubkey, sats });
+        }
+        Err(e) => {
+            if mark(true) {
+                let _ = updates.unbounded_send(Update::Error {
+                    source: ErrorSource::Wallet,
+                    message: format!("Balance check failed: {e}"),
+                });
+            }
+        }
+    }
+}
+
+/// Announce the store as public material, then each account's kind-0.
+/// Secrets never leave [`crate::secrets`]. A store that cannot be read is
+/// reported and treated as empty — the account screen then opens, and the
+/// first save fails with the same message.
+async fn load_accounts(updates: mpsc::UnboundedSender<Update>) {
+    let store = match secrets::load() {
+        Ok(store) => store,
         Err(e) => {
             let _ = updates.unbounded_send(Update::Error {
                 source: ErrorSource::Accounts,
                 message: e.to_string(),
             });
-            let _ = updates.unbounded_send(Update::AccountMissing { account });
-            return;
+            secrets::Store::default()
         }
     };
-    let pubkey = keys.public_key().to_hex();
-    let npub = keys
-        .public_key()
-        .to_bech32()
-        .unwrap_or_else(|_| pubkey.clone());
+    let accounts = store
+        .accounts
+        .iter()
+        .map(|account| AccountInfo {
+            pubkey: account.pubkey.clone(),
+            npub: account.npub(),
+            wallet: account.coinos.as_ref().map(|login| WalletInfo {
+                username: login.username.clone(),
+                lightning_address: coinos::lightning_address(&login.username),
+                has_token: login.has_token(),
+            }),
+        })
+        .collect();
     if updates
-        .unbounded_send(Update::AccountLoaded {
-            account,
-            pubkey: pubkey.clone(),
-            npub,
+        .unbounded_send(Update::AccountsLoaded {
+            accounts,
+            active: store.active.clone(),
         })
         .is_err()
     {
@@ -807,80 +1018,47 @@ async fn load_one_account(account: Account, updates: &mpsc::UnboundedSender<Upda
     }
 
     // A scan failure is not an error state: the UI's fallback labels are
-    // the defined behaviour when no profile is known.
+    // the defined behaviour when no profile is known. A CONFIRMED-empty
+    // profile is reported, though: the UI pre-fills a stored wallet's address
+    // from the store, and only a real profile read can say whether the
+    // relays carry that lud16 yet.
     let Ok(api) = Api::new() else { return };
-    if let Ok(Some(content)) = fetch_kind0(&api, &pubkey).await {
-        let _ = updates.unbounded_send(profile_loaded(account, parse_profile(&content)));
+    for account in &store.accounts {
+        if let Ok(content) = fetch_kind0(&api, &account.pubkey).await {
+            let _ = updates.unbounded_send(profile_loaded(
+                account.pubkey.clone(),
+                content.map(|c| parse_profile(&c)).unwrap_or_default(),
+            ));
+        }
     }
 }
 
-async fn load_accounts(updates: mpsc::UnboundedSender<Update>) {
-    for account in Account::ALL {
-        load_one_account(account, &updates).await;
-    }
-}
-
-/// The pasted-key import, run entirely on the runtime thread so the UI never
-/// touches the keychain: validate, store, drop any stale session, then
-/// announce the account and probe its profile. Every message that leaves here
-/// is public material or fixed text.
-async fn import_key(
+/// The add-account path, run entirely on the runtime thread so the UI never
+/// touches the store: validate, store, drop any stale session, announce the
+/// account and probe its profile — then, if asked, open the wallet in the
+/// same breath. Every message that leaves here is public material or fixed
+/// text.
+async fn add_account(
     sessions: SharedSessions,
-    account: Account,
     secret: Secret,
+    name: Option<String>,
+    open_wallet: bool,
     updates: mpsc::UnboundedSender<Update>,
 ) {
-    let parsed = match secrets::parse_secret(&secret) {
-        Ok(keys) => keys,
+    let record = match secrets::add_account(&secret) {
+        Ok(record) => record,
         Err(e) => {
-            let _ = updates.unbounded_send(Update::ImportFailed {
-                account,
+            let _ = updates.unbounded_send(Update::AddAccountFailed {
                 message: e.to_string(),
             });
             return;
         }
     };
-    // Store the trimmed text, so the keychain never holds stray whitespace.
-    let trimmed = Secret::new(secret.expose().trim());
-    if let Err(e) = secrets::store_nsec(account, &trimmed) {
-        // This message lands on the first-launch screen: a locked keychain
-        // gets a recovery step, not the keyring crate's platform detail.
-        let message = match e {
-            SecretError::Keyring(_) => "This Mac's keychain is locked — unlock it \
-                 (or log out and back in) and try again."
-                .to_string(),
-            other => other.to_string(),
-        };
-        let _ = updates.unbounded_send(Update::ImportFailed { account, message });
-        return;
-    }
-    // A cached session signs with the old key; drop it.
-    sessions.lock().await.remove(&account);
-
-    // Env wins over the keychain, so announce the EFFECTIVE key — normally
-    // the one just pasted, but an automated run's env override stays honest.
-    let keys = match secrets::keys(account) {
-        Ok(Some(keys)) => keys,
-        _ => parsed,
-    };
-    let pubkey = keys.public_key().to_hex();
-    let npub = keys
-        .public_key()
-        .to_bech32()
-        .unwrap_or_else(|_| pubkey.clone());
-    if updates
-        .unbounded_send(Update::AccountLoaded {
-            account,
-            pubkey: pubkey.clone(),
-            npub: npub.clone(),
-        })
-        .is_err()
-    {
-        return;
-    }
+    // A cached session for a re-added key is harmless but stale; drop it.
+    sessions.lock().await.remove(&record.pubkey);
 
     let probe = match Api::new() {
-        Ok(api) => fetch_kind0(&api, &pubkey).await,
+        Ok(api) => fetch_kind0(&api, &record.pubkey).await,
         Err(_) => Err(()),
     };
     let (profile, profile_checked) = match probe {
@@ -888,56 +1066,75 @@ async fn import_key(
         Err(()) => (None, false),
     };
     let profile_found = profile.is_some();
-    // The profile lands on the account view first, so the onboarding summary
-    // that follows can read the name and lud16 from there.
-    if let Some(content) = profile {
-        let _ = updates.unbounded_send(profile_loaded(account, parse_profile(&content)));
+    // The account lands on the UI first, so the profile that follows has a
+    // view to land on.
+    if updates
+        .unbounded_send(Update::AccountAdded {
+            pubkey: record.pubkey.clone(),
+            npub: record.npub,
+            profile_checked,
+            profile_found,
+        })
+        .is_err()
+    {
+        return;
     }
-    let _ = updates.unbounded_send(Update::ImportReady {
-        account,
-        npub,
-        profile_checked,
-        profile_found,
-    });
+    if let Some(content) = profile {
+        let _ = updates.unbounded_send(profile_loaded(
+            record.pubkey.clone(),
+            parse_profile(&content),
+        ));
+    }
+    if open_wallet {
+        create_coinos_wallet(sessions, record.pubkey, name, updates).await;
+    }
 }
 
-/// Delete the keychain entry, drop the cached session, then re-announce
-/// whatever is still true — an env override survives and wins.
-async fn forget_key(
+/// Delete the account from the store, drop the cached session, then
+/// re-announce the store.
+async fn remove_account(
     sessions: SharedSessions,
-    account: Account,
+    pubkey: String,
     updates: mpsc::UnboundedSender<Update>,
 ) {
-    if let Err(e) = secrets::forget_nsec(account) {
+    if let Err(e) = secrets::remove_account(&pubkey) {
         let _ = updates.unbounded_send(Update::Error {
             source: ErrorSource::Accounts,
             message: e.to_string(),
         });
         return;
     }
-    sessions.lock().await.remove(&account);
-    load_one_account(account, &updates).await;
+    sessions.lock().await.remove(&pubkey);
+    load_accounts(updates).await;
 }
 
-/// The pubkey whose bounties the read paths list: the imported issuer key if
-/// any, else `MC_ISSUER_NPUB`, else the instance's house issuer. Public
-/// material only — read-only browsing needs no secret.
-fn issuer_pubkey_for_reads() -> String {
-    if let Ok(Some(keys)) = secrets::keys(Account::Issuer) {
-        return keys.public_key().to_hex();
-    }
-    if let Ok(value) = std::env::var("MC_ISSUER_NPUB")
-        && let Ok(pubkey) = PublicKey::parse(value.trim())
-    {
-        return pubkey.to_hex();
-    }
-    HOUSE_ISSUER_HEX.to_string()
+/// The issuer whose bounties the read paths list: `MC_ISSUER_NPUB` (npub or
+/// hex), else the instance's house issuer. No stored key changes it — a
+/// person who pastes their own nsec must not end up looking at their own
+/// (empty) bounty list. Public material only.
+pub fn issuer_pubkey() -> String {
+    issuer_pubkey_from(std::env::var("MC_ISSUER_NPUB").ok().as_deref())
+}
+
+fn issuer_pubkey_from(env_value: Option<&str>) -> String {
+    env_value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| PublicKey::parse(v).ok())
+        .map(|pk| pk.to_hex())
+        .unwrap_or_else(|| HOUSE_ISSUER_HEX.to_string())
+}
+
+/// An account IS the issuer when its pubkey is the one the read paths list.
+/// That account gets the bounty form; everyone else gets the claim form.
+pub fn is_issuer(pubkey: &str) -> bool {
+    pubkey == issuer_pubkey()
 }
 
 async fn fetch_bounties(updates: mpsc::UnboundedSender<Update>) {
     let result = async {
         let api = Api::new()?;
-        Ok::<_, BridgeError>(api.list_bounties(&issuer_pubkey_for_reads()).await?)
+        Ok::<_, BridgeError>(api.list_bounties(&issuer_pubkey()).await?)
     }
     .await;
     let update = match result {
@@ -1411,7 +1608,7 @@ mod tests {
     #[test]
     fn merging_lud16_keeps_every_other_profile_field() {
         let existing = r#"{"name":"Matthias","picture":"https://x/p.png","about":"hi","nip05":"m@x.io","custom":{"deep":1}}"#;
-        let merged = merge_lud16(Some(existing), "carpet1234@coinos.io").unwrap();
+        let merged = merge_lud16(Some(existing), "carpet1234@coinos.io", None).unwrap();
         assert_eq!(merged["name"], "Matthias");
         assert_eq!(merged["picture"], "https://x/p.png");
         assert_eq!(merged["about"], "hi");
@@ -1422,34 +1619,72 @@ mod tests {
         assert_eq!(merged.len(), 6);
 
         // An existing lud16 is replaced, not duplicated.
-        let merged = merge_lud16(Some(r#"{"lud16":"old@strike.me","name":"M"}"#), "new@coinos.io").unwrap();
+        let merged = merge_lud16(Some(r#"{"lud16":"old@strike.me","name":"M"}"#), "new@coinos.io", None).unwrap();
         assert_eq!(merged["lud16"], "new@coinos.io");
         assert_eq!(merged["name"], "M");
         assert_eq!(merged.len(), 2);
 
         // A wrong-typed field elsewhere survives as it was.
-        let merged = merge_lud16(Some(r#"{"name":"Alice","about":42}"#), "a@coinos.io").unwrap();
+        let merged = merge_lud16(Some(r#"{"name":"Alice","about":42}"#), "a@coinos.io", None).unwrap();
         assert_eq!(merged["name"], "Alice");
         assert_eq!(merged["about"], 42);
 
         // A wrong-typed lud16 is replaced and the rest kept.
-        let merged = merge_lud16(Some(r#"{"name":"Alice","lud16":123}"#), "a@coinos.io").unwrap();
+        let merged = merge_lud16(Some(r#"{"name":"Alice","lud16":123}"#), "a@coinos.io", None).unwrap();
         assert_eq!(merged["lud16"], "a@coinos.io");
         assert_eq!(merged["name"], "Alice");
 
         // A null value keeps its key.
-        let merged = merge_lud16(Some(r#"{"about":null}"#), "a@coinos.io").unwrap();
+        let merged = merge_lud16(Some(r#"{"about":null}"#), "a@coinos.io", None).unwrap();
         assert!(merged.contains_key("about"));
         assert!(merged["about"].is_null());
 
         // Only a confirmed-absent profile may start from blank.
         let blank = serde_json::json!({ "lud16": "new@coinos.io" });
-        assert_eq!(merge_lud16(None, "new@coinos.io").unwrap(), *blank.as_object().unwrap());
-        assert_eq!(merge_lud16(Some(""), "new@coinos.io").unwrap(), *blank.as_object().unwrap());
+        assert_eq!(merge_lud16(None, "new@coinos.io", None).unwrap(), *blank.as_object().unwrap());
+        assert_eq!(merge_lud16(Some(""), "new@coinos.io", None).unwrap(), *blank.as_object().unwrap());
 
         // Content that is not an object is left alone rather than clobbered.
-        assert!(merge_lud16(Some("[1,2]"), "x@y.z").is_err());
-        assert!(merge_lud16(Some("not json"), "x@y.z").is_err());
+        assert!(merge_lud16(Some("[1,2]"), "x@y.z", None).is_err());
+        assert!(merge_lud16(Some("not json"), "x@y.z", None).is_err());
+    }
+
+    #[test]
+    fn a_new_accounts_name_only_fills_an_empty_profile() {
+        // The create path: no kind-0 yet, so the name goes in with the lud16.
+        let merged = merge_lud16(None, "a@coinos.io", Some(" Ada ")).unwrap();
+        assert_eq!(merged["name"], "Ada");
+        assert_eq!(merged.len(), 2);
+        // A blank name is no name.
+        assert!(!merge_lud16(None, "a@coinos.io", Some("  ")).unwrap().contains_key("name"));
+        // A name set elsewhere wins, whichever field carries it.
+        let merged = merge_lud16(Some(r#"{"name":"Alice"}"#), "a@coinos.io", Some("Ada")).unwrap();
+        assert_eq!(merged["name"], "Alice");
+        let merged =
+            merge_lud16(Some(r#"{"display_name":"Alice"}"#), "a@coinos.io", Some("Ada")).unwrap();
+        assert!(!merged.contains_key("name"));
+        // A profile with an empty name is a profile with no name.
+        let merged = merge_lud16(Some(r#"{"name":""}"#), "a@coinos.io", Some("Ada")).unwrap();
+        assert_eq!(merged["name"], "Ada");
+    }
+
+    #[test]
+    fn the_issuer_is_the_env_override_or_the_house_key() {
+        let house = PublicKey::from_hex(HOUSE_ISSUER_HEX).unwrap();
+        assert_eq!(issuer_pubkey_from(None), HOUSE_ISSUER_HEX);
+        assert_eq!(issuer_pubkey_from(Some("")), HOUSE_ISSUER_HEX);
+        assert_eq!(issuer_pubkey_from(Some("not a key")), HOUSE_ISSUER_HEX);
+        // npub or hex, either way the hex comes out.
+        assert_eq!(
+            issuer_pubkey_from(Some(&house.to_bech32().unwrap())),
+            HOUSE_ISSUER_HEX
+        );
+        let other = Keys::generate().public_key();
+        assert_eq!(
+            issuer_pubkey_from(Some(&format!(" {} ", other.to_bech32().unwrap()))),
+            other.to_hex()
+        );
+        assert_eq!(issuer_pubkey_from(Some(&other.to_hex())), other.to_hex());
     }
 
     #[test]
@@ -1464,17 +1699,18 @@ mod tests {
 
     #[test]
     fn a_wallet_command_and_update_carry_no_secret() {
-        // Neither side of the wallet channel may hold the password: the
-        // command names an account, the update names public material only.
+        // Neither side of the wallet channel may hold the password or the
+        // token: the command names an account, the update names public
+        // material only.
         let printed = format!(
             "{:?}",
             Command::CreateCoinosWallet {
-                account: Account::Claimant
+                pubkey: "aa".repeat(32)
             }
         );
-        assert_eq!(printed, "CreateCoinosWallet { account: Claimant }");
+        assert_eq!(printed, format!("CreateCoinosWallet {{ pubkey: \"{}\" }}", "aa".repeat(32)));
         let update = Update::WalletCreated {
-            account: Account::Claimant,
+            pubkey: "aa".repeat(32),
             created: WalletCreated {
                 username: "carpetab12cd34".into(),
                 lightning_address: "carpetab12cd34@coinos.io".into(),
@@ -1485,12 +1721,13 @@ mod tests {
     }
 
     #[test]
-    fn an_import_command_debugs_without_its_secret() {
+    fn an_add_account_command_debugs_without_its_secret() {
         // The command channel is the one place a pasted key travels outside
         // `secrets`; a `{:?}` on it must stay clean.
-        let command = Command::ImportKey {
-            account: Account::Claimant,
+        let command = Command::AddAccount {
             secret: Secret::new("nsec1extremelysecretvalue"),
+            name: Some("Ada".into()),
+            open_wallet: true,
         };
         let printed = format!("{command:?}");
         assert!(!printed.contains("extremelysecret"), "leaked: {printed}");

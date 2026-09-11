@@ -1,7 +1,7 @@
 //! The Dashboard screen: "Needs attention" beside "Recent activity".
 //!
 //! Every row renders from the shell's live state. "Needs attention" is derived
-//! (missing keys, relay down, list failures) and "Recent activity" is the feed
+//! (no account, relay down, list failures) and "Recent activity" is the feed
 //! the nostr runtime's updates write, newest first.
 
 use gpui_kit::prelude::FluentBuilder as _;
@@ -10,7 +10,6 @@ use gpui_kit::component::{h_flex, v_flex};
 
 use magic_carpet_chat::api;
 use magic_carpet_chat::nostr;
-use magic_carpet_chat::secrets::Account;
 
 use crate::palette::*;
 use crate::shell::{ActivityItem, Load, Shell};
@@ -105,23 +104,15 @@ struct Attention {
 /// list renders as an explicit all-clear instead of an empty card.
 fn attention_rows(shell: &Shell) -> Vec<Attention> {
     let mut rows = Vec::new();
-    // Only the CLAIMANT key gates anything a user can do here — claims are
-    // signed with it. A missing ISSUER key is deliberately NOT a row: the
-    // app lists the house issuer's bounties without one, claiming never
-    // needs it, and steering a claimant at the issuer slot would replace
-    // the bounty list with their own (empty) one.
-    if shell.view(Account::Claimant).missing {
-        let description = if shell.account == Account::Claimant {
-            "No key for the Claimant account — paste your nsec in the sidebar \
-             input to claim and get paid. It stays in this Mac's keychain."
-        } else {
-            "No key for the Claimant account — press ⌘] to switch to it, then \
-             paste your nsec in the sidebar input."
-        };
+    // Claims are signed with an account's key, so no account means no
+    // claiming. The bounty list needs none: it is the house issuer's.
+    if shell.active_view().is_none() {
         rows.push(Attention {
             dot: TEXT_DIM,
-            title: "Read-only — import a key to claim".into(),
-            description: description.into(),
+            title: "Read-only — add an account to claim".into(),
+            description: "Press + in the rail to create an account or paste your \
+                 nsec. It stays in this Mac's accounts file."
+                .into(),
             retry: false,
         });
     }
@@ -199,16 +190,8 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
 }
 
 fn all_clear(shell: &Shell) -> AnyElement {
-    // "Keys loaded" may only be claimed when it is true of BOTH accounts —
-    // an issuer-keyless claimant still reaches this row (that gap is not an
-    // attention item), so the text drops the claim instead of lying.
-    let all_keys = Account::ALL
-        .into_iter()
-        .all(|account| shell.view(account).npub.is_some());
     let (dot, text): (u32, &str) = if matches!(shell.bounties, Load::Loading) {
         (TEXT_DIM, "Loading the bounty list…")
-    } else if all_keys {
-        (GREEN, "All clear — keys loaded, relay connected, bounty list live.")
     } else {
         (GREEN, "All clear — relay connected, bounty list live.")
     };
@@ -295,11 +278,11 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
     let host = host
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    let keys_loaded = Account::ALL
-        .into_iter()
-        .filter(|account| shell.view(*account).npub.is_some())
-        .count();
-    let summary = format!("{keys_loaded} of 2 account keys · watching {host}");
+    let accounts = shell.views().count();
+    let summary = format!(
+        "{accounts} account{} · watching {host}",
+        if accounts == 1 { "" } else { "s" }
+    );
 
     let attention = attention_rows(shell);
     let badge = (!attention.is_empty()).then(|| attention.len().to_string());
@@ -322,13 +305,14 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
             .collect()
     };
 
-    let action_label = match shell.account {
-        Account::Issuer => "+ New DList + bounty",
-        Account::Claimant => "+ Submit a bounty claim",
+    let action_label = if shell.is_active_issuer() {
+        "+ New DList + bounty"
+    } else {
+        "+ Submit a bounty claim"
     };
-    // With no key for the active account the CTA cannot do what it says —
-    // it dims, and a click (like ⌘N) routes to the sidebar key input.
-    let keyless = shell.view(shell.account).missing;
+    // With no account the CTA cannot do what it says — it dims, and a click
+    // (like ⌘N) opens the account screen.
+    let keyless = shell.active_view().is_none();
 
     v_flex()
         .child(

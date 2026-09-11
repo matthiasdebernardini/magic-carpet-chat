@@ -20,23 +20,24 @@ use gpui_kit::component::{
 };
 
 use magic_carpet_chat::api::{Bounty, BountyDetail, CreateBounty};
-use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update};
-use magic_carpet_chat::secrets::{Account, Secret};
+use magic_carpet_chat::coinos;
+use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated};
+use magic_carpet_chat::secrets::{self, Secret};
 
+use crate::account_setup::{self, AccountSetup, Path as SetupPath, ReadySummary};
 use crate::bounties;
 use crate::chat::Chat;
 use crate::dashboard::{self, MONO, avatar};
 use crate::icons::icon;
-use crate::onboarding::{ImportSummary, Onboarding};
 use crate::palette::*;
-use crate::wallet::{self, WalletState};
-use crate::{onboarding, timefmt};
+use crate::timefmt;
+use crate::wallet::{self, PendingSent, SendInputs, SendState, WalletState};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
-    /// First launch with no key anywhere: paste a key or continue read-only.
-    /// Never in the nav — reachable only through the first-screen decision.
-    Onboarding,
+    /// Create an account or paste a key. Never in the nav — reachable through
+    /// the first-screen decision (no account stored) and the rail's "+".
+    AccountSetup,
     Dashboard,
     Bounties,
     Payments,
@@ -52,7 +53,7 @@ pub enum Screen {
 impl Screen {
     fn label(self) -> &'static str {
         match self {
-            Screen::Onboarding => "Welcome",
+            Screen::AccountSetup => "Account",
             Screen::Dashboard => "Dashboard",
             Screen::Bounties => "Bounties",
             Screen::Payments => "Payments",
@@ -68,7 +69,7 @@ impl Screen {
 
     fn icon(self) -> &'static str {
         match self {
-            Screen::Onboarding => "accounts",
+            Screen::AccountSetup => "accounts",
             Screen::Dashboard => "overview",
             Screen::Bounties => "bounties",
             Screen::Payments => "payments",
@@ -132,7 +133,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
         // after gpui_kit::init.
         KeyBinding::new("up", SelectPrev, Some("Shell")),
         KeyBinding::new("down", SelectNext, Some("Shell")),
-        // Onboarding's "Start": only fires when the shell itself has focus.
+        // The account screen's "Start": only fires when the shell itself has focus.
         KeyBinding::new("enter", Confirm, Some("Shell")),
     ]
 }
@@ -159,25 +160,33 @@ pub(crate) enum Load<T> {
     Failed(String),
 }
 
-/// What the app knows about one of the two identities. Everything starts
-/// unknown; the runtime fills it in (or reports the key missing).
-#[derive(Default)]
+/// What the app knows about one stored account. The runtime announces the
+/// public half of the key; the profile fills in when its kind-0 arrives.
 pub(crate) struct AccountView {
-    pub pubkey: Option<String>,
-    pub npub: Option<String>,
-    /// True once the runtime confirmed there is no stored key.
-    pub missing: bool,
+    pub pubkey: String,
+    pub npub: String,
     /// From the account's kind-0 on the instance relay, when one exists.
     pub kind0_name: Option<String>,
     pub picture: Option<String>,
     /// The kind-0's Lightning address — payouts need one.
     pub lud16: Option<String>,
-    /// The Coinos signup, shared by the onboarding ready panel and ⌘6.
+    /// The Coinos wallet, shared by the account screen's ready panel and ⌘6.
     pub wallet: WalletState,
 }
 
 impl AccountView {
-    /// Where payouts land: this session's Coinos signup first, else the
+    fn new(pubkey: String, npub: String) -> Self {
+        Self {
+            pubkey,
+            npub,
+            kind0_name: None,
+            picture: None,
+            lud16: None,
+            wallet: WalletState::default(),
+        }
+    }
+
+    /// Where payouts land: the Coinos wallet this app opened first, else the
     /// profile's lud16 as the relays have it.
     pub(crate) fn payout_address(&self) -> Option<&str> {
         self.wallet
@@ -193,65 +202,65 @@ impl AccountView {
         let address = self.payout_address().map(str::to_string);
         self.wallet.sync_qr(address.as_deref());
     }
-
-    /// `Some(true)` = a key exists, `Some(false)` = confirmed missing,
-    /// `None` = the runtime has not answered yet.
-    fn key_resolved(&self) -> Option<bool> {
-        if self.npub.is_some() {
-            Some(true)
-        } else if self.missing {
-            Some(false)
-        } else {
-            None
-        }
-    }
 }
 
-/// First-launch routing, decided once per launch: `None` until enough is
-/// known, `Some(true)` when NO account has a key anywhere (onboarding),
-/// `Some(false)` as soon as any key exists (straight to the dashboard).
-/// A single loaded key decides early; a single missing key waits for the
-/// other account's answer.
-pub(crate) fn onboarding_needed(
-    issuer: Option<bool>,
-    claimant: Option<bool>,
-) -> Option<bool> {
-    match (issuer, claimant) {
-        (Some(true), _) | (_, Some(true)) => Some(false),
-        (Some(false), Some(false)) => Some(true),
-        _ => None,
-    }
-}
-
-/// The label shown before (or without) a kind-0: the account's ROLE, never a
-/// person or brand name — the app cannot know who an imported key belongs to
-/// until the profile arrives, and a kind-0 fetch failure is silent.
-pub(crate) fn fallback_name(account: Account) -> &'static str {
-    match account {
-        Account::Issuer => "Issuer",
-        Account::Claimant => "Claimant",
-    }
-}
-
-pub(crate) fn display_name(account: Account, view: &AccountView) -> String {
+/// The label shown before (or without) a kind-0: a fixed placeholder, never
+/// a role or a guessed name — the app cannot know who a key belongs to until
+/// the profile arrives, and a kind-0 fetch failure is silent. Not the short
+/// npub: the identity line under it already shows that.
+pub(crate) fn display_name(view: &AccountView) -> String {
     view.kind0_name
         .clone()
-        .unwrap_or_else(|| fallback_name(account).to_string())
+        .unwrap_or_else(|| "New account".to_string())
 }
 
-pub(crate) fn initials(name: &str) -> String {
-    name.split_whitespace()
-        .take(2)
-        .filter_map(|word| word.chars().next())
-        .collect::<String>()
-        .to_uppercase()
-}
-
-pub(crate) fn account_hue(account: Account) -> (u32, u32) {
-    match account {
-        Account::Issuer => (HUE_AK_FROM, HUE_AK_TO),
-        Account::Claimant => (HUE_BO_FROM, HUE_BO_TO),
+/// The avatar letters: two words' initials from the profile name, else the
+/// two characters after `npub1` — so two nameless accounts do not both show
+/// an "N".
+pub(crate) fn initials(view: &AccountView) -> String {
+    match &view.kind0_name {
+        Some(name) => name
+            .split_whitespace()
+            .take(2)
+            .filter_map(|word| word.chars().next())
+            .collect::<String>()
+            .to_uppercase(),
+        None => view
+            .npub
+            .strip_prefix("npub1")
+            .unwrap_or(&view.npub)
+            .chars()
+            .take(2)
+            .collect::<String>()
+            .to_uppercase(),
     }
+}
+
+/// Item 1 of the money path: the panel pre-fills a stored wallet's address
+/// on launch, but only the profile as the relays have it says whether the
+/// payer can see that address. `None` = they agree; `Some` = the text the
+/// panel shows next to "Retry publishing".
+pub(crate) fn relay_address_gap(relay_lud16: Option<&str>, wallet_address: &str) -> Option<String> {
+    (relay_lud16 != Some(wallet_address))
+        .then(|| "The profile on the relays does not carry this address yet".to_string())
+}
+
+/// The two hue pairs from the mock, alternated down the rail by position.
+pub(crate) fn account_hue(ix: usize) -> (u32, u32) {
+    if ix % 2 == 0 {
+        (HUE_AK_FROM, HUE_AK_TO)
+    } else {
+        (HUE_BO_FROM, HUE_BO_TO)
+    }
+}
+
+/// Which account to act as: `preferred` if it is still stored, else the
+/// first stored one, else none (read-only).
+pub(crate) fn pick_active(pubkeys: &[String], preferred: Option<&str>) -> Option<String> {
+    preferred
+        .filter(|p| pubkeys.iter().any(|stored| stored == p))
+        .map(str::to_string)
+        .or_else(|| pubkeys.first().cloned())
 }
 
 pub(crate) fn short_npub(npub: &str) -> String {
@@ -325,25 +334,14 @@ pub(crate) struct ClaimForm {
     _sub: Subscription,
 }
 
-/// The slim in-sidebar key import — the onboarding input's second home.
-/// Opens when the active account has no key (switch accounts with ⌘] to
-/// reach it); Enter imports, esc closes.
-pub(crate) struct SidebarImport {
-    pub account: Account,
-    pub input: Entity<InputState>,
-    /// Fixed text from the runtime — never an echo of the input.
-    pub error: Option<String>,
-    pub submitting: bool,
-    _sub: Subscription,
-}
-
 // -------------------------------------------------------------------- shell
 
 pub struct Shell {
     pub(crate) screen: Screen,
-    pub(crate) account: Account,
-    pub(crate) issuer: AccountView,
-    pub(crate) claimant: AccountView,
+    /// Every stored account, in rail (store) order.
+    views: Vec<(String, AccountView)>,
+    /// The account the forms act as. `None` is read-only mode: no account.
+    pub(crate) active: Option<String>,
     pub(crate) relay_connected: bool,
     pub(crate) activity: Vec<ActivityItem>,
     pub(crate) bounties: Load<Vec<Bounty>>,
@@ -357,14 +355,12 @@ pub struct Shell {
     optimistic: Option<Bounty>,
     pub(crate) bounty_form: Option<BountyForm>,
     pub(crate) claim_form: Option<ClaimForm>,
-    /// First-launch key setup; rendered only while `screen` is Onboarding.
-    pub(crate) onboarding: Onboarding,
-    /// Set once the first-screen decision is made, so a later ⌘R (which
-    /// re-runs LoadAccounts) can never bounce the app back to onboarding.
+    /// The account screen; rendered only while `screen` is AccountSetup.
+    pub(crate) setup: AccountSetup,
+    /// Set once the first `AccountsLoaded` routed the app, so a later one
+    /// (⌘R, a remove) keeps the account on screen instead of re-reading the
+    /// store's preference.
     first_screen_decided: bool,
-    /// The slim import input in the sidebar, open while the ACTIVE account
-    /// has no key.
-    pub(crate) sidebar_import: Option<SidebarImport>,
     /// The bounty half of a submitted form, parked while the DList publishes.
     pending_bounty: Option<CreateBounty>,
     /// The request as it went to the server (coordinate filled in), kept so
@@ -384,6 +380,15 @@ pub struct Shell {
     _updates: Task<()>,
     /// Re-renders every 30 s so the relative timestamps stay truthful.
     _clock: Task<()>,
+    /// The 3-second balance poll for the wallet on screen (the ready panel's
+    /// account, or ⌘6's active one); `None` when neither is showing.
+    balance_poll: Option<(String, Task<()>)>,
+    /// "Remove this account" is armed for this pubkey: the next click on it
+    /// deletes the nsec and the Coinos password together, so one click is
+    /// not enough. Anything else that happens disarms it.
+    confirm_remove: Option<String>,
+    /// The Wallet screen's recipient and amount; cleared on an account switch.
+    send_inputs: SendInputs,
 }
 
 impl Shell {
@@ -429,13 +434,13 @@ impl Shell {
             }
         });
 
-        let onboarding = Onboarding::new(window, cx);
+        let setup = AccountSetup::new(true, window, cx);
+        let send_inputs = SendInputs::new(window, cx);
 
         Self {
             screen: Screen::Dashboard,
-            account: Account::Issuer,
-            issuer: AccountView::default(),
-            claimant: AccountView::default(),
+            views: Vec::new(),
+            active: None,
             relay_connected: false,
             activity: Vec::new(),
             bounties: Load::Loading,
@@ -444,9 +449,8 @@ impl Shell {
             optimistic: None,
             bounty_form: None,
             claim_form: None,
-            onboarding,
+            setup,
             first_screen_decided: false,
-            sidebar_import: None,
             pending_bounty: None,
             submitted_bounty: None,
             bounty_list_scroll: ScrollHandle::new(),
@@ -459,21 +463,39 @@ impl Shell {
             focus,
             _updates,
             _clock,
+            balance_poll: None,
+            confirm_remove: None,
+            send_inputs,
         }
     }
 
-    pub(crate) fn view(&self, account: Account) -> &AccountView {
-        match account {
-            Account::Issuer => &self.issuer,
-            Account::Claimant => &self.claimant,
-        }
+    pub(crate) fn view(&self, pubkey: &str) -> Option<&AccountView> {
+        self.views.iter().find(|(p, _)| p == pubkey).map(|(_, v)| v)
     }
 
-    fn view_mut(&mut self, account: Account) -> &mut AccountView {
-        match account {
-            Account::Issuer => &mut self.issuer,
-            Account::Claimant => &mut self.claimant,
-        }
+    fn view_mut(&mut self, pubkey: &str) -> Option<&mut AccountView> {
+        self.views.iter_mut().find(|(p, _)| p == pubkey).map(|(_, v)| v)
+    }
+
+    pub(crate) fn active_view(&self) -> Option<&AccountView> {
+        self.view(self.active.as_deref()?)
+    }
+
+    pub(crate) fn views(&self) -> impl Iterator<Item = &AccountView> {
+        self.views.iter().map(|(_, v)| v)
+    }
+
+    /// The active account IS the issuer: ⌘N opens the bounty form, not a
+    /// claim.
+    pub(crate) fn is_active_issuer(&self) -> bool {
+        self.active.as_deref().is_some_and(nostr::is_issuer)
+    }
+
+    /// The feed's name for an account: profile name, else short npub.
+    fn label(&self, pubkey: &str) -> String {
+        self.view(pubkey)
+            .map(display_name)
+            .unwrap_or_else(|| short_id(pubkey))
     }
 
     /// The bounty by id, from the freshest source that has it: the detail
@@ -531,98 +553,144 @@ impl Shell {
     /// Folds one runtime update into the state every screen renders from.
     fn apply(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
         let now = timefmt::now_unix();
+        // A removal armed a moment ago is about a screen that just changed.
+        self.confirm_remove = None;
         match update {
             Update::RelayStatus(connected) => {
                 self.relay_connected = connected;
             }
-            Update::AccountLoaded {
-                account,
-                pubkey,
-                npub,
-            } => {
-                let view = self.view_mut(account);
-                view.pubkey = Some(pubkey);
-                view.npub = Some(npub);
-                view.missing = false;
-                // The account has a key now; its import input has no job left.
-                if self
-                    .sidebar_import
-                    .as_ref()
-                    .is_some_and(|form| form.account == account)
-                {
-                    self.sidebar_import = None;
-                    self.focus.focus(window, cx);
+            Update::AccountsLoaded { accounts, active } => {
+                // Rebuild in store order, keeping what is already known
+                // (profile, wallet, balance) for accounts that stayed.
+                let mut old = std::mem::take(&mut self.views);
+                let had_accounts = !old.is_empty();
+                self.views = accounts
+                    .into_iter()
+                    .map(|info| {
+                        let mut view = match old.iter().position(|(p, _)| *p == info.pubkey) {
+                            Some(ix) => old.swap_remove(ix).1,
+                            None => AccountView::new(info.pubkey.clone(), info.npub.clone()),
+                        };
+                        // A stored login WITHOUT a token was saved before a
+                        // register that never answered: the wallet may not
+                        // exist, so it stays "no address" until a retry
+                        // settles it.
+                        if let Some(wallet) = info.wallet.filter(|w| w.has_token) {
+                            view.wallet.has_token = true;
+                            if view.wallet.created.is_none() {
+                                view.wallet.created = Some(WalletCreated {
+                                    username: wallet.username,
+                                    lightning_address: wallet.lightning_address,
+                                    publish_error: None,
+                                });
+                            }
+                            view.sync_qr();
+                        }
+                        (info.pubkey, view)
+                    })
+                    .collect();
+                let pubkeys: Vec<String> = self.views.iter().map(|(p, _)| p.clone()).collect();
+                // The store's preference routes the first load; after that
+                // the account on screen stays unless it is gone.
+                let preferred = if self.first_screen_decided {
+                    self.active.clone().or(active)
+                } else {
+                    active
+                };
+                let was_active = self.active.clone();
+                self.active = pick_active(&pubkeys, preferred.as_deref());
+                if self.active.is_none() {
+                    self.close_forms(window, cx);
                 }
-                self.decide_first_screen(window, cx);
-            }
-            Update::AccountMissing { account } => {
-                self.view_mut(account).missing = true;
-                self.decide_first_screen(window, cx);
-                // The startup path: the app opens on the issuer with no key
-                // (but another key exists, so onboarding is skipped). Offer
-                // the sidebar import without stealing the caret.
-                if self.screen != Screen::Onboarding
-                    && account == self.account
-                    && self.sidebar_import.is_none()
-                {
-                    self.open_sidebar_import(account, false, window, cx);
+                if self.active != was_active {
+                    self.send_inputs.clear(window, cx);
+                }
+                let first_load = !self.first_screen_decided;
+                self.first_screen_decided = true;
+                // No account: first launch, or the last one was just removed.
+                // Not a ⌘R while already browsing read-only — that would
+                // bounce the person back to the account screen they left.
+                if self.views.is_empty() && (first_load || had_accounts) {
+                    self.open_account_setup(true, window, cx);
                 }
             }
             Update::ProfileLoaded {
-                account,
+                pubkey,
                 name,
                 picture,
                 lud16,
             } => {
-                let view = self.view_mut(account);
-                view.kind0_name = name;
-                view.picture = picture;
-                view.lud16 = lud16;
-                view.sync_qr();
-            }
-            Update::ImportFailed { account, message } => {
-                // `message` is fixed text from the runtime; it never echoes
-                // what was pasted.
-                if self.screen == Screen::Onboarding && account == Account::Claimant {
-                    self.onboarding.submitting = false;
-                    self.onboarding.error = Some(message);
-                } else if let Some(form) = &mut self.sidebar_import
-                    && form.account == account
-                {
-                    form.submitting = false;
-                    form.error = Some(message);
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.kind0_name = name;
+                    view.picture = picture;
+                    view.lud16 = lud16;
+                    // A wallet pre-filled from the store on launch claimed
+                    // nothing about the relays; the profile read settles
+                    // whether "Retry publishing" is due.
+                    if let Some(created) = &mut view.wallet.created {
+                        created.publish_error =
+                            relay_address_gap(view.lud16.as_deref(), &created.lightning_address);
+                    }
+                    view.sync_qr();
                 }
             }
-            Update::ImportReady {
-                account,
+            Update::AddAccountFailed { message } => {
+                // `message` is fixed text from the runtime; it never echoes
+                // what was pasted.
+                if self.screen == Screen::AccountSetup {
+                    self.setup.working = None;
+                    self.setup.awaiting_wallet = false;
+                    self.setup.error = Some(message);
+                } else {
+                    self.push_activity(RED, message, now);
+                }
+            }
+            Update::AccountAdded {
+                pubkey,
                 npub,
                 profile_checked,
                 profile_found,
             } => {
-                self.push_activity(
-                    GREEN,
-                    format!("Imported the {account} key ({})", short_npub(&npub)),
-                    now,
-                );
-                if self.screen == Screen::Onboarding && account == Account::Claimant {
-                    self.onboarding.submitting = false;
-                    self.onboarding.error = None;
-                    self.onboarding.ready = Some(ImportSummary {
+                self.push_activity(GREEN, format!("Added account {}", short_npub(&npub)), now);
+                if self.view(&pubkey).is_none() {
+                    self.views
+                        .push((pubkey.clone(), AccountView::new(pubkey.clone(), npub.clone())));
+                }
+                // Read-only mode ends with the first account.
+                if self.active.is_none() {
+                    self.active = Some(pubkey.clone());
+                }
+                // The create path continues straight into the wallet: the
+                // view exists now, so its panel can show the spinner.
+                if self.setup.awaiting_wallet
+                    && let Some(view) = self.view_mut(&pubkey)
+                {
+                    view.wallet.submitting = true;
+                    view.wallet.error = None;
+                }
+                if self.screen == Screen::AccountSetup {
+                    self.setup.error = None;
+                    self.setup.working = self
+                        .setup
+                        .awaiting_wallet
+                        .then_some("Opening your Coinos wallet…");
+                    self.setup.ready = Some(ReadySummary {
+                        pubkey,
                         npub,
                         profile_checked,
                         profile_found,
                     });
-                    // The key is in the keychain; the input has no reason to
+                    // The key is in the store; the input has no reason to
                     // keep holding it.
-                    self.onboarding
-                        .input
+                    self.setup
+                        .key
                         .update(cx, |state, cx| state.set_value("", window, cx));
                     // Enter now means "Start" — the Confirm binding needs the
                     // shell to hold the focus.
                     self.focus.focus(window, cx);
                 }
             }
-            Update::WalletCreated { account, created } => {
+            Update::WalletCreated { pubkey, created } => {
                 // One feed line per event; the panel shows the same error
                 // next to its retry button.
                 let (dot, suffix) = match &created.publish_error {
@@ -634,17 +702,110 @@ impl Shell {
                     format!("Coinos wallet ready: {}{suffix}", created.lightning_address),
                     now,
                 );
-                let view = self.view_mut(account);
-                view.wallet.submitting = false;
-                view.wallet.error = None;
-                view.wallet.created = Some(created);
-                view.sync_qr();
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.wallet.submitting = false;
+                    view.wallet.error = None;
+                    view.wallet.has_token = true;
+                    view.wallet.created = Some(created);
+                    view.sync_qr();
+                }
+                self.finish_setup_wallet(&pubkey);
             }
-            Update::WalletFailed { account, message } => {
-                let wallet = &mut self.view_mut(account).wallet;
-                wallet.submitting = false;
-                wallet.error = Some(message.clone());
-                self.push_activity(RED, format!("Coinos wallet for the {account} failed: {message}"), now);
+            Update::WalletFailed { pubkey, message } => {
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.wallet.submitting = false;
+                    view.wallet.error = Some(message.clone());
+                }
+                let who = self.label(&pubkey);
+                self.push_activity(RED, format!("Coinos wallet for {who} failed: {message}"), now);
+                self.finish_setup_wallet(&pubkey);
+            }
+            Update::Balance { pubkey, sats } => {
+                // A number that just flips is easy to miss: a change gets a
+                // fading tag beside the balance, and a toast with the math
+                // — one per send (keyed by the pending `Sent`), or one per
+                // arrival while this wallet is on screen.
+                let is_active = self.active.as_deref() == Some(pubkey.as_str());
+                let on_screen = self.wallet_on_screen(&pubkey);
+                let Some(view) = self.view_mut(&pubkey) else {
+                    return self.finish_apply(cx);
+                };
+                let changed = view.wallet.record_balance(sats);
+                let pending = view.wallet.pending_sent.take();
+                let fmt = timefmt::fmt_sats;
+                let toast = match (pending, changed.as_ref()) {
+                    (Some(sent), _) if is_active => {
+                        let math = match sent.before {
+                            Some(before) => format!("{} → {} sats", fmt(before), fmt(sats)),
+                            None => format!("{} sats", fmt(sats)),
+                        };
+                        Some((
+                            format!("Sent {} sats", fmt(sent.sats)),
+                            format!("{math} · to {}", sent.to),
+                        ))
+                    }
+                    (Some(_), _) => None,
+                    (None, Some(delta)) if delta.current > delta.previous && on_screen => Some((
+                        format!("Received {} sats", fmt(delta.current - delta.previous)),
+                        format!("{} → {} sats", fmt(delta.previous), fmt(delta.current)),
+                    )),
+                    (None, _) => None,
+                };
+                if changed.is_some() {
+                    let cleared = pubkey.clone();
+                    let clear = cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(wallet::DELTA_FADE).await;
+                        let _ = this.update(cx, |shell, cx| {
+                            if let Some(view) = shell.view_mut(&cleared) {
+                                view.wallet.delta = None;
+                            }
+                            cx.notify();
+                        });
+                    });
+                    if let Some(view) = self.view_mut(&pubkey) {
+                        view.wallet.delta_clear = Some(clear);
+                    }
+                }
+                if let Some((title, body)) = toast {
+                    window.push_notification(Notification::info(body).title(title), cx);
+                }
+            }
+            Update::Sent { pubkey, to, sats } => {
+                let who = self.label(&pubkey);
+                self.push_activity(
+                    GREEN,
+                    format!("{who} sent {} sats to {to}", timefmt::fmt_sats(sats)),
+                    now,
+                );
+                if self.active.as_deref() == Some(pubkey.as_str()) {
+                    self.send_inputs.clear(window, cx);
+                }
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.wallet.pending_sent = Some(PendingSent {
+                        to: to.clone(),
+                        sats,
+                        before: view.wallet.balance,
+                    });
+                    view.wallet.send = Some(SendState::Sent { to, sats });
+                }
+            }
+            Update::SendFailed {
+                pubkey,
+                message,
+                may_have_paid,
+            } => {
+                let who = self.label(&pubkey);
+                self.push_activity(RED, format!("Send from {who} failed: {message}"), now);
+                // The sats may be gone: a reflex Enter on the same amount
+                // must not pay twice, so the amount goes, the recipient stays.
+                if may_have_paid && self.active.as_deref() == Some(pubkey.as_str()) {
+                    self.send_inputs
+                        .sats
+                        .update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.wallet.send = Some(SendState::Failed(message));
+                }
             }
             Update::Bounties(list) => {
                 if self.selected.is_none()
@@ -680,26 +841,21 @@ impl Shell {
                 }
                 self.details.insert(detail.bounty.id.clone(), *detail);
             }
-            Update::DListPublished {
-                account,
-                coordinate,
-            } => {
+            Update::DListPublished { pubkey, coordinate } => {
                 self.push_activity(
                     ACCENT_LIGHT,
                     format!("Published list {coordinate}"),
                     now,
                 );
-                if account == Account::Issuer
-                    && let Some(mut req) = self.pending_bounty.take() {
-                        req.list_coordinate = coordinate;
-                        // Kept so BountyCreated can build the optimistic card
-                        // from the exact values the server was sent.
-                        self.submitted_bounty = Some(req.clone());
-                        let _ = self.commands.unbounded_send(Command::CreateBounty {
-                            account: Account::Issuer,
-                            req,
-                        });
-                    }
+                if let Some(mut req) = self.pending_bounty.take() {
+                    req.list_coordinate = coordinate;
+                    // Kept so BountyCreated can build the optimistic card
+                    // from the exact values the server was sent.
+                    self.submitted_bounty = Some(req.clone());
+                    let _ = self
+                        .commands
+                        .unbounded_send(Command::CreateBounty { pubkey, req });
+                }
             }
             Update::BountyCreated { id } => {
                 self.push_activity(
@@ -713,7 +869,7 @@ impl Shell {
                 // The detail pane shows the submitted values immediately; the
                 // watch's first snapshot (or the refreshed list) replaces them.
                 if let Some(req) = self.submitted_bounty.take() {
-                    self.optimistic = Some(optimistic_bounty(&id, req, &self.issuer, now));
+                    self.optimistic = Some(optimistic_bounty(&id, req, now));
                 }
                 self.scroll_to = Some(id.clone());
                 let _ = self.commands.unbounded_send(Command::WatchBounty { id });
@@ -833,12 +989,33 @@ impl Shell {
                                 form.error = Some(message.clone());
                             }
                     }
-                    ErrorSource::Runtime | ErrorSource::Accounts | ErrorSource::Watch => {}
+                    ErrorSource::Runtime
+                    | ErrorSource::Accounts
+                    | ErrorSource::Watch
+                    | ErrorSource::Wallet => {}
                 }
                 self.push_activity(RED, message, now);
             }
         }
+        self.finish_apply(cx);
+    }
+
+    /// The tail of every `apply`: the poll follows the wallet on screen, and
+    /// the screen re-renders.
+    fn finish_apply(&mut self, cx: &mut Context<Self>) {
+        self.sync_balance_poll(cx);
         cx.notify();
+    }
+
+    /// Is this account's wallet panel what the person is looking at? The
+    /// same rule `sync_balance_poll` uses: ⌘6's active account, or the
+    /// account screen's ready panel.
+    fn wallet_on_screen(&self, pubkey: &str) -> bool {
+        match self.screen {
+            Screen::Wallet => self.active.as_deref() == Some(pubkey),
+            Screen::AccountSetup => self.setup.ready.as_ref().is_some_and(|r| r.pubkey == pubkey),
+            _ => false,
+        }
     }
 
     // ------------------------------------------------------------ navigation
@@ -847,251 +1024,338 @@ impl Shell {
     /// "Chat" leaves the window typeable.
     fn go(&mut self, screen: Screen, window: &mut Window, cx: &mut Context<Self>) {
         self.screen = screen;
+        self.confirm_remove = None;
         if screen == Screen::Chat {
             self.chat.focus_handle(cx).focus(window, cx);
         } else {
             self.focus.focus(window, cx);
         }
+        self.sync_balance_poll(cx);
         cx.notify();
     }
 
-    fn set_account(&mut self, account: Account, window: &mut Window, cx: &mut Context<Self>) {
-        if self.account != account {
-            self.account = account;
+    fn set_account(&mut self, pubkey: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view(pubkey).is_none() {
+            return;
+        }
+        if self.active.as_deref() != Some(pubkey) {
+            self.active = Some(pubkey.to_string());
+            self.confirm_remove = None;
             // An open form belongs to the account that opened it.
             self.close_forms(window, cx);
-            // Switching into a keyless account IS the import path (⌘] from
-            // the dashboard): the sidebar input opens with the caret in it.
-            // Trap: while it has focus, ⌘[/⌘] indent — esc hands focus back.
-            if self.view(account).missing {
-                self.open_sidebar_import(account, true, window, cx);
-            }
+            self.send_inputs.clear(window, cx);
+            let _ = self.commands.unbounded_send(Command::SetActive {
+                pubkey: pubkey.to_string(),
+            });
+        }
+        self.sync_balance_poll(cx);
+        cx.notify();
+    }
+
+    /// ⌘[ / ⌘]: the previous / next account in rail order, wrapping. A
+    /// no-op with fewer than two.
+    fn step_account(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.views.len();
+        if count < 2 {
+            return;
+        }
+        let current = self
+            .active
+            .as_deref()
+            .and_then(|active| self.views.iter().position(|(p, _)| p == active))
+            .unwrap_or(0) as isize;
+        let next = (current + step).rem_euclid(count as isize) as usize;
+        let pubkey = self.views[next].0.clone();
+        self.set_account(&pubkey, window, cx);
+    }
+
+    // ------------------------------------------------------ account screen
+
+    /// Both doors in: first launch (no account stored) and the rail's "+".
+    /// A fresh screen every time, so nothing typed last time lingers.
+    pub(crate) fn open_account_setup(
+        &mut self,
+        first_launch: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_forms(window, cx);
+        self.setup = AccountSetup::new(first_launch, window, cx);
+        self.screen = Screen::AccountSetup;
+        self.focus.focus(window, cx);
+        self.sync_balance_poll(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn setup_choose(
+        &mut self,
+        path: SetupPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.setup.path = path;
+        self.setup.error = None;
+        match path {
+            SetupPath::Create => self
+                .setup
+                .name
+                .update(cx, |state, cx| state.focus(window, cx)),
+            SetupPath::Paste => self
+                .setup
+                .key
+                .update(cx, |state, cx| state.focus(window, cx)),
+            SetupPath::Choose => self.focus.focus(window, cx),
         }
         cx.notify();
     }
 
-    // ------------------------------------------------------- first launch
-
-    /// The first-screen decision, made once per launch as the account
-    /// answers arrive: no key anywhere → onboarding; any key → dashboard.
-    fn decide_first_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.first_screen_decided {
+    /// Enter inside a setup input: submit the open path, or — once the add
+    /// came back — start the app.
+    pub(crate) fn setup_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Mid-add (the create path sets `ready` at AccountAdded while the
+        // wallet still opens), Enter would skip the ready panel and the QR.
+        if self.setup.working.is_some() {
             return;
         }
-        let Some(needed) =
-            onboarding_needed(self.issuer.key_resolved(), self.claimant.key_resolved())
-        else {
+        if self.setup.ready.is_some() {
+            self.leave_account_setup(window, cx);
             return;
-        };
-        self.first_screen_decided = true;
-        if needed {
-            self.screen = Screen::Onboarding;
-            // A sidebar import opened by an earlier AccountMissing would sit
-            // stale behind the full-screen onboarding — drop it.
-            self.sidebar_import = None;
-            // A pasted key becomes the claimant — the person who claims and
-            // gets paid — so that is the active account from here on.
-            self.account = Account::Claimant;
-            self.onboarding
-                .input
-                .update(cx, |state, cx| state.focus(window, cx));
-            cx.notify();
+        }
+        match self.setup.path {
+            SetupPath::Create => self.setup_submit_create(cx),
+            SetupPath::Paste => self.setup_submit_paste(cx),
+            SetupPath::Choose => {}
         }
     }
 
-    /// Enter inside the onboarding input: import the pasted key, or — once
-    /// the import came back — start the app.
-    pub(crate) fn onboarding_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.onboarding.ready.is_some() {
-            self.leave_onboarding(window, cx);
-        } else {
-            self.submit_onboarding_key(cx);
-        }
-    }
-
-    fn submit_onboarding_key(&mut self, cx: &mut Context<Self>) {
-        if self.onboarding.submitting {
-            return;
-        }
-        // Wrapped immediately: the pasted key exists on this thread only
-        // inside `Secret`, which redacts itself everywhere.
-        let secret = Secret::new(self.onboarding.input.read(cx).value().trim().to_string());
-        if secret.expose().is_empty() {
-            self.onboarding.error = Some("Paste a key first — or just look around.".into());
-            cx.notify();
-            return;
-        }
-        self.onboarding.error = None;
-        self.onboarding.submitting = true;
-        self.onboarding.generated = false;
-        let _ = self.commands.unbounded_send(Command::ImportKey {
-            account: Account::Claimant,
-            secret,
-        });
-        cx.notify();
-    }
-
-    /// "No key yet? Create a new one": generate a fresh key here and run it
-    /// through the exact same import path as a paste — keychain storage,
-    /// profile probe, ready panel. The nsec exists on this thread only
-    /// inside `Secret`.
-    pub(crate) fn generate_onboarding_key(&mut self, cx: &mut Context<Self>) {
-        if self.onboarding.submitting || self.onboarding.ready.is_some() {
+    /// "Create": a fresh key generated here, run through the same add path
+    /// as a paste, with the wallet opened in the same breath. The nsec exists
+    /// on this thread only inside `Secret`.
+    pub(crate) fn setup_submit_create(&mut self, cx: &mut Context<Self>) {
+        if self.setup.working.is_some() || self.setup.ready.is_some() {
             return;
         }
         let keys = nostr_sdk::prelude::Keys::generate();
         let nsec = match nostr_sdk::prelude::ToBech32::to_bech32(keys.secret_key()) {
             Ok(nsec) => nsec,
             Err(e) => {
-                self.onboarding.error = Some(format!("Could not create a key: {e}"));
+                self.setup.error = Some(format!("Could not create a key: {e}"));
                 cx.notify();
                 return;
             }
         };
-        self.onboarding.error = None;
-        self.onboarding.submitting = true;
-        self.onboarding.generated = true;
-        let _ = self.commands.unbounded_send(Command::ImportKey {
-            account: Account::Claimant,
+        let name = self.setup.name.read(cx).value().trim().to_string();
+        self.setup.error = None;
+        self.setup.generated = true;
+        self.setup.awaiting_wallet = true;
+        self.setup.working = Some("Creating your key…");
+        let _ = self.commands.unbounded_send(Command::AddAccount {
             secret: Secret::new(nsec),
+            name: Some(name).filter(|n| !n.is_empty()),
+            open_wallet: true,
         });
         cx.notify();
     }
 
-    /// "Create a Coinos wallet" and "Retry publishing": one command, for the
-    /// active account. The runtime reuses a login already in the keychain, so
-    /// pressing it twice never opens two accounts.
-    pub(crate) fn create_wallet(&mut self, cx: &mut Context<Self>) {
-        let account = self.account;
-        if !account.has_local_wallet() {
+    fn setup_submit_paste(&mut self, cx: &mut Context<Self>) {
+        if self.setup.working.is_some() || self.setup.ready.is_some() {
             return;
         }
-        let wallet = &mut self.view_mut(account).wallet;
-        if wallet.submitting {
+        // Wrapped immediately: the pasted key exists on this thread only
+        // inside `Secret`, which redacts itself everywhere.
+        let secret = Secret::new(self.setup.key.read(cx).value().trim().to_string());
+        if secret.expose().is_empty() {
+            self.setup.error = Some("Paste a key first.".into());
+            cx.notify();
             return;
         }
-        wallet.submitting = true;
-        wallet.error = None;
-        let _ = self
-            .commands
-            .unbounded_send(Command::CreateCoinosWallet { account });
+        self.setup.error = None;
+        self.setup.generated = false;
+        self.setup.awaiting_wallet = false;
+        self.setup.working = Some("Checking the key…");
+        let _ = self.commands.unbounded_send(Command::AddAccount {
+            secret,
+            name: None,
+            open_wallet: false,
+        });
         cx.notify();
     }
 
-    /// Both doors out of onboarding — Start after an import, or "just look
-    /// around" — land on the dashboard as the claimant.
-    pub(crate) fn leave_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.screen != Screen::Onboarding {
+    /// The create path's second step is over (wallet opened, or not): the
+    /// ready panel takes over and shows whichever it was.
+    fn finish_setup_wallet(&mut self, pubkey: &str) {
+        if self.setup.awaiting_wallet
+            && self.setup.ready.as_ref().is_some_and(|r| r.pubkey == pubkey)
+        {
+            self.setup.awaiting_wallet = false;
+            self.setup.working = None;
+        }
+    }
+
+    /// Every door out of the account screen: Start, "just look around",
+    /// Cancel, esc. A finished add becomes the active account; otherwise
+    /// whatever was active stays (or nothing — read-only).
+    pub(crate) fn leave_account_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen != Screen::AccountSetup {
             return;
         }
         // The input may still hold a pasted key: esc with text in the field,
-        // or esc while an import is in flight (whose ImportReady would then
-        // arrive too late to clear it — its handler is gated on this screen).
-        // `set_value` also clears the input's undo history, so nothing keeps
-        // the secret alive after this. Runs on BOTH exits; on the Start path
-        // the field is already empty and this is a no-op.
-        self.onboarding
-            .input
+        // or esc while an add is in flight. `set_value` also clears the
+        // input's undo history, so nothing keeps the secret alive after this.
+        self.setup
+            .key
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.onboarding.error = None;
-        self.onboarding.submitting = false;
-        self.account = Account::Claimant;
+        self.setup.error = None;
+        if let Some(ready) = self.setup.ready.take() {
+            self.set_account(&ready.pubkey, window, cx);
+        }
         self.go(Screen::Dashboard, window, cx);
-        // "You can add a key later from the sidebar" — make that visibly
-        // true: leaving without a key shows the claimant input, unfocused.
-        if self.view(Account::Claimant).missing && self.sidebar_import.is_none() {
-            self.open_sidebar_import(Account::Claimant, false, window, cx);
-        }
     }
 
-    /// The global Enter binding: only onboarding's Start listens to it.
+    /// The global Enter binding: only the account screen's Start listens.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.screen == Screen::Onboarding && self.onboarding.ready.is_some() {
-            self.leave_onboarding(window, cx);
+        if self.screen == Screen::AccountSetup && self.setup.ready.is_some() {
+            self.leave_account_setup(window, cx);
         }
     }
 
-    /// esc / ⌘.: on onboarding this is "just look around"; everywhere else
-    /// it cancels whichever form is open.
+    /// esc / ⌘.: on the account screen this leaves it; everywhere else it
+    /// cancels whichever form is open.
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.screen == Screen::Onboarding {
-            self.leave_onboarding(window, cx);
+        if self.screen == Screen::AccountSetup {
+            // Mid-add, esc would skip the ready panel — and with it the QR
+            // the create path exists to show. Wait for the runtime.
+            if self.setup.working.is_some() {
+                return;
+            }
+            self.leave_account_setup(window, cx);
         } else {
             self.close_forms(window, cx);
         }
     }
 
-    // ------------------------------------------------------ sidebar import
+    // --------------------------------------------------------------- wallet
 
-    fn open_sidebar_import(
-        &mut self,
-        account: Account,
-        focus_input: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .masked(true)
-                .placeholder("nsec1… or hex")
-        });
-        let sub = cx.subscribe_in(&input, window, |this: &mut Self, _, event, window, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.submit_sidebar_import(window, cx);
-            }
-        });
-        if focus_input {
-            input.update(cx, |state, cx| state.focus(window, cx));
-        }
-        self.sidebar_import = Some(SidebarImport {
-            account,
-            input,
-            error: None,
-            submitting: false,
-            _sub: sub,
-        });
-        cx.notify();
-    }
-
-    fn submit_sidebar_import(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(form) = &self.sidebar_import else {
+    /// "Create a Coinos wallet" and "Retry publishing": one command. The
+    /// runtime reuses a login already stored for the account, so pressing
+    /// it twice never opens two wallets.
+    pub(crate) fn create_wallet(&mut self, pubkey: String, cx: &mut Context<Self>) {
+        let Some(view) = self.view_mut(&pubkey) else {
             return;
         };
-        if form.submitting {
+        if view.wallet.submitting {
             return;
         }
-        let account = form.account;
-        let secret = Secret::new(form.input.read(cx).value().trim().to_string());
-        if secret.expose().is_empty() {
-            if let Some(form) = &mut self.sidebar_import {
-                form.error = Some("Paste a key first.".into());
-            }
-            cx.notify();
-            return;
-        }
+        view.wallet.submitting = true;
+        view.wallet.error = None;
         let _ = self
             .commands
-            .unbounded_send(Command::ImportKey { account, secret });
-        if let Some(form) = &mut self.sidebar_import {
-            form.error = None;
-            form.submitting = true;
+            .unbounded_send(Command::CreateCoinosWallet { pubkey });
+        cx.notify();
+    }
+
+    /// "Send" on the Wallet screen, and Enter in either of its fields: the
+    /// active account pays what the inputs say. The obvious mistakes (no
+    /// amount, not an address) are caught here; everything else comes back
+    /// as `Sent` or `SendFailed` for this pubkey. Inert while a send is in
+    /// flight, so a second Enter cannot pay twice.
+    pub(crate) fn send_sats(&mut self, cx: &mut Context<Self>) {
+        let Some(pubkey) = self.active.clone() else {
+            return;
+        };
+        let to = self.send_inputs.to.read(cx).value().trim().to_string();
+        let amount = self.send_inputs.sats.read(cx).value().trim().to_string();
+        let Some(view) = self.view_mut(&pubkey) else {
+            return;
+        };
+        if !view.wallet.has_token || view.wallet.send == Some(SendState::Sending) {
+            return;
+        }
+        let checked = match amount.replace(',', "").parse::<u64>() {
+            Ok(sats) if sats > 0 => {
+                if coinos::split_address(&to).is_some() {
+                    Ok(sats)
+                } else {
+                    Err("Enter a Lightning address like name@domain.com")
+                }
+            }
+            _ => Err("Enter a whole number of sats"),
+        };
+        view.wallet.send = Some(match checked {
+            Ok(_) => SendState::Sending,
+            Err(message) => SendState::Failed(message.into()),
+        });
+        if let Ok(sats) = checked {
+            let _ = self
+                .commands
+                .unbounded_send(Command::Send { pubkey, to, sats });
         }
         cx.notify();
     }
 
-    /// "Forget this key": the runtime deletes the keychain entry and then
-    /// re-announces whatever is still true (an env override survives).
-    fn forget_key(&mut self, account: Account, cx: &mut Context<Self>) {
-        let _ = self.commands.unbounded_send(Command::ForgetKey { account });
+    /// "Copy password": from the store straight to the clipboard. It is
+    /// never rendered and never logged — only a store failure reaches the
+    /// feed, and that message carries a path, not a secret.
+    pub(crate) fn copy_coinos_password(&mut self, pubkey: &str, cx: &mut Context<Self>) {
+        match secrets::load_coinos_login(pubkey) {
+            Ok(Some(login)) => cx.write_to_clipboard(ClipboardItem::new_string(
+                login.password.expose().to_string(),
+            )),
+            Ok(None) => self.push_activity(
+                AMBER,
+                "No Coinos login is stored for this account".into(),
+                timefmt::now_unix(),
+            ),
+            Err(e) => self.push_activity(RED, e.to_string(), timefmt::now_unix()),
+        }
         cx.notify();
     }
 
-    fn step_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let next = match self.account {
-            Account::Issuer => Account::Claimant,
-            Account::Claimant => Account::Issuer,
-        };
-        self.set_account(next, window, cx);
+    /// "Remove this account", in two clicks: the first arms it (the link
+    /// reads "Click again to remove"), the second has the runtime delete the
+    /// nsec and Coinos login and re-announce the store; `AccountsLoaded`
+    /// then moves the active account if it was this one.
+    fn remove_account(&mut self, pubkey: String, cx: &mut Context<Self>) {
+        if self.confirm_remove.as_deref() == Some(pubkey.as_str()) {
+            self.confirm_remove = None;
+            let _ = self
+                .commands
+                .unbounded_send(Command::RemoveAccount { pubkey });
+        } else {
+            self.confirm_remove = Some(pubkey);
+        }
+        cx.notify();
+    }
+
+    /// The wallet on screen — the ready panel's account, or ⌘6's active one
+    /// — is polled every 3 s while it has a token. Restarted only when the
+    /// target changes, so re-renders never reset the cadence.
+    fn sync_balance_poll(&mut self, cx: &mut Context<Self>) {
+        let target = match self.screen {
+            Screen::AccountSetup => self.setup.ready.as_ref().map(|r| r.pubkey.clone()),
+            Screen::Wallet => self.active.clone(),
+            _ => None,
+        }
+        .filter(|pubkey| self.view(pubkey).is_some_and(|v| v.wallet.has_token));
+        if self.balance_poll.as_ref().map(|(p, _)| p) == target.as_ref() {
+            return;
+        }
+        self.balance_poll = target.map(|pubkey| {
+            let commands = self.commands.clone();
+            let polled = pubkey.clone();
+            let task = cx.spawn(async move |_, cx| {
+                // Cancel-on-drop: replacing or clearing `balance_poll` ends it.
+                loop {
+                    let _ = commands.unbounded_send(Command::FetchBalance {
+                        pubkey: polled.clone(),
+                    });
+                    cx.background_executor()
+                        .timer(Duration::from_secs(3))
+                        .await;
+                }
+            });
+            (pubkey, task)
+        });
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -1152,38 +1416,29 @@ impl Shell {
 
     // ----------------------------------------------------------------- forms
 
-    /// cmd-N: as the issuer, a new DList+bounty; as the claimant, a claim on
+    /// cmd-N: as the issuer, a new DList+bounty; as anyone else, a claim on
     /// the selected bounty. From any screen — it navigates to Bounties first.
     pub(crate) fn new_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // No key for the active account: the honest response is the key
-        // input, not a form whose submit can only fail.
-        if self.view(self.account).missing {
-            let account = self.account;
-            match &self.sidebar_import {
-                Some(form) if form.account == account => {
-                    form.input.update(cx, |state, cx| state.focus(window, cx));
-                }
-                _ => self.open_sidebar_import(account, true, window, cx),
-            }
+        // No account: the honest response is the account screen, not a form
+        // whose submit can only fail.
+        if self.active.is_none() {
+            self.open_account_setup(false, window, cx);
             return;
         }
         if self.screen != Screen::Bounties {
             self.go(Screen::Bounties, window, cx);
         }
-        match self.account {
-            Account::Issuer => self.open_bounty_form(window, cx),
-            Account::Claimant => self.open_claim_form(window, cx),
+        if self.is_active_issuer() {
+            self.open_bounty_form(window, cx)
+        } else {
+            self.open_claim_form(window, cx)
         }
     }
 
     pub(crate) fn close_forms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.bounty_form.is_some()
-            || self.claim_form.is_some()
-            || self.sidebar_import.is_some()
-        {
+        if self.bounty_form.is_some() || self.claim_form.is_some() {
             self.bounty_form = None;
             self.claim_form = None;
-            self.sidebar_import = None;
             self.pending_bounty = None;
             self.focus.focus(window, cx);
             cx.notify();
@@ -1257,6 +1512,11 @@ impl Shell {
         if form.submitting {
             return;
         }
+        // Forms close on an account switch, so the active account is the
+        // one that opened this form.
+        let Some(pubkey) = self.active.clone() else {
+            return;
+        };
         let value =
             |ix: usize| -> String { form.fields[ix].read(cx).value().trim().to_string() };
 
@@ -1349,7 +1609,7 @@ impl Shell {
             auto_pay_min_rank: min_rank,
         });
         let _ = self.commands.unbounded_send(Command::PublishDList {
-            account: Account::Issuer,
+            pubkey,
             singular,
             plural,
             description: if description.is_empty() {
@@ -1407,6 +1667,9 @@ impl Shell {
         let name = form.name.read(cx).value().trim().to_string();
         let coordinate = form.coordinate.clone();
         let bounty_id = form.bounty_id.clone();
+        let Some(pubkey) = self.active.clone() else {
+            return;
+        };
         if name.is_empty() {
             if let Some(form) = &mut self.claim_form {
                 form.error = Some("The claim needs an item name.".into());
@@ -1415,7 +1678,7 @@ impl Shell {
             return;
         }
         let _ = self.commands.unbounded_send(Command::PublishClaim {
-            account: Account::Claimant,
+            pubkey,
             bounty_id,
             name,
             list_coordinate: coordinate,
@@ -1445,37 +1708,16 @@ impl Shell {
             .child(img(crate::icons::icon("logo")).size_full())
     }
 
-    /// The account's round marker: kind-0 picture when there is one, initials
-    /// when a key is loaded, a dashed placeholder when there is no key at all.
-    pub(crate) fn account_marker(
-        account: Account,
-        view: &AccountView,
-        size: f32,
-        text: f32,
-    ) -> AnyElement {
+    /// The account's round marker: kind-0 picture when there is one, else
+    /// initials on the rail hue for its position.
+    pub(crate) fn account_marker(view: &AccountView, ix: usize, size: f32, text: f32) -> AnyElement {
         if let Some(url) = &view.picture {
             return img(SharedUri::from(url.clone()))
                 .size(px(size))
                 .rounded_full()
                 .into_any_element();
         }
-        if view.npub.is_some() {
-            let name = display_name(account, view);
-            return avatar(initials(&name), account_hue(account), size, text).into_any_element();
-        }
-        div()
-            .size(px(size))
-            .rounded_full()
-            .border_1()
-            .border_dashed()
-            .border_color(rgb(BORDER_3))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(text))
-            .text_color(rgb(TEXT_DIM))
-            .child("?")
-            .into_any_element()
+        avatar(initials(view), account_hue(ix), size, text).into_any_element()
     }
 
     fn rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1505,13 +1747,13 @@ impl Shell {
             .py(px(16.))
             .child(self.logo(cx))
             .child(div().w(px(32.)).h(px(1.)).bg(rgb(LINE)))
-            .children(Account::ALL.into_iter().enumerate().map(|(ix, account)| {
-                let view = self.view(account);
-                let ring = if account == self.account {
+            .children(self.views.iter().enumerate().map(|(ix, (pubkey, view))| {
+                let ring = if self.active.as_deref() == Some(pubkey.as_str()) {
                     rgb(ACCENT)
                 } else {
                     rgb(BG_NAV_ON)
                 };
+                let pubkey = pubkey.clone();
                 div()
                     .id(("account", ix))
                     .flex_shrink_0()
@@ -1521,11 +1763,33 @@ impl Shell {
                         BoxShadow::new(px(0.), px(0.), rgb(BG_RAIL).into()).spread_radius(px(2.)),
                         BoxShadow::new(px(0.), px(0.), ring.into()).spread_radius(px(4.)),
                     ])
-                    .child(Self::account_marker(account, view, 42., 15.))
+                    .child(Self::account_marker(view, ix, 42., 15.))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_account(account, window, cx);
+                        this.set_account(&pubkey, window, cx);
                     }))
             }))
+            .child(
+                // "+": the one door to another account, pasted or created.
+                div()
+                    .id("add-account")
+                    .size(px(42.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .border_1()
+                    .border_dashed()
+                    .border_color(rgb(BORDER_3))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_size(px(20.))
+                    .text_color(rgb(TEXT_DIM))
+                    .hover(|this| this.border_color(rgb(ACCENT)).text_color(rgb(TEXT)))
+                    .child("+")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_account_setup(false, window, cx)
+                    })),
+            )
             .child(div().flex_1())
             .child(
                 v_flex()
@@ -1608,20 +1872,22 @@ impl Shell {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let account = self.account;
-        let view = self.view(account);
-        let name = display_name(account, view);
-        let identity: SharedString = match (&view.npub, view.missing) {
-            (Some(npub), _) => short_npub(npub).into(),
-            // Quiet, not alarming: browsing works without a key. The import
-            // input below (⌘], or a click here) is the fix path.
-            (None, true) => "read-only — no key".into(),
-            (None, false) => "loading key…".into(),
+        let view = self.active_view();
+        let name: SharedString = view
+            .map(display_name)
+            .unwrap_or_else(|| "Read-only".to_string())
+            .into();
+        let identity: SharedString = match view {
+            Some(view) => short_npub(&view.npub).into(),
+            // Quiet, not alarming: browsing works without an account. The
+            // "+" in the rail is the fix path.
+            None => "no account — + adds one".into(),
         };
-        let has_key = view.npub.is_some();
-        // The address payouts go to, as the relays have it (or this
-        // session's Coinos signup). Claimants asked where their sats land.
-        let address = view.payout_address().map(SharedString::new);
+        // The address payouts go to, as the relays have it (or the Coinos
+        // wallet this app opened). Claimants asked where their sats land.
+        let address = view.and_then(|v| v.payout_address()).map(SharedString::new);
+        let active = self.active.clone();
+        let remove_armed = active.is_some() && self.confirm_remove == active;
 
         // The three cards are the issuer's live bounty economics; before the
         // list loads (or when it failed) they say so instead of guessing.
@@ -1726,22 +1992,30 @@ impl Shell {
                                                 .child(address),
                                         )
                                     })
-                                    .when(has_key, |this| {
+                                    .when_some(active, |this, pubkey| {
                                         this.child(
                                             div()
-                                                .id("forget-key")
+                                                .id("remove-account")
                                                 .mt(px(3.))
                                                 .text_size(px(10.))
-                                                .text_color(rgb(TEXT_DIM))
+                                                .text_color(rgb(if remove_armed {
+                                                    RED
+                                                } else {
+                                                    TEXT_DIM
+                                                }))
                                                 .cursor_pointer()
                                                 .hover(|this| this.text_color(rgb(RED)))
-                                                .child("Forget this key")
+                                                .child(if remove_armed {
+                                                    "Click again to remove"
+                                                } else {
+                                                    "Remove this account"
+                                                })
                                                 .on_click(cx.listener(
                                                     move |this, _, _, cx| {
                                                         // Sits inside the account
                                                         // switcher; don't switch too.
                                                         cx.stop_propagation();
-                                                        this.forget_key(account, cx)
+                                                        this.remove_account(pubkey.clone(), cx)
                                                     },
                                                 )),
                                         )
@@ -1749,78 +2023,10 @@ impl Shell {
                             )
                             .child(div().text_color(rgb(TEXT_DIM)).child("›"))
                             // The chevron means "next account", like ⌘].
-                            // A keyless account opens the import input on
-                            // the way in (set_account does that).
                             .on_click(cx.listener(|this, _, window, cx| {
-                                let account = this.account;
-                                if this.view(account).missing
-                                    && this.sidebar_import.is_none()
-                                {
-                                    this.open_sidebar_import(account, true, window, cx);
-                                } else {
-                                    this.step_account(window, cx);
-                                }
+                                this.step_account(1, window, cx);
                             })),
                     ),
-            )
-            .when_some(
-                self.sidebar_import
-                    .as_ref()
-                    .filter(|form| form.account == account),
-                |this, form| {
-                    this.child(
-                        v_flex()
-                            .mx(px(2.))
-                            .mb(px(8.))
-                            .px(px(9.))
-                            .py(px(9.))
-                            .gap(px(5.))
-                            .rounded(px(10.))
-                            .bg(rgb(BG_APP))
-                            .border_1()
-                            .border_color(rgb(BORDER_3))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT))
-                                    .child(SharedString::from(match form.account {
-                                        Account::Claimant => "Paste your key".to_string(),
-                                        Account::Issuer => "Paste the issuer key".to_string(),
-                                    })),
-                            )
-                            // The issuer slot is for operators only: a
-                            // claimant who pastes their own nsec here makes
-                            // the app list THEIR (empty) bounties.
-                            .when(form.account == Account::Issuer, |this| {
-                                this.child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(rgb(AMBER))
-                                        .child("Operators only. Claiming never needs it."),
-                                )
-                            })
-                            .child(div().text_size(px(12.)).child(Input::new(&form.input)))
-                            .when_some(form.error.clone(), |this, error| {
-                                this.child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(RED))
-                                        .child(SharedString::from(error)),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(rgb(TEXT_DIM))
-                                    .child(if form.submitting {
-                                        "Checking the key…"
-                                    } else {
-                                        "Enter to save · esc to close"
-                                    }),
-                            ),
-                    )
-                },
             )
             .children(NAV.iter().map(|&screen| {
                 let on = self.screen == screen;
@@ -2005,8 +2211,17 @@ impl Shell {
                 .child(self.chat.clone())
                 .into_any_element(),
             Screen::Wallet => {
-                let account = self.account;
-                let panel = wallet::panel(account, self.view(account), cx);
+                let title = match self.active_view() {
+                    Some(view) => format!("Wallet — {}", display_name(view)),
+                    None => "Wallet".to_string(),
+                };
+                let panel = match self.active_view() {
+                    Some(view) => wallet::panel(view, false, Some(&self.send_inputs), cx),
+                    None => dashboard::muted(
+                        "No account — press + in the rail to add one.",
+                        TEXT_MUTED,
+                    ),
+                };
                 div()
                     .id("wallet")
                     .flex_1()
@@ -2025,10 +2240,7 @@ impl Shell {
                                 div()
                                     .text_size(px(21.))
                                     .font_weight(FontWeight::BOLD)
-                                    .child(format!(
-                                        "Wallet — {}",
-                                        display_name(account, self.view(account))
-                                    )),
+                                    .child(SharedString::from(title)),
                             )
                             .child(
                                 v_flex()
@@ -2053,10 +2265,10 @@ impl Shell {
 /// sent, so the detail pane renders them instantly. Server data replaces it
 /// as soon as the first list/detail arrives — this is a stopgap for the
 /// seconds in between, never a source of record.
-fn optimistic_bounty(id: &str, req: CreateBounty, issuer: &AccountView, now: u64) -> Bounty {
+fn optimistic_bounty(id: &str, req: CreateBounty, now: u64) -> Bounty {
     Bounty {
         id: id.to_string(),
-        issuer_pubkey: issuer.pubkey.clone().unwrap_or_default(),
+        issuer_pubkey: nostr::issuer_pubkey(),
         list_coordinate: req.list_coordinate,
         amount_sats: req.amount_sats,
         criteria: Some(req.criteria).filter(|c| !c.is_empty()),
@@ -2085,10 +2297,10 @@ fn parse_sats(value: &str) -> Option<u64> {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Onboarding takes the whole window: no rail, no sidebar, no top bar
-        // — one decision at a time.
-        let body: AnyElement = if self.screen == Screen::Onboarding {
-            onboarding::render(self, cx).into_any_element()
+        // The account screen takes the whole window: no rail, no sidebar, no
+        // top bar — one decision at a time.
+        let body: AnyElement = if self.screen == Screen::AccountSetup {
+            account_setup::render(self, cx).into_any_element()
         } else {
             h_flex()
                 .flex_1()
@@ -2126,8 +2338,8 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &GoWallet, w, cx| this.go(Screen::Wallet, w, cx)))
             .on_action(cx.listener(|this, _: &GoTags, w, cx| this.go(Screen::Tags, w, cx)))
             .on_action(cx.listener(|this, _: &GoChat, w, cx| this.go(Screen::Chat, w, cx)))
-            .on_action(cx.listener(|this, _: &PrevAccount, w, cx| this.step_account(w, cx)))
-            .on_action(cx.listener(|this, _: &NextAccount, w, cx| this.step_account(w, cx)))
+            .on_action(cx.listener(|this, _: &PrevAccount, w, cx| this.step_account(-1, w, cx)))
+            .on_action(cx.listener(|this, _: &NextAccount, w, cx| this.step_account(1, w, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &NewItem, w, cx| this.new_item(w, cx)))
             .on_action(cx.listener(|this, _: &CloseForm, w, cx| this.cancel(w, cx)))
@@ -2157,30 +2369,28 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::onboarding_needed;
-
-    // `Some(true)` = key present, `Some(false)` = confirmed missing,
-    // `None` = the runtime has not answered for that account yet.
+    use super::{pick_active, relay_address_gap};
 
     #[test]
-    fn onboarding_shows_only_when_no_account_has_a_key() {
-        assert_eq!(onboarding_needed(Some(false), Some(false)), Some(true));
+    fn a_stored_wallet_shows_retry_until_the_relays_carry_its_address() {
+        // Relaunch: the panel pre-fills the Coinos address from the store.
+        // Only a profile read decides whether the payer can see it.
+        assert_eq!(relay_address_gap(Some("carpet12@coinos.io"), "carpet12@coinos.io"), None);
+        assert!(relay_address_gap(None, "carpet12@coinos.io").is_some(), "confirmed-empty profile");
+        assert!(
+            relay_address_gap(Some("me@strike.me"), "carpet12@coinos.io").is_some(),
+            "a different lud16 on the relays is a gap too"
+        );
     }
 
     #[test]
-    fn any_key_skips_onboarding_without_waiting_for_the_other_account() {
-        assert_eq!(onboarding_needed(Some(true), Some(true)), Some(false));
-        assert_eq!(onboarding_needed(Some(true), Some(false)), Some(false));
-        assert_eq!(onboarding_needed(Some(false), Some(true)), Some(false));
-        // One key confirmed decides early — the other answer cannot change it.
-        assert_eq!(onboarding_needed(Some(true), None), Some(false));
-        assert_eq!(onboarding_needed(None, Some(true)), Some(false));
-    }
-
-    #[test]
-    fn a_single_missing_key_waits_for_the_other_answer() {
-        assert_eq!(onboarding_needed(Some(false), None), None);
-        assert_eq!(onboarding_needed(None, Some(false)), None);
-        assert_eq!(onboarding_needed(None, None), None);
+    fn the_stored_active_account_wins_while_it_still_exists() {
+        let stored = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(pick_active(&stored, Some("b")).as_deref(), Some("b"));
+        // Gone (removed, or a stale preference): the first one.
+        assert_eq!(pick_active(&stored, Some("zz")).as_deref(), Some("a"));
+        assert_eq!(pick_active(&stored, None).as_deref(), Some("a"));
+        // No accounts at all: read-only.
+        assert_eq!(pick_active(&[], Some("a")), None);
     }
 }

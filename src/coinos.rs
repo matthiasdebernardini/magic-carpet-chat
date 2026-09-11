@@ -11,12 +11,22 @@
 //!   the account exists. Funding never needs the token: a static
 //!   `lightning:LNURL1…` QR is enough for Strike or any Lightning wallet.
 //!
-//! ponytail: one provider, no account recovery, no balance display (that
-//! needs the token), no NWC (this app never pays). Someone who outgrows a
-//! custodial wallet sets a different lud16 in any Nostr client.
+//! - `GET /api/me` with the register token — the balance, so the app can
+//!   show the sats arrive. The token is the one from register: the server
+//!   signs `{id}` with no expiry, and `/api/login` sits behind a captcha, so
+//!   that token is the only one this app will ever hold.
+//! - `POST /api/payments` with the same token — pays a BOLT11 invoice from
+//!   the wallet. The invoice comes from the recipient's own LUD-16 endpoint
+//!   (`lnurl_invoice`, any domain), so one account here can pay another, or
+//!   a Strike address, straight from the panel.
+//!
+//! ponytail: one provider, no account recovery, no NWC. Someone who outgrows
+//! a custodial wallet sets a different lud16 in any Nostr client.
 
+use std::str::FromStr as _;
 use std::sync::LazyLock;
 
+use lightning_invoice::Bolt11Invoice;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -40,9 +50,21 @@ pub enum CoinosError {
     #[error("could not reach coinos.io: {0}")]
     Http(String),
     /// Coinos answers registration failures with plain text, not JSON, so the
-    /// body is passed through as-is.
-    #[error("coinos refused the signup: {0}")]
+    /// body is passed through as-is. Also a 401 on the balance read, and a
+    /// payment coinos would not make ("Insufficient funds").
+    #[error("coinos refused: {0}")]
     Refused(String),
+    /// The recipient's side of a send: its LNURL server was unreachable,
+    /// answered something other than a pay request, or said no. Named after
+    /// the recipient's domain, because coinos had no part in it.
+    #[error("{0}")]
+    Recipient(String),
+    /// `POST /api/payments` went out and no answer came back (timeout,
+    /// dropped connection). Coinos may have paid: a retry with a fresh
+    /// invoice would pay twice, so the caller must re-read the balance and
+    /// let the person decide.
+    #[error("Payment outcome unknown; check the balance before sending again")]
+    OutcomeUnknown,
 }
 
 impl CoinosError {
@@ -58,64 +80,34 @@ impl CoinosError {
     }
 }
 
-/// The keychain payload: what it takes to log in to coinos.io by hand. The
-/// username is public (it is the Lightning address), the password is not, so
-/// the whole thing only ever travels as one [`Secret`]. `pubkey` (hex) names
-/// the key the account was bound to: the keychain entry is per account slot,
-/// not per key, so a re-imported nsec must not inherit the old key's wallet.
+/// One account's Coinos wallet, as the store keeps it: what it takes to log
+/// in to coinos.io by hand, plus the API token. The username is public (it
+/// is the Lightning address); the password and token are not, so both are
+/// [`Secret`]s and a `{:?}` on the whole thing stays clean. It lives on the
+/// account record itself, so it can never belong to a different key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Login {
     pub username: String,
     pub password: Secret,
-    pub pubkey: String,
+    /// The bearer JWT from `POST /api/register`. Empty until register
+    /// answers: the login is saved BEFORE the request (see
+    /// `nostr::create_coinos_wallet`), so an empty token means "the outcome
+    /// of that request is unknown".
+    pub token: Secret,
 }
 
 impl Login {
-    pub fn fresh(pubkey_hex: &str) -> Self {
+    pub fn fresh() -> Self {
         Self {
             username: suggest_username(),
             password: generate_password(),
-            pubkey: pubkey_hex.to_string(),
+            token: Secret::new(""),
         }
     }
 
-    /// The login to use for `pubkey_hex`, and whether it is new. A stored
-    /// login for a different key is ignored, not deleted here: the caller
-    /// overwrites the entry when it stores the fresh one.
-    pub fn reuse_or_fresh(stored: Option<Self>, pubkey_hex: &str) -> (Self, bool) {
-        match stored {
-            Some(login) if login.pubkey == pubkey_hex => (login, false),
-            _ => (Self::fresh(pubkey_hex), true),
-        }
+    pub fn has_token(&self) -> bool {
+        !self.token.expose().is_empty()
     }
-
-    pub fn encode(&self) -> Secret {
-        let wire = Wire {
-            username: self.username.clone(),
-            password: self.password.expose().to_string(),
-            pubkey: self.pubkey.clone(),
-        };
-        Secret::new(serde_json::to_string(&wire).expect("three strings serialize"))
-    }
-
-    /// `None` for a keychain entry this app did not write. Every field is
-    /// required: a partial entry is unreadable, not half a login.
-    pub fn decode(secret: &Secret) -> Option<Self> {
-        let wire: Wire = serde_json::from_str(secret.expose()).ok()?;
-        Some(Self {
-            username: wire.username,
-            password: Secret::new(wire.password),
-            pubkey: wire.pubkey,
-        })
-    }
-}
-
-/// The keychain JSON shape of a [`Login`]. Private: the password is a plain
-/// string here, and this struct only ever lives inside `encode`/`decode`.
-#[derive(Serialize, Deserialize)]
-struct Wire {
-    username: String,
-    password: String,
-    pubkey: String,
 }
 
 pub fn lightning_address(username: &str) -> String {
@@ -146,13 +138,14 @@ fn generate_password() -> Secret {
     )
 }
 
-/// Register `username` bound to `pubkey_hex`. The caller must already hold
-/// the login in the keychain: an `Http` error here leaves the outcome unknown.
+/// Register `username` bound to `pubkey_hex` and return the session token.
+/// The caller must already hold the login in the store: an `Http` error here
+/// leaves the outcome unknown.
 pub async fn create_wallet(
     username: &str,
     password: &Secret,
     pubkey_hex: &str,
-) -> Result<(), CoinosError> {
+) -> Result<Secret, CoinosError> {
     let resp = CLIENT
         .post(format!("{BASE}/api/register"))
         .json(&serde_json::json!({
@@ -170,18 +163,39 @@ pub async fn create_wallet(
         let body = resp.text().await.unwrap_or_default();
         return Err(CoinosError::Refused(body));
     }
-    // The response carries a session token. It is a bearer secret this app
-    // has no use for, so it is checked for shape and dropped, never stored.
     let registered: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| CoinosError::Http(format!("unexpected signup response: {e}")))?;
-    if registered.get("token").and_then(|t| t.as_str()).is_none() {
-        return Err(CoinosError::Http(
-            "unexpected signup response: no token".into(),
-        ));
+    registered
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(Secret::new)
+        .ok_or_else(|| CoinosError::Http("unexpected signup response: no token".into()))
+}
+
+/// The wallet's balance in sats. A 401 is `Refused`: the token is not one
+/// coinos knows, and no retry fixes that.
+pub async fn balance(token: &Secret) -> Result<u64, CoinosError> {
+    let resp = CLIENT
+        .get(format!("{BASE}/api/me"))
+        .bearer_auth(token.expose())
+        .send()
+        .await
+        .map_err(|e| CoinosError::Http(e.to_string()))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(CoinosError::Refused("the wallet token was not accepted".into()));
     }
-    Ok(())
+    if !resp.status().is_success() {
+        return Err(CoinosError::Http(format!("/api/me answered {}", resp.status())));
+    }
+    let me: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| CoinosError::Http(format!("unexpected /api/me response: {e}")))?;
+    me.get("balance")
+        .and_then(|b| b.as_u64().or_else(|| b.as_f64().map(|f| f.max(0.) as u64)))
+        .ok_or_else(|| CoinosError::Http("unexpected /api/me response: no balance".into()))
 }
 
 /// Does a Coinos account answer at this username? Public endpoint, no token.
@@ -210,16 +224,184 @@ pub async fn wallet_exists(username: &str) -> Result<bool, CoinosError> {
     Ok(body.get("tag").and_then(|t| t.as_str()) == Some("payRequest"))
 }
 
+/// `user@domain`, split. `None` for anything else — an empty half, no `@`,
+/// or whitespace inside a half.
+pub fn split_address(lightning_address: &str) -> Option<(&str, &str)> {
+    let (user, domain) = lightning_address.trim().split_once('@')?;
+    if user.is_empty() || domain.is_empty() {
+        return None;
+    }
+    if user.contains(char::is_whitespace) || domain.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((user, domain))
+}
+
+/// LUD-16: where `user@domain` publishes its pay request.
+fn lnurlp_url(user: &str, domain: &str) -> String {
+    format!("https://{domain}/.well-known/lnurlp/{user}")
+}
+
 /// The LUD-01 encoding of any Lightning address's pay endpoint (LUD-16 maps
 /// `user@domain` to `https://domain/.well-known/lnurlp/user`). Uppercase, so
 /// a QR encodes it in alphanumeric mode. `None` when `lightning_address` is
 /// not `user@domain`.
 pub fn lnurl_pay(lightning_address: &str) -> Option<String> {
-    let (user, domain) = lightning_address.trim().split_once('@')?;
-    if user.is_empty() || domain.is_empty() {
+    let (user, domain) = split_address(lightning_address)?;
+    lnurl_encode(&lnurlp_url(user, domain)).ok()
+}
+
+/// LUD-06's callback takes `amount` as one more query parameter; the
+/// callback may already carry some.
+fn callback_with_amount(callback: &str, msat: u64) -> String {
+    let separator = if callback.contains('?') { '&' } else { '?' };
+    format!("{callback}{separator}amount={msat}")
+}
+
+/// A LNURL server's `{"status":"ERROR","reason":…}`, when that is what
+/// `body` is.
+fn lnurl_error(body: &serde_json::Value) -> Option<String> {
+    if body.get("status").and_then(|s| s.as_str()) != Some("ERROR") {
         return None;
     }
-    lnurl_encode(&format!("https://{domain}/.well-known/lnurlp/{user}")).ok()
+    Some(
+        body.get("reason")
+            .and_then(|r| r.as_str())
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or("no reason given")
+            .trim()
+            .to_string(),
+    )
+}
+
+/// A GET to the recipient's LNURL server, decoded. Both LUD-06 steps answer
+/// JSON, and both can be `{"status":"ERROR"}` with a 200.
+async fn lnurl_get(domain: &str, url: String) -> Result<serde_json::Value, CoinosError> {
+    let resp = CLIENT
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| CoinosError::Recipient(format!("{domain} could not be reached: {e}")))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.map_err(|_| {
+        CoinosError::Recipient(format!("{domain} answered {status} with no LNURL response"))
+    })?;
+    if let Some(reason) = lnurl_error(&body) {
+        return Err(CoinosError::Recipient(format!("{domain} refused: {reason}")));
+    }
+    if !status.is_success() {
+        return Err(CoinosError::Recipient(format!("{domain} answered {status}")));
+    }
+    Ok(body)
+}
+
+/// A BOLT11 invoice for exactly `sats`, from the recipient's own LUD-16
+/// endpoint — any domain, not only coinos (Strike, Primal, …). LUD-06: read
+/// the pay request, check the amount is inside its range, ask the callback.
+/// `Recipient` for everything the recipient's server did wrong; the caller
+/// keeps the sats count and re-checks it against the invoice before paying.
+pub async fn lnurl_invoice(lightning_address: &str, sats: u64) -> Result<String, CoinosError> {
+    let (user, domain) = split_address(lightning_address).ok_or_else(|| {
+        CoinosError::Recipient(format!(
+            "{} is not a Lightning address (name@domain.com)",
+            lightning_address.trim()
+        ))
+    })?;
+    let pay = lnurl_get(domain, lnurlp_url(user, domain)).await?;
+    if pay.get("tag").and_then(|t| t.as_str()) != Some("payRequest") {
+        return Err(CoinosError::Recipient(format!(
+            "{domain} has no Lightning address named {user}"
+        )));
+    }
+    let msat = sats.saturating_mul(1000);
+    let min = pay.get("minSendable").and_then(|v| v.as_u64()).unwrap_or(1);
+    let max = pay.get("maxSendable").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+    if msat < min || msat > max {
+        return Err(CoinosError::Recipient(format!(
+            "{domain} accepts {} to {} sats per payment",
+            min.div_ceil(1000),
+            max / 1000
+        )));
+    }
+    let callback = pay
+        .get("callback")
+        .and_then(|c| c.as_str())
+        .filter(|c| c.starts_with("https://"))
+        .ok_or_else(|| {
+            CoinosError::Recipient(format!("{domain} gave no callback for the invoice"))
+        })?;
+    let invoice = lnurl_get(domain, callback_with_amount(callback, msat)).await?;
+    invoice
+        .get("pr")
+        .and_then(|pr| pr.as_str())
+        .map(|pr| pr.trim().to_string())
+        .filter(|pr| !pr.is_empty())
+        .ok_or_else(|| CoinosError::Recipient(format!("{domain} returned no invoice")))
+}
+
+/// `bolt11` parsed, and its amount checked against what was asked for. The
+/// invoice came from the recipient's server, so the wallet never trusts its
+/// amount: one that asks for more (or is open-ended) is refused here, before
+/// coinos ever sees it.
+fn invoice_for(bolt11: &str, sats: u64) -> Result<Bolt11Invoice, CoinosError> {
+    let invoice = Bolt11Invoice::from_str(bolt11.trim())
+        .map_err(|e| CoinosError::Refused(format!("the invoice could not be read: {e}")))?;
+    match invoice.amount_milli_satoshis() {
+        Some(msat) if msat == sats.saturating_mul(1000) => Ok(invoice),
+        Some(msat) => Err(CoinosError::Refused(format!(
+            "the invoice asks for {} sats, not {sats}",
+            msat.div_ceil(1000)
+        ))),
+        None => Err(CoinosError::Refused(
+            "the invoice names no amount, so it was not paid".into(),
+        )),
+    }
+}
+
+/// Coinos truncates nothing, and a proxy error page can be long; the panel
+/// shows this text.
+const REFUSAL_TEXT_CAP: usize = 200;
+
+/// A Lightning payment can take a while to settle through the network, and
+/// coinos answers only once it has; the client's 30 s default would give up
+/// on payments that go through.
+const PAYMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Pay `bolt11` from the wallet `token` opens, after checking the invoice
+/// asks for exactly `sats`. `Ok` once coinos accepted the payment; a 401 is
+/// the token, any other refusal is coinos's own text ("Insufficient funds").
+/// `Http` means the request never reached coinos; once it has, no answer is
+/// [`CoinosError::OutcomeUnknown`], never a plain failure.
+pub async fn pay_invoice(token: &Secret, bolt11: &str, sats: u64) -> Result<(), CoinosError> {
+    let invoice = invoice_for(bolt11, sats)?;
+    let resp = CLIENT
+        .post(format!("{BASE}/api/payments"))
+        .bearer_auth(token.expose())
+        .timeout(PAYMENT_TIMEOUT)
+        .json(&serde_json::json!({ "payreq": invoice.to_string() }))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_connect() {
+                CoinosError::Http(e.to_string())
+            } else {
+                CoinosError::OutcomeUnknown
+            }
+        })?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(CoinosError::Refused("the wallet token was not accepted".into()));
+    }
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let body = body.trim();
+        let reason = match body.char_indices().nth(REFUSAL_TEXT_CAP) {
+            Some((cut, _)) => format!("{}…", &body[..cut]),
+            None if body.is_empty() => "payment not accepted".to_string(),
+            None => body.to_string(),
+        };
+        return Err(CoinosError::Refused(reason));
+    }
+    Ok(())
 }
 
 /// bech32 with HRP `lnurl`. The original checksum, NOT bech32m: LUD-01
@@ -255,6 +437,48 @@ mod tests {
         assert_eq!(lnurl_pay("not-an-address"), None);
         assert_eq!(lnurl_pay("@coinos.io"), None);
         assert_eq!(lnurl_pay("user@"), None);
+        assert_eq!(split_address("  m@strike.me "), Some(("m", "strike.me")));
+        assert_eq!(split_address("a b@strike.me"), None);
+    }
+
+    #[test]
+    fn the_callback_gets_amount_as_one_more_query_parameter() {
+        assert_eq!(
+            callback_with_amount("https://coinos.io/api/lnurlp/carpet", 21_000),
+            "https://coinos.io/api/lnurlp/carpet?amount=21000"
+        );
+        assert_eq!(
+            callback_with_amount("https://strike.me/pay?user=m", 21_000),
+            "https://strike.me/pay?user=m&amount=21000"
+        );
+    }
+
+    #[test]
+    fn an_invoice_for_a_different_amount_is_not_paid() {
+        // BOLT 11's own "coffee beans" vector, as lightning-invoice tests
+        // it: 25 mBTC = 2 500 000 sats, with a payment secret so it parses.
+        let bolt11 = "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q5sqqqqqqqqqqqqqqqpqsq67gye39hfg3zd8rgc80k32tvy9xk2xunwm5lzexnvpx6fd77en8qaq424dxgt56cag2dpt359k3ssyhetktkpqh24jqnjyw6uqd08sgptq44qu";
+        assert!(invoice_for(bolt11, 2_500_000).is_ok());
+        match invoice_for(bolt11, 21) {
+            Err(CoinosError::Refused(reason)) => {
+                assert_eq!(reason, "the invoice asks for 2500000 sats, not 21")
+            }
+            other => panic!("a wrong amount must be refused: {other:?}"),
+        }
+        assert!(matches!(
+            invoice_for("lnbc1notaninvoice", 21),
+            Err(CoinosError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn a_lnurl_error_body_is_its_reason() {
+        let err = serde_json::json!({"status": "ERROR", "reason": "Not found"});
+        assert_eq!(lnurl_error(&err).as_deref(), Some("Not found"));
+        let bare = serde_json::json!({"status": "ERROR"});
+        assert_eq!(lnurl_error(&bare).as_deref(), Some("no reason given"));
+        let ok = serde_json::json!({"tag": "payRequest"});
+        assert_eq!(lnurl_error(&ok), None);
     }
 
     #[test]
@@ -287,46 +511,23 @@ mod tests {
     }
 
     #[test]
-    fn a_login_round_trips_through_the_keychain_shape_without_printing() {
+    fn a_login_round_trips_through_the_store_shape_without_printing() {
         let login = Login {
             username: "carpetabcd1234".into(),
             password: generate_password(),
-            pubkey: "aa".repeat(32),
+            token: Secret::new("eyJhbGciOiJIUzI1NiJ9.payload.signature"),
         };
-        let encoded = login.encode();
-        assert_eq!(format!("{encoded:?}"), "Secret(<redacted>)");
-        let decoded = Login::decode(&encoded).unwrap();
-        assert_eq!(decoded.username, login.username);
-        assert_eq!(decoded.password, login.password);
-        assert_eq!(decoded.pubkey, login.pubkey);
-        assert!(Login::decode(&Secret::new("not json")).is_none());
-        assert!(Login::decode(&Secret::new(r#"{"username":"x"}"#)).is_none());
-        // An entry from before `pubkey` was recorded is unreadable, not
-        // silently bound to whatever key is active now.
-        assert!(Login::decode(&Secret::new(r#"{"username":"x","password":"y"}"#)).is_none());
-    }
+        let printed = format!("{login:?}");
+        assert!(!printed.contains("eyJ"), "token leaked: {printed}");
+        assert!(!printed.contains(login.password.expose()), "password leaked");
+        assert!(printed.contains("carpetabcd1234"), "the username is public");
 
-    #[test]
-    fn a_login_for_one_key_is_never_reused_for_another() {
-        // Forget the nsec, paste a different one: the account slot keeps its
-        // keychain entry, but that wallet belongs to the old key.
-        let key_a = "aa".repeat(32);
-        let key_b = "bb".repeat(32);
-        let stored = Login::decode(&Login::fresh(&key_a).encode()).unwrap();
-        let old_username = stored.username.clone();
-
-        let (login, fresh) = Login::reuse_or_fresh(Some(stored), &key_b);
-        assert!(fresh);
-        assert_eq!(login.pubkey, key_b);
-        assert_ne!(login.username, old_username);
-
-        let stored = Login::decode(&Login::fresh(&key_a).encode()).unwrap();
-        let old_username = stored.username.clone();
-        let (login, fresh) = Login::reuse_or_fresh(Some(stored), &key_a);
-        assert!(!fresh);
-        assert_eq!(login.username, old_username);
-
-        let (_, fresh) = Login::reuse_or_fresh(None, &key_a);
-        assert!(fresh);
+        let json = serde_json::to_string(&login).unwrap();
+        let decoded: Login = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, login);
+        assert!(decoded.has_token());
+        assert!(!Login::fresh().has_token(), "a login saved before register has no token yet");
+        // Every field is required: a partial entry is unreadable, not half a login.
+        assert!(serde_json::from_str::<Login>(r#"{"username":"x","password":"y"}"#).is_err());
     }
 }

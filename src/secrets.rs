@@ -1,80 +1,32 @@
-//! Secret storage. The two nsecs are bearer credentials: they live in the OS
-//! keychain (or an env override for automated runs) and nowhere else.
+//! Secret storage: every account's nsec and Coinos login in ONE file,
+//! `~/Library/Application Support/magic-carpet-chat/accounts.json`, mode 0600,
+//! written atomically. Not the keychain: every unsigned build is a new app to
+//! macOS, which re-prompts for the login password on each launch, and a plain
+//! file survives app updates for every build the same way.
 //!
 //! Every secret leaves this module wrapped in [`Secret`], which has a `Debug`
 //! impl that prints a placeholder. That is the whole point — a stray `{:?}`
 //! anywhere in the app, or a secret embedded in an error chain, cannot leak
 //! the value into a log line.
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
-use keyring::Entry;
 use nostr_sdk::prelude::*;
+use serde::{Deserialize, Serialize};
 
-const SERVICE: &str = "magic-carpet-chat";
+use crate::coinos;
 
-/// The two identities the demo drives. Each has its own keychain entry, its
-/// own env override, and (in `api::Api`) its own cookie jar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Account {
-    /// The house: posts the DList and the auto-pay bounty.
-    Issuer,
-    /// Matthias: claims an item and gets paid.
-    Claimant,
-}
-
-impl Account {
-    pub const ALL: [Account; 2] = [Account::Issuer, Account::Claimant];
-
-    fn entry_key(self) -> &'static str {
-        match self {
-            Account::Issuer => "issuer-nsec",
-            Account::Claimant => "claimant-nsec",
-        }
-    }
-
-    /// The Coinos username + password this app opened for the account, as
-    /// one JSON string (see `coinos::Login`). Its own entry, so forgetting the
-    /// nsec and forgetting the wallet login stay separate decisions. Public
-    /// because the UI names the entry when it tells the user where the
-    /// password lives.
-    pub fn coinos_entry_key(self) -> &'static str {
-        match self {
-            Account::Issuer => "issuer-coinos-login",
-            Account::Claimant => "claimant-coinos-login",
-        }
-    }
-
-    /// Whether this app opens and shows a wallet for the account. Only the
-    /// claimant: the issuer's wallet is the prod payer's, managed elsewhere.
-    pub fn has_local_wallet(self) -> bool {
-        self == Account::Claimant
-    }
-
-    /// Env override, checked before the keychain so automated runs never need
-    /// an unlocked credential store.
-    pub fn env_var(self) -> &'static str {
-        match self {
-            Account::Issuer => "MC_ISSUER_NSEC",
-            Account::Claimant => "MC_CLAIMANT_NSEC",
-        }
-    }
-}
-
-impl std::fmt::Display for Account {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Account::Issuer => "issuer",
-            Account::Claimant => "claimant",
-        })
-    }
-}
+const APP_DIR: &str = "magic-carpet-chat";
+const FILE_NAME: &str = "accounts.json";
 
 #[derive(thiserror::Error, Debug)]
 pub enum SecretError {
-    #[error("OS keychain unavailable: {0}")]
-    Keyring(String),
+    /// The store file could not be read or written. Carries the path and the
+    /// io error, never the file's contents.
+    #[error("{0}")]
+    Store(String),
     /// Deliberately does not carry the parser's error: a bech32 error can echo
     /// pieces of its input, and this message may end up in a log.
     #[error("{0} is not an nsec or 64-char hex secret key")]
@@ -92,8 +44,10 @@ pub enum SecretError {
     PublicKeyPasted,
 }
 
-/// A string that refuses to print itself.
-#[derive(Clone, PartialEq, Eq)]
+/// A string that refuses to print itself. Serialises as the bare string, so
+/// it can sit in the store file without a wrapper.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Secret(String);
 
 impl Secret {
@@ -120,120 +74,199 @@ impl std::fmt::Display for Secret {
     }
 }
 
-fn keyring_err(e: impl std::fmt::Display) -> SecretError {
-    SecretError::Keyring(e.to_string())
+/// The store file as a whole. `Debug` is safe: every secret inside is a
+/// [`Secret`].
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Store {
+    /// The account the app opens on. `None` only for an empty store.
+    pub active: Option<String>,
+    /// In the order they were added; the rail draws them in this order.
+    pub accounts: Vec<StoredAccount>,
 }
 
-/// Surfaces a missing or locked OS credential store at startup instead of at
-/// the first save.
-pub fn store_available() -> Result<(), SecretError> {
-    if DEV_STORE {
-        return dev_dir().map(|_| ());
-    }
-    Entry::store_status()
-        .as_ref()
-        .copied()
-        .map_err(keyring_err)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoredAccount {
+    pub pubkey: String,
+    /// Private: the runtime gets signing keys through [`keys`], never the text.
+    nsec: Secret,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coinos: Option<coinos::Login>,
 }
 
-/// Debug builds keep secrets in plain 0600 files instead of the keychain:
-/// every unsigned debug binary is a new app to macOS, which re-prompts for the
-/// login password on each launch. Release builds always use the keychain.
-const DEV_STORE: bool = cfg!(debug_assertions);
-
-/// The dev-store directory, resolved and created once per process. The
-/// failure is kept as text because `SecretError` does not clone.
-fn dev_dir() -> Result<&'static Path, SecretError> {
-    static DEV_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    DEV_DIR
-        .get_or_init(|| {
-            let dir = std::env::home_dir()
-                .ok_or_else(|| "no home directory".to_string())?
-                .join("Library/Application Support")
-                .join(SERVICE)
-                .join("dev-secrets");
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            Ok(dir)
-        })
-        .as_deref()
-        .map_err(keyring_err)
-}
-
-fn get(key: &str) -> Result<Option<String>, SecretError> {
-    if DEV_STORE {
-        return match std::fs::read_to_string(dev_dir()?.join(key)) {
-            Ok(value) => Ok(Some(value)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(keyring_err(e)),
-        };
-    }
-    match entry(key)?.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(keyring_err(e)),
+impl StoredAccount {
+    pub fn npub(&self) -> String {
+        PublicKey::from_hex(&self.pubkey)
+            .ok()
+            .and_then(|pk| pk.to_bech32().ok())
+            .unwrap_or_else(|| self.pubkey.clone())
     }
 }
 
-fn set(key: &str, value: &str) -> Result<(), SecretError> {
-    if DEV_STORE {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(dev_dir()?.join(key))
-            .map_err(keyring_err)?;
-        return file.write_all(value.as_bytes()).map_err(keyring_err);
+/// What [`add_account`] hands back: public material only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRecord {
+    pub pubkey: String,
+    pub npub: String,
+}
+
+/// `MC_STORE_DIR` overrides the directory — the round-trip test writes to a
+/// temp dir, and a rehearsal can run on a throwaway store.
+fn store_dir() -> Result<PathBuf, SecretError> {
+    if let Ok(dir) = std::env::var("MC_STORE_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
     }
-    entry(key)?.set_password(value).map_err(keyring_err)
+    let home = std::env::home_dir()
+        .ok_or_else(|| SecretError::Store("no home directory".into()))?;
+    Ok(home.join("Library/Application Support").join(APP_DIR))
 }
 
-/// An entry that was never stored is already forgotten, so "not found" is success.
-fn del(key: &str) -> Result<(), SecretError> {
-    if DEV_STORE {
-        return match std::fs::remove_file(dev_dir()?.join(key)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(keyring_err(e)),
-        };
+pub fn store_path() -> Result<PathBuf, SecretError> {
+    Ok(store_dir()?.join(FILE_NAME))
+}
+
+/// Missing file = empty store.
+pub fn load() -> Result<Store, SecretError> {
+    let path = store_path()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            SecretError::Store(format!("Could not read {}: {e}", path.display()))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
+        Err(e) => Err(SecretError::Store(format!(
+            "Could not read {}: {e}",
+            path.display()
+        ))),
     }
-    match entry(key)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(keyring_err(e)),
+}
+
+/// Write to `accounts.json.tmp` (mode 0600), then rename over the real file,
+/// so a crash mid-write never leaves a half-written store.
+fn save(store: &Store) -> Result<(), SecretError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let path = store_path()?;
+    let fail = |e: &dyn std::fmt::Display| {
+        SecretError::Store(format!("Could not save to {}: {e}", path.display()))
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
     }
+    let json = serde_json::to_vec_pretty(store).map_err(|e| fail(&e))?;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| fail(&e))?;
+    file.write_all(&json).map_err(|e| fail(&e))?;
+    file.sync_all().map_err(|e| fail(&e))?;
+    drop(file);
+    std::fs::rename(&tmp, &path).map_err(|e| fail(&e))
 }
 
-fn entry(key: &str) -> Result<Entry, SecretError> {
-    Entry::new(SERVICE, key).map_err(keyring_err)
+/// Every change is load → modify → save; two runtime tasks can overlap (an
+/// add, then its wallet step), so writers take turns.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn modify<T>(change: impl FnOnce(&mut Store) -> Result<T, SecretError>) -> Result<T, SecretError> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store = load()?;
+    let out = change(&mut store)?;
+    save(&store)?;
+    Ok(out)
 }
 
-pub fn store_nsec(account: Account, nsec: &Secret) -> Result<(), SecretError> {
-    set(account.entry_key(), nsec.expose())
+fn missing(pubkey: &str) -> SecretError {
+    SecretError::Store(format!("No stored account for {pubkey}"))
 }
 
-/// "Forget this key": delete the stored entry. An env override is NOT
-/// touched — env wins on the next load, and lying about that would be worse
-/// than showing the key come back.
-pub fn forget_nsec(account: Account) -> Result<(), SecretError> {
-    del(account.entry_key())
+/// Parse, dedupe by pubkey, make it the active account, save. The nsec is
+/// stored as bech32 whatever was pasted, so the file has one shape.
+pub fn add_account(nsec: &Secret) -> Result<AccountRecord, SecretError> {
+    let keys = parse_secret(nsec)?;
+    let pubkey = keys.public_key().to_hex();
+    let npub = keys
+        .public_key()
+        .to_bech32()
+        .map_err(|_| SecretError::NotAKey)?;
+    let nsec = Secret::new(
+        keys.secret_key()
+            .to_bech32()
+            .map_err(|_| SecretError::NotAKey)?,
+    );
+    modify(|store| {
+        if !store.accounts.iter().any(|a| a.pubkey == pubkey) {
+            store.accounts.push(StoredAccount {
+                pubkey: pubkey.clone(),
+                nsec,
+                coinos: None,
+            });
+        }
+        store.active = Some(pubkey.clone());
+        Ok(())
+    })?;
+    Ok(AccountRecord { pubkey, npub })
+}
+
+/// Drops the nsec AND the Coinos login with it. If the removed account was
+/// active, the first remaining one is.
+pub fn remove_account(pubkey: &str) -> Result<(), SecretError> {
+    modify(|store| {
+        store.accounts.retain(|a| a.pubkey != pubkey);
+        if store.active.as_deref() == Some(pubkey) {
+            store.active = store.accounts.first().map(|a| a.pubkey.clone());
+        }
+        Ok(())
+    })
+}
+
+pub fn set_active(pubkey: &str) -> Result<(), SecretError> {
+    modify(|store| {
+        if !store.accounts.iter().any(|a| a.pubkey == pubkey) {
+            return Err(missing(pubkey));
+        }
+        store.active = Some(pubkey.to_string());
+        Ok(())
+    })
 }
 
 /// Write the Coinos login BEFORE `POST /api/register`, never after: a signup
 /// that succeeds but never reports back would otherwise leave a funded
 /// account nobody can log in to. Delete it only through
 /// [`forget_coinos_login`], and only when coinos refused outright.
-pub fn store_coinos_login(account: Account, login: &Secret) -> Result<(), SecretError> {
-    set(account.coinos_entry_key(), login.expose())
+pub fn store_coinos_login(pubkey: &str, login: &coinos::Login) -> Result<(), SecretError> {
+    modify(|store| {
+        let account = store
+            .accounts
+            .iter_mut()
+            .find(|a| a.pubkey == pubkey)
+            .ok_or_else(|| missing(pubkey))?;
+        account.coinos = Some(login.clone());
+        Ok(())
+    })
 }
 
-pub fn load_coinos_login(account: Account) -> Result<Option<Secret>, SecretError> {
-    Ok(get(account.coinos_entry_key())?.map(Secret::new))
+pub fn load_coinos_login(pubkey: &str) -> Result<Option<coinos::Login>, SecretError> {
+    Ok(load()?
+        .accounts
+        .into_iter()
+        .find(|a| a.pubkey == pubkey)
+        .and_then(|a| a.coinos))
 }
 
-pub fn forget_coinos_login(account: Account) -> Result<(), SecretError> {
-    del(account.coinos_entry_key())
+pub fn forget_coinos_login(pubkey: &str) -> Result<(), SecretError> {
+    modify(|store| {
+        if let Some(account) = store.accounts.iter_mut().find(|a| a.pubkey == pubkey) {
+            account.coinos = None;
+        }
+        Ok(())
+    })
 }
 
 /// Validate a user-pasted secret: `nsec1…` bech32 or 64 hex characters.
@@ -256,49 +289,46 @@ pub fn parse_secret(secret: &Secret) -> Result<Keys, SecretError> {
     Keys::parse(&lower).map_err(|_| SecretError::NotAKey)
 }
 
-/// Env override first, then the keychain. `Ok(None)` means no key anywhere.
-pub fn load_nsec(account: Account) -> Result<Option<Secret>, SecretError> {
-    if let Ok(value) = std::env::var(account.env_var()) {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Ok(Some(Secret::new(value)));
-        }
-    }
-    Ok(get(account.entry_key())?.map(Secret::new))
-}
-
-/// The stored key as signing keys. `Ok(None)` means no key is stored.
-pub fn keys(account: Account) -> Result<Option<Keys>, SecretError> {
-    let Some(secret) = load_nsec(account)? else {
+/// The stored key as signing keys. `Ok(None)` means no such account.
+pub fn keys(pubkey: &str) -> Result<Option<Keys>, SecretError> {
+    let store = load()?;
+    let Some(account) = store.accounts.iter().find(|a| a.pubkey == pubkey) else {
         return Ok(None);
     };
-    Keys::parse(secret.expose())
+    Keys::parse(account.nsec.expose())
         .map(Some)
-        .map_err(|_| SecretError::InvalidKey(account.env_var()))
+        .map_err(|_| SecretError::InvalidKey("A stored key"))
 }
 
-/// The `--import-keys` CLI path: read MC_ISSUER_NSEC / MC_CLAIMANT_NSEC,
-/// validate, store to the keychain, and return only the derived npubs.
-/// Nothing here may ever return or print key material.
-pub fn import_keys_from_env() -> Result<Vec<(Account, String)>, SecretError> {
-    let mut imported = Vec::new();
-    for account in Account::ALL {
-        let Ok(raw) = std::env::var(account.env_var()) else {
-            continue;
-        };
-        let raw = raw.trim();
-        if raw.is_empty() {
+/// `MC_NSECS`: comma-separated nsecs, added if not already stored. Called at
+/// every launch and by `--import-keys`, so it must be idempotent: a key
+/// already in the store is left alone (its active flag included). Returns
+/// the npub of every key named — nothing here may ever return key material.
+pub fn import_from_env() -> Result<Vec<String>, SecretError> {
+    let Ok(raw) = std::env::var("MC_NSECS") else {
+        return Ok(Vec::new());
+    };
+    let known: HashSet<String> = load()?
+        .accounts
+        .iter()
+        .map(|a| a.pubkey.clone())
+        .collect();
+    let mut npubs = Vec::new();
+    for piece in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let secret = Secret::new(piece);
+        let keys = parse_secret(&secret).map_err(|_| SecretError::InvalidKey("MC_NSECS"))?;
+        let pubkey = keys.public_key().to_hex();
+        if known.contains(&pubkey) {
+            npubs.push(
+                keys.public_key()
+                    .to_bech32()
+                    .map_err(|_| SecretError::InvalidKey("MC_NSECS"))?,
+            );
             continue;
         }
-        let keys = Keys::parse(raw).map_err(|_| SecretError::InvalidKey(account.env_var()))?;
-        store_nsec(account, &Secret::new(raw))?;
-        let npub = keys
-            .public_key()
-            .to_bech32()
-            .map_err(|_| SecretError::InvalidKey(account.env_var()))?;
-        imported.push((account, npub));
+        npubs.push(add_account(&secret)?.npub);
     }
-    Ok(imported)
+    Ok(npubs)
 }
 
 #[cfg(test)]
@@ -322,11 +352,69 @@ mod tests {
 
     #[test]
     fn key_errors_never_echo_the_input() {
-        let err = SecretError::InvalidKey(Account::Issuer.env_var());
+        let err = SecretError::InvalidKey("MC_NSECS");
         assert_eq!(
             err.to_string(),
-            "MC_ISSUER_NSEC is not an nsec or 64-char hex secret key"
+            "MC_NSECS is not an nsec or 64-char hex secret key"
         );
+    }
+
+    #[test]
+    fn the_store_round_trips_accounts_wallets_and_the_active_flag() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // nextest runs each test in its own process, so the env override
+        // cannot bleed into another test.
+        let dir = std::env::temp_dir().join(format!("mc-store-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        assert!(load().unwrap().accounts.is_empty(), "missing file is an empty store");
+
+        let a = Keys::generate();
+        let b = Keys::generate();
+        let ra = add_account(&Secret::new(a.secret_key().to_bech32().unwrap())).unwrap();
+        let rb = add_account(&Secret::new(b.secret_key().to_secret_hex())).unwrap();
+        // The same key again is a no-op on the list, and makes it active.
+        let again = add_account(&Secret::new(a.secret_key().to_bech32().unwrap())).unwrap();
+        assert_eq!(again, ra);
+        let store = load().unwrap();
+        assert_eq!(store.accounts.len(), 2);
+        assert_eq!(store.accounts[0].pubkey, ra.pubkey);
+        assert_eq!(store.accounts[0].npub(), ra.npub);
+        assert_eq!(store.active.as_deref(), Some(ra.pubkey.as_str()));
+        assert!(!format!("{store:?}").contains("nsec1"), "the store debug-prints a key");
+
+        // Hex in, bech32 out: the signing keys are the same key.
+        assert_eq!(keys(&rb.pubkey).unwrap().unwrap().public_key(), b.public_key());
+        assert!(keys(&"cc".repeat(32)).unwrap().is_none());
+
+        set_active(&rb.pubkey).unwrap();
+        assert_eq!(load().unwrap().active.as_deref(), Some(rb.pubkey.as_str()));
+        assert!(set_active(&"cc".repeat(32)).is_err());
+
+        let login = coinos::Login::fresh();
+        store_coinos_login(&ra.pubkey, &login).unwrap();
+        assert_eq!(load_coinos_login(&ra.pubkey).unwrap(), Some(login.clone()));
+        assert_eq!(load_coinos_login(&rb.pubkey).unwrap(), None);
+        assert!(store_coinos_login(&"cc".repeat(32), &login).is_err());
+
+        let path = store_path().unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "store file mode");
+        assert!(!path.with_extension("json.tmp").exists(), "temp file left behind");
+
+        forget_coinos_login(&ra.pubkey).unwrap();
+        assert_eq!(load_coinos_login(&ra.pubkey).unwrap(), None);
+
+        // Removing the active account falls back to the first remaining one.
+        remove_account(&rb.pubkey).unwrap();
+        let store = load().unwrap();
+        assert_eq!(store.accounts.len(), 1);
+        assert_eq!(store.active.as_deref(), Some(ra.pubkey.as_str()));
+        assert!(keys(&rb.pubkey).unwrap().is_none());
+        remove_account(&ra.pubkey).unwrap();
+        assert_eq!(load().unwrap().active, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

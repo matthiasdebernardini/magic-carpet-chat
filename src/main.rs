@@ -10,36 +10,30 @@ use gpui_kit::*;
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::component::Root;
 
+mod account_setup;
 mod bounties;
 mod chat;
 mod dashboard;
 mod icons;
-mod onboarding;
 mod palette;
 mod shell;
 mod timefmt;
 mod wallet;
 
 fn main() {
-    // `--import-keys`: read MC_ISSUER_NSEC / MC_CLAIMANT_NSEC, store them in
-    // the OS keychain, print ONLY the derived npubs, and exit. The secrets
+    // `--import-keys`: read MC_NSECS (comma-separated), add them to the
+    // accounts file, print ONLY the derived npubs, and exit. The secrets
     // themselves never touch stdout — `Secret` redacts, and only bech32
     // public keys are printed here.
     if std::env::args().any(|arg| arg == "--import-keys") {
-        // Import writes the keychain, so a missing or locked credential store
-        // is fatal here — better now than halfway through storing one key.
-        if let Err(error) = magic_carpet_chat::secrets::store_available() {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        match magic_carpet_chat::secrets::import_keys_from_env() {
-            Ok(imported) if imported.is_empty() => {
-                eprintln!("nothing to import: set MC_ISSUER_NSEC and/or MC_CLAIMANT_NSEC");
+        match magic_carpet_chat::secrets::import_from_env() {
+            Ok(npubs) if npubs.is_empty() => {
+                eprintln!("nothing to import: set MC_NSECS");
                 std::process::exit(1);
             }
-            Ok(imported) => {
-                for (account, npub) in imported {
-                    println!("{account}: {npub}");
+            Ok(npubs) => {
+                for npub in npubs {
+                    println!("{npub}");
                 }
                 return;
             }
@@ -50,11 +44,17 @@ fn main() {
         }
     }
 
-    // Surface a missing/locked credential store at launch, not mid-demo at
-    // the first keychain read. Not fatal: the MC_*_NSEC env overrides still
-    // work, and the account rows show whatever ends up missing.
-    if let Err(error) = magic_carpet_chat::secrets::store_available() {
-        eprintln!("credential store unavailable ({error}); relying on env keys");
+    // The same import at every launch, before the window opens, so
+    // LoadAccounts sees an MC_NSECS key on its first read. Idempotent: a key
+    // already stored is left alone.
+    if let Err(error) = magic_carpet_chat::secrets::import_from_env() {
+        eprintln!("MC_NSECS import failed: {error}");
+    }
+    // Surface an unreadable accounts file at launch, not mid-demo. Not
+    // fatal: browsing works with no account, and the first save says the
+    // same thing on screen.
+    if let Err(error) = magic_carpet_chat::secrets::load() {
+        eprintln!("{error}");
     }
 
     let app = gpui_kit::application().with_assets(icons::Assets);

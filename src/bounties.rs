@@ -1,6 +1,6 @@
 //! The Bounties screen: the issuer's live bounty list beside a detail pane
 //! with per-claim payment timelines, plus the two forms that drive the demo —
-//! the issuer's "New DList + bounty" and the claimant's claim.
+//! the issuer's "New DList + bounty" and everyone else's claim.
 //!
 //! Everything renders from `Shell` state fed by the nostr runtime. The whole
 //! screen is keyboard-reachable: ↑/↓ select, ⌘N opens the form for whichever
@@ -12,7 +12,6 @@ use gpui_kit::*;
 use gpui_kit::component::{h_flex, input::Input, v_flex};
 
 use magic_carpet_chat::api::{Bounty, Claim};
-use magic_carpet_chat::secrets::Account;
 
 use crate::dashboard::{MONO, count_badge};
 use crate::palette::*;
@@ -655,13 +654,14 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
 // ------------------------------------------------------------------ screen
 
 pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
-    let action_label = match shell.account {
-        Account::Issuer => "+ New DList + bounty (⌘N)",
-        Account::Claimant => "+ Submit a bounty claim (⌘N)",
+    let action_label = if shell.is_active_issuer() {
+        "+ New DList + bounty (⌘N)"
+    } else {
+        "+ Submit a bounty claim (⌘N)"
     };
-    // No key for the active account: the CTA dims, and a click (like ⌘N)
-    // routes to the sidebar key input instead of a form that cannot submit.
-    let keyless = shell.view(shell.account).missing;
+    // No account: the CTA dims, and a click (like ⌘N) opens the account
+    // screen instead of a form that cannot submit.
+    let keyless = shell.active_view().is_none();
 
     v_flex()
         .flex_1()

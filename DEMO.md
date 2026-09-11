@@ -13,34 +13,40 @@ money move.
    Privacy & Security**, scroll to *"Magic Carpet Chat" was blocked*, click
    **Open Anyway**, then **Open**. macOS asks this once. (The zip ships a
    "READ ME FIRST.txt" with the same steps.)
-2. The app opens on the onboarding screen when no key is stored anywhere.
-3. Paste your Nostr secret key into the masked field and press `Enter`. It
-   starts with `nsec1` — copy it from your Nostr app (Settings > Keys in
-   Primal or Damus). The app stores it in the Mac keychain, shows your npub,
-   your profile name, and whether the profile has a Lightning address
-   (payouts need one — without it, claims are accepted but never paid).
-4. Press `Enter` again (Start) — or press `esc` at any point to just look
-   around read-only.
-5. **No Lightning address?** The ready panel offers **Create a Coinos wallet
-   for this key** (also on the Wallet screen, `⌘6`). One click opens a
-   hosted Coinos wallet bound to the key, writes its address into the
-   profile, and shows a QR: scan it with Strike or any Lightning wallet to
-   add sats. Coinos holds the funds — keep the balance small. The login is
-   in the Mac keychain under `magic-carpet-chat` / `claimant-coinos-login`
-   (Copy username is on the panel; the password is in Keychain Access).
+2. The app opens on the account screen when no account is stored.
+3. **Create a new account** (the primary button): type a name if you like
+   and press `Enter`. The app makes a key, opens a Coinos wallet for it,
+   writes the wallet's address into the profile, and shows a QR. Scan it
+   with Strike or any Lightning wallet; the line under the QR turns green
+   with "Received N sats" when the money lands. Coinos holds the funds —
+   keep the balance small.
+4. Or **I already have a key**: paste your Nostr secret key (it starts with
+   `nsec1` — Settings > Keys in Primal or Damus) and press `Enter`. The app
+   shows your npub, your profile name, and whether the profile has a
+   Lightning address (payouts need one — without it, claims are accepted but
+   never paid). No address? The ready panel offers **Create a Coinos wallet
+   for this account** (also on the Wallet screen, `⌘6`). The Wallet screen
+   can also send sats from that wallet to any Lightning address.
+5. Press `Enter` again (Start) — or press `esc` at any point to just look
+   around read-only. Keys and Coinos logins live in
+   `~/Library/Application Support/magic-carpet-chat/accounts.json`; **Copy
+   username** / **Copy password** on the wallet panel are how you get into
+   coinos.io itself, if you ever want to.
 
 ## One-time setup (operator)
 
 1. Import both keys (secrets live in `magic-carpet-v2/.fallow/` — never print them):
 
    ```
-   MC_ISSUER_NSEC=… MC_CLAIMANT_NSEC=… ./target/release/magic-carpet-chat --import-keys
+   MC_NSECS=<issuer nsec>,<claimant nsec> ./target/release/magic-carpet-chat --import-keys
    ```
 
-   It prints the two npubs and exits. Keys land in the macOS keychain under
-   `magic-carpet-chat`. The `MC_ISSUER_NSEC`/`MC_CLAIMANT_NSEC` env vars also
-   work directly at launch — env wins over the keychain, and a key in the env
-   skips the onboarding.
+   It prints the npubs and exits. Keys land in
+   `~/Library/Application Support/magic-carpet-chat/accounts.json`. `MC_NSECS`
+   also works directly at launch — the same import runs before the window
+   opens, and a key already stored is left alone. The issuer role is fixed:
+   the account whose pubkey is the house issuer (or `MC_ISSUER_NPUB`) gets
+   the bounty form, every other account gets the claim form.
 
 2. Build fresh: `/Users/md/.cargo/bin/cargo build --release`.
 
@@ -50,7 +56,7 @@ money move.
 |---|---|---|
 | 1 | launch the app | Dashboard opens. Rail dot turns **green** when the relay socket is really up (~3 s). "Needs attention" is all-clear once both keys load. |
 | 2 | `⌘2` | Bounties. The issuer's live list loads; the first bounty is auto-selected and watched. `↑`/`↓` move the selection. |
-| 3 | `⌘N` | "New DList + bounty" form opens (the house issuer is the active account at launch), caret in the first field. |
+| 3 | `⌘N` | "New DList + bounty" form opens (the rail ring must sit on the house issuer — click its avatar or `⌘[`/`⌘]`), caret in the first field. |
 | 4 | type, `Enter` after each field | Singular → plural → description → criteria → reward (prefilled 100) → cap (prefilled 400) → min rank (prefilled 2). `Enter` on the last field publishes the kind-39998 list through the instance, then creates the auto-pay bounty with the session login. |
 | 5 | watch | Activity logs "Published list …" then "Bounty … created — watching for claims". The new bounty is selected; the top-bar pill reads **Auto-pay armed** because the bounty really has autoPay. |
 | 6 | `⌘]` | Switch to the claimant (Matthias). The rail ring moves; the sidebar shows his real npub and kind-0 name. **Trap:** while a text field has focus, `⌘[`/`⌘]` indent instead of switching accounts — submit or cancel the form first (both return focus to the shell), or press `⌘2` to park focus. |
@@ -69,18 +75,19 @@ money move.
 
 - `esc` inside a field cancels the form only when the field has nothing of its
   own to do with it; `⌘.` cancels from anywhere, always.
-- `⌘]` into an account with no key opens the sidebar's paste-a-key input with
-  the caret in it — and while that input has focus, `⌘[`/`⌘]` indent instead of
-  switching accounts. `esc` closes the input and hands focus back.
-- On the onboarding screen, `esc` is "just look around" (read-only dashboard).
-- The ISSUER key slot is operator-only: importing a key there changes whose
-  bounties the app lists (a claimant who pastes their own nsec as issuer sees
-  an empty list). Claiming never needs an issuer key — the app reads the house
-  issuer's bounties without one, and the issuer input says so in amber.
-- `⌘N` (or the claim/new-bounty button) with no key for the active account
-  opens the sidebar key input instead of a form.
-- "Forget this key" (under the account name in the sidebar) deletes the
-  keychain entry only. A key set through the env vars survives it — env wins.
+- `⌘[` / `⌘]` cycle through the accounts in the rail and do nothing with
+  fewer than two. The "+" at the end of the rail adds one (paste or create).
+- On the account screen, `esc` is "just look around" on first launch and
+  Cancel when it was opened from "+".
+- The issuer is fixed to the house key (or `MC_ISSUER_NPUB`): adding any other
+  key never changes whose bounties the app lists, and only the account holding
+  the issuer key gets the bounty form. Claiming never needs the issuer key.
+- `⌘N` (or the claim/new-bounty button) with no account opens the account
+  screen instead of a form.
+- "Remove this account" (under the account name in the sidebar) takes two
+  clicks — the first arms it, "Click again to remove" — and deletes the nsec
+  AND its Coinos login from the accounts file. Copy the password first if the
+  wallet holds sats. A key in `MC_NSECS` comes back on the next launch.
 - Selecting an old bounty replays its historical payment facts into the
   activity feed once, with their real (old) timestamps. That is the watch
   reporting each fact exactly once, not a bug.
