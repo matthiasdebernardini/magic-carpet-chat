@@ -1,5 +1,6 @@
 //! Secret storage: every account's nsec and Coinos login in ONE file,
-//! `~/Library/Application Support/magic-carpet-chat/accounts.json`, mode 0600,
+//! `~/Library/Application Support/magic-carpet-chat/accounts.json` (Linux:
+//! `~/.config/magic-carpet-chat/accounts.json`), mode 0600,
 //! written atomically. Not the keychain: every unsigned build is a new app to
 //! macOS, which re-prompts for the login password on each launch, and a plain
 //! file survives app updates for every build the same way.
@@ -118,9 +119,16 @@ fn store_dir() -> Result<PathBuf, SecretError> {
             return Ok(PathBuf::from(dir));
         }
     }
+    // Linux: $XDG_CONFIG_HOME, else ~/.config. Everything else keeps the
+    // macOS layout the app shipped with.
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir).join(APP_DIR));
+    }
     let home = std::env::home_dir()
         .ok_or_else(|| SecretError::Store("no home directory".into()))?;
-    Ok(home.join("Library/Application Support").join(APP_DIR))
+    let base = if cfg!(target_os = "linux") { ".config" } else { "Library/Application Support" };
+    Ok(home.join(base).join(APP_DIR))
 }
 
 pub fn store_path() -> Result<PathBuf, SecretError> {
