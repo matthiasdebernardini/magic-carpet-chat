@@ -60,7 +60,7 @@ jobs:
       - name: Zip the app with the first-open instructions
         run: |
           ditto -c -k --keepParent "dist/Magic Carpet Chat.app" "$ZIP"
-          (cd dist && zip -X "$(basename "$ZIP")" "READ ME FIRST.txt")
+          zip -j "$ZIP" "dist/READ ME FIRST.txt"
           unzip -l "$ZIP"
 
       - uses: actions/upload-artifact@v4
