@@ -21,6 +21,33 @@ mod timefmt;
 mod wallet;
 
 fn main() {
+    // ring before any TLS client exists: sentry's reqwest transport is built
+    // at init, which is before spawn_runtime() installs the same provider.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    // MC_SENTRY_DSN turns on crash and error reporting; unset means off. The
+    // guard lives for the whole of main. The transport sends each event as it
+    // arrives and panics flush themselves; the drop only matters for the ping,
+    // because Cmd+Q exits inside app.run and never returns here.
+    let sentry_dsn = std::env::var("MC_SENTRY_DSN").unwrap_or_default();
+    let sentry_guard = (!sentry_dsn.is_empty()).then(|| {
+        // ClientOptions is non_exhaustive in 0.49, so no struct expression.
+        let mut options = sentry::ClientOptions::default();
+        options.release = sentry::release_name!();
+        sentry::init((sentry_dsn.as_str(), options))
+    });
+
+    // `--sentry-ping`: send one test event, print its id, and exit.
+    if std::env::args().any(|arg| arg == "--sentry-ping") {
+        let Some(guard) = sentry_guard else {
+            eprintln!("MC_SENTRY_DSN is not set");
+            std::process::exit(1);
+        };
+        let id = sentry::capture_message("magic-carpet-chat sentry ping", sentry::Level::Info);
+        drop(guard);
+        println!("{id}");
+        return;
+    }
+
     // `--import-keys`: read MC_NSECS (comma-separated), add them to the
     // accounts file, print ONLY the derived npubs, and exit. The secrets
     // themselves never touch stdout — `Secret` redacts, and only bech32

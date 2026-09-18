@@ -15,7 +15,7 @@ use magic_carpet_chat::api::{Bounty, Claim};
 
 use crate::dashboard::{MONO, count_badge};
 use crate::palette::*;
-use crate::shell::{BOUNTY_FIELD_DEFS, Load, Shell, short_id};
+use crate::shell::{BOUNTY_FIELD_DEFS, Load, RANK_NOTE, Shell, short_id};
 use crate::timefmt;
 
 /// The human end of a list coordinate: `39998:<pk>:us-city` → `us-city`.
@@ -452,7 +452,10 @@ fn detail_pane(shell: &Shell) -> AnyElement {
                 .py(px(8.))
                 .text_size(px(12.))
                 .text_color(rgb(TEXT_DIM))
-                .child("No claims yet.")
+                .child(
+                    "No claims yet. Claims from keys the issuer's web of trust ranks \
+                     below 2 stay on the relay but are not listed here.",
+                )
                 .into_any_element(),
         ],
         Some(detail) => detail.claims.iter().map(claim_card).collect(),
@@ -630,15 +633,31 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
     if let Some(form) = &shell.claim_form {
         let dtag = coordinate_dtag(&form.coordinate).to_string();
         // Several bounties can share a list, so name the reward too.
-        let reward = shell
+        let bounty = shell
             .selected_bounty()
-            .filter(|b| b.id == form.bounty_id)
+            .filter(|b| b.id == form.bounty_id);
+        let reward = bounty
             .map(|b| format!(" · {} sats per item", timefmt::fmt_sats(b.amount_sats)))
             .unwrap_or_default();
-        let rows = vec![labeled_input(
-            "Item name",
-            Input::new(&form.name).into_any_element(),
-        )];
+        // Say up front how the payout works and why a new key's claim may
+        // not show: the toast after publishing is too brief to carry it.
+        // The auto-pay rank and the listing rank in RANK_NOTE are different
+        // thresholds; keep the payout sentence rank-free so they never read
+        // as a contradiction.
+        let payout = bounty
+            .map(|b| {
+                let sats = timefmt::fmt_sats(b.amount_sats);
+                if b.auto_pay_on() {
+                    format!("Auto-pay: {sats} sats within about a minute. ")
+                } else {
+                    format!("Manual pay: the issuer reviews the claim and sends {sats} sats by hand. ")
+                }
+            })
+            .unwrap_or_default();
+        let rows = vec![
+            labeled_input("Item name", Input::new(&form.name).into_any_element()),
+            hint(format!("{payout}{RANK_NOTE}")).into_any_element(),
+        ];
         return Some(form_card(
             format!("Claim an item on {dtag}{reward}"),
             rows,

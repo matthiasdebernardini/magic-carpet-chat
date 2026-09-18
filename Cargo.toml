@@ -1,6 +1,6 @@
 [package]
 name = "magic-carpet-chat"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 publish = false
 
@@ -32,6 +32,15 @@ reqwest = { version = "0.12", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
+] }
+# Crash and error reporting to any Sentry-protocol receiver, on only when
+# MC_SENTRY_DSN is set (src/main.rs).
+sentry = { version = "0.49", default-features = false, features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "reqwest",
+    "rustls",
 ] }
 lightning-invoice = { version = "0.34", features = ["std"] }
 thiserror = "2"

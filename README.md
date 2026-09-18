@@ -16,15 +16,17 @@ Anthropic Messages API.
 
 ## Build and run
 
-Homebrew's `cargo` shadows rustup on this Mac. Use the rustup one:
+Everything that compiles goes through [mbx](https://mr-boxington.jdx.dev), the
+machine-wide Cargo build cache; `target` is a symlink into it. The toolchain is
+pinned in `rust-toolchain.toml`.
 
 ```sh
-export ANTHROPIC_API_KEY=sk-ant-…
-/Users/md/.cargo/bin/cargo build
-/Users/md/.cargo/bin/cargo run
+mbx build
+mbx run
 ```
 
-Without the key the app still opens and says what to set.
+The Chat pane reads an Anthropic key from `~/.config/anthropic/key` or
+`ANTHROPIC_API_KEY`. Without one the pane still opens and says what to set.
 
 ## Dependencies
 
@@ -55,6 +57,10 @@ Coinos refuses outright, so a signup that times out on the way back is never
 lost. "Copy username" and "Copy password" on the panel are the only way the
 password leaves the file.
 
+`MC_SENTRY_DSN` turns on crash and error reporting to any Sentry-protocol
+receiver (unset means off). `magic-carpet-chat --sentry-ping` sends one test
+event to that DSN and prints its id.
+
 ## End-to-end check
 
 `tests/e2e.rs` proves two brand-new keys can open wallets and pay each other
@@ -80,24 +86,15 @@ Without it the test prints A's address and waits for a phone wallet
 
 ## What is here
 
-`src/main.rs`, about 400 lines.
+Two halves. `src/lib.rs` is the protocol layer, free of gpui so it runs on its
+own tokio thread and tests offline: `api` (the instance REST API), `nostr` (the
+runtime, relays, signing, the bounty watcher), `events` (event kinds and
+dtags), `coinos` (wallet signup and payments), `secrets` (accounts.json and the
+`Secret` type). `src/main.rs` is the window: `shell` owns all state and paints
+the screens (`dashboard`, `bounties`, `wallet`, `chat`, `account_setup`), with
+`palette`, `icons` and `timefmt` as helpers. The Chat pane streams Claude from
+the Anthropic Messages API on the window's own executor; every other network
+call crosses to the tokio thread as a Command and comes back as an Update.
 
-- Model — `MODEL` at the top of `main.rs`, `claude-sonnet-5`.
-- Network — `reqwest_client::ReqwestClient` installed with `cx.set_http_client`,
-  so `cx.http_client()` can POST. It runs its own tokio runtime; the UI thread
-  only polls the socket, it never blocks on it.
-- Streaming — one `POST /v1/messages` with `stream: true`. A foreground
-  `cx.spawn` reads the Server-Sent Events line by line and pushes each
-  `text_delta` into the pending bubble. The whole transcript goes with every
-  request.
-- Failures — a missing key, an HTTP error, or a broken stream all land in the
-  pending bubble as plain English. Nothing panics and the key is never logged.
-
-- `TitleBar` — drawn by the app, so the window stays on the dark theme instead of
-  the system appearance.
-- Transcript — a `track_scroll` + `overflow_y_scroll` area with gpui-component's
-  overlay scrollbar. The app owns the `ScrollHandle`, so a new message can call
-  `scroll_to_bottom()`.
-- Assistant bubbles — `TextView::markdown`, selectable.
-- Composer — `TextareaState` with `auto_grow(1, 6)` and `submit_on_enter(true)`.
-  Enter sends, Shift+Enter makes a line.
+The full map, structure by structure, is `docs/SYSTEM.md` and the interactive
+`docs/atlas.html`; see `docs/README.md`.

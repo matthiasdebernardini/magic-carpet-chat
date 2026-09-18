@@ -284,6 +284,62 @@ pub(crate) fn short_id(id: &str) -> String {
     id.chars().take(8).collect::<String>() + "…"
 }
 
+/// The instance hides claims from keys it ranks below 2, so a new key's claim
+/// is on the relay but invisible in the list. Shown in the claim form and in
+/// the published-claim details.
+pub(crate) const RANK_NOTE: &str = "This instance only lists claims from keys the \
+    issuer's web of trust ranks 2 or higher. A new key has no rank yet, so \
+    your claim can be on the relay and still not show here.";
+
+/// The toast for a just-published claim: one short line, and the full text
+/// behind a click when there is more to say.
+struct ClaimNotice {
+    title: &'static str,
+    short: String,
+    full: Option<String>,
+}
+
+/// `payout` is `(auto_pay, min_rank, amount_sats)` of the claimed bounty, or
+/// `None` when no list we hold has it.
+fn claim_notice(payout: Option<(bool, u64, u64)>) -> ClaimNotice {
+    match payout {
+        Some((true, min_rank, sats)) => {
+            let sats = timefmt::fmt_sats(sats);
+            ClaimNotice {
+                title: "Claim published — auto-pay bounty",
+                short: format!(
+                    "With rank {min_rank} or higher, {sats} sats arrive within about a \
+                     minute. Click for details."
+                ),
+                full: Some(format!(
+                    "With rank {min_rank} or higher, {sats} sats arrive at your Lightning \
+                     address within about a minute. Below that, the issuer reviews the \
+                     claim by hand. {RANK_NOTE}"
+                )),
+            }
+        }
+        Some((false, _, sats)) => {
+            let sats = timefmt::fmt_sats(sats);
+            ClaimNotice {
+                title: "Claim published — manual-pay bounty",
+                short: format!(
+                    "The issuer reviews your claim and pays {sats} sats by hand. Click for \
+                     details."
+                ),
+                full: Some(format!(
+                    "This bounty does not auto-pay: the issuer reviews your claim and \
+                     sends the {sats} sats by hand. {RANK_NOTE}"
+                )),
+            }
+        }
+        None => ClaimNotice {
+            title: "Claim published",
+            short: "The issuer's relay has it.".to_string(),
+            full: None,
+        },
+    }
+}
+
 /// One row of "Recent activity", written the moment its update arrives.
 pub(crate) struct ActivityItem {
     pub dot: u32,
@@ -887,39 +943,25 @@ impl Shell {
                 self.claim_form = None;
                 self.focus.focus(window, cx);
                 // Say how this bounty pays: the claim card alone reads as
-                // "nothing happened" when the payout is manual or gated.
-                // The instance hides claims from keys it ranks below 2, so a
-                // new key's claim is on the relay but invisible in this list.
-                const RANK_NOTE: &str = "This instance only lists claims from keys the \
-                    issuer's web of trust ranks 2 or higher. A new key has no rank yet, so \
-                    your claim can be on the relay and still not show here.";
-                let (title, message) = match self.bounty(&bounty_id) {
-                    Some(b) if b.auto_pay_on() => (
-                        "Claim published — auto-pay bounty",
-                        format!(
-                            "With rank {} or higher, {} sats arrive at your Lightning \
-                             address within about a minute. Below that, the issuer reviews \
-                             the claim by hand.",
-                            b.auto_pay_min_rank.unwrap_or(0),
-                            timefmt::fmt_sats(b.amount_sats)
-                        ),
-                    ),
-                    Some(b) => (
-                        "Claim published — manual-pay bounty",
-                        format!(
-                            "This bounty does not auto-pay: the issuer reviews your claim \
-                             and sends the {} sats by hand.",
-                            timefmt::fmt_sats(b.amount_sats)
-                        ),
-                    ),
-                    None => ("Claim published", "The issuer's relay has it.".to_string()),
-                };
-                window.push_notification(
-                    Notification::info(format!("{message} {RANK_NOTE}"))
-                        .title(title)
-                        .autohide(false),
-                    cx,
+                // "nothing happened" when the payout is manual or gated. The
+                // toast stays one line and autohides; the full text is an
+                // alert dialog behind a click, so it never covers the card.
+                let notice = claim_notice(
+                    self.bounty(&bounty_id)
+                        .map(|b| (b.auto_pay_on(), b.auto_pay_min_rank.unwrap_or(0), b.amount_sats)),
                 );
+                let mut toast = Notification::info(notice.short).title(notice.title);
+                if let Some(full) = notice.full {
+                    let title = SharedString::from(notice.title);
+                    let full = SharedString::from(full);
+                    toast = toast.on_click(move |_, window, cx| {
+                        let (title, full) = (title.clone(), full.clone());
+                        window.open_alert_dialog(cx, move |alert, _, _| {
+                            alert.title(title.clone()).description(full.clone())
+                        });
+                    });
+                }
+                window.push_notification(toast, cx);
                 // Watch the bounty the claim went to — the form snapshots it
                 // at open, so this is right even if selection moved meanwhile.
                 let _ = self
@@ -969,6 +1011,7 @@ impl Shell {
                 );
             }
             Update::Error { source, message } => {
+                sentry::capture_message(&format!("{source:?}: {message}"), sentry::Level::Error);
                 // An error fails a form only when it came from that form's own
                 // command — everything else (watch polls, account refreshes)
                 // is feed-only noise as far as the forms are concerned.
@@ -2369,7 +2412,24 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_active, relay_address_gap};
+    use super::{RANK_NOTE, claim_notice, pick_active, relay_address_gap};
+
+    #[test]
+    fn an_auto_pay_claim_gets_a_short_toast_and_the_rank_note_behind_a_click() {
+        let notice = claim_notice(Some((true, 2, 21_000)));
+        assert_eq!(notice.title, "Claim published — auto-pay bounty");
+        assert_eq!(
+            notice.short,
+            "With rank 2 or higher, 21,000 sats arrive within about a minute. Click for details."
+        );
+        let full = notice.full.expect("auto-pay has details");
+        assert!(full.contains(RANK_NOTE), "the rank note moved out of the toast");
+        assert!(!notice.short.contains(RANK_NOTE));
+        // Nothing to expand when the bounty is unknown.
+        assert!(claim_notice(None).full.is_none());
+        let manual = claim_notice(Some((false, 0, 500)));
+        assert!(manual.full.expect("manual pay has details").contains("by hand"));
+    }
 
     #[test]
     fn a_stored_wallet_shows_retry_until_the_relays_carry_its_address() {
