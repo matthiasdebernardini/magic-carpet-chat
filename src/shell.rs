@@ -24,6 +24,7 @@ use magic_carpet_chat::coinos;
 use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated};
 use magic_carpet_chat::secrets::{self, Secret};
 
+use crate::account::{self, AccountPage, Tab};
 use crate::account_setup::{self, AccountSetup, Path as SetupPath, ReadySummary};
 use crate::bounties;
 use crate::chat::Chat;
@@ -31,6 +32,7 @@ use crate::dashboard::{self, MONO, avatar};
 use crate::icons::icon;
 use crate::palette::*;
 use crate::timefmt;
+use crate::trust_state::TrustState;
 use crate::wallet::{self, PendingSent, SendInputs, SendState, WalletState};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -47,6 +49,10 @@ pub enum Screen {
     Tags,
     Chat,
     Accounts,
+    /// One stored account's page: header, five tabs, real Trust data. Not in
+    /// the nav — reached from the dashboard's Fix rows, Accounts › Manage,
+    /// and the sidebar's account chip.
+    Account,
     Settings,
 }
 
@@ -63,6 +69,7 @@ impl Screen {
             Screen::Tags => "Tags",
             Screen::Chat => "Chat",
             Screen::Accounts => "Accounts",
+            Screen::Account => "Account",
             Screen::Settings => "Settings",
         }
     }
@@ -79,6 +86,7 @@ impl Screen {
             Screen::Tags => "tags",
             Screen::Chat => "chat",
             Screen::Accounts => "accounts",
+            Screen::Account => "accounts",
             Screen::Settings => "settings",
         }
     }
@@ -247,7 +255,7 @@ pub(crate) fn relay_address_gap(relay_lud16: Option<&str>, wallet_address: &str)
 
 /// The two hue pairs from the mock, alternated down the rail by position.
 pub(crate) fn account_hue(ix: usize) -> (u32, u32) {
-    if ix % 2 == 0 {
+    if ix.is_multiple_of(2) {
         (HUE_AK_FROM, HUE_AK_TO)
     } else {
         (HUE_BO_FROM, HUE_BO_TO)
@@ -445,6 +453,14 @@ pub struct Shell {
     confirm_remove: Option<String>,
     /// The Wallet screen's recipient and amount; cleared on an account switch.
     send_inputs: SendInputs,
+    /// Per-account NIP-85 state (Treasure Map, assertions, follows), keyed by
+    /// pubkey. Each entry carries the fetch generation it answers to.
+    pub(crate) trust: HashMap<String, TrustState>,
+    /// The Account page's own state — which account, which tab — while
+    /// `screen` is `Screen::Account`.
+    pub(crate) account_page: Option<AccountPage>,
+    /// Kept alive so re-activating the window can re-fetch a stale Trust tab.
+    _activation: Subscription,
 }
 
 impl Shell {
@@ -493,6 +509,30 @@ impl Shell {
         let setup = AccountSetup::new(true, window, cx);
         let send_inputs = SendInputs::new(window, cx);
 
+        // Coming back to the window re-reads the Trust tab on screen — but
+        // only when its last read is more than 30 s old.
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                return;
+            }
+            let Some(pubkey) = this.account_page.as_ref().map(|page| page.pubkey.clone())
+            else {
+                return;
+            };
+            let stale = this
+                .trust
+                .get(&pubkey)
+                .map(|state| {
+                    state.requested_at == 0
+                        || timefmt::now_unix().saturating_sub(state.requested_at) > 30
+                })
+                .unwrap_or(true);
+            if stale {
+                this.fetch_trust(&pubkey);
+                cx.notify();
+            }
+        });
+
         Self {
             screen: Screen::Dashboard,
             views: Vec::new(),
@@ -522,6 +562,9 @@ impl Shell {
             balance_poll: None,
             confirm_remove: None,
             send_inputs,
+            trust: HashMap::new(),
+            account_page: None,
+            _activation: activation,
         }
     }
 
@@ -611,6 +654,10 @@ impl Shell {
         let now = timefmt::now_unix();
         // A removal armed a moment ago is about a screen that just changed.
         self.confirm_remove = None;
+        // The "copied" tick lives until the next update lands.
+        if let Some(page) = &mut self.account_page {
+            page.copied = None;
+        }
         match update {
             Update::RelayStatus(connected) => {
                 self.relay_connected = connected;
@@ -663,6 +710,10 @@ impl Shell {
                 }
                 let first_load = !self.first_screen_decided;
                 self.first_screen_decided = true;
+                // Trust state follows the account set: removed accounts lose
+                // their entries, and everyone gets a fresh read.
+                self.trust.retain(|p, _| pubkeys.contains(p));
+                self.fetch_trust_all();
                 // No account: first launch, or the last one was just removed.
                 // Not a ⌘R while already browsing read-only — that would
                 // bounce the person back to the account screen they left.
@@ -712,6 +763,8 @@ impl Shell {
                     self.views
                         .push((pubkey.clone(), AccountView::new(pubkey.clone(), npub.clone())));
                 }
+                // A new account's trust read starts the moment it lands.
+                self.fetch_trust(&pubkey);
                 // Read-only mode ends with the first account.
                 if self.active.is_none() {
                     self.active = Some(pubkey.clone());
@@ -1039,6 +1092,20 @@ impl Shell {
                 }
                 self.push_activity(RED, message, now);
             }
+            Update::Trust {
+                pubkey,
+                generation,
+                part,
+            } => {
+                // Stale generations and updates for accounts no longer in
+                // the store are dropped, never folded in.
+                if self.view(&pubkey).is_some()
+                    && let Some(state) = self.trust.get_mut(&pubkey)
+                    && state.accepts(generation)
+                {
+                    state.apply(part, now);
+                }
+            }
         }
         self.finish_apply(cx);
     }
@@ -1065,7 +1132,7 @@ impl Shell {
 
     /// Switches the main pane. The chat takes the caret with it, so a click on
     /// "Chat" leaves the window typeable.
-    fn go(&mut self, screen: Screen, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn go(&mut self, screen: Screen, window: &mut Window, cx: &mut Context<Self>) {
         self.screen = screen;
         self.confirm_remove = None;
         if screen == Screen::Chat {
@@ -1077,7 +1144,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn set_account(&mut self, pubkey: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_account(&mut self, pubkey: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.view(pubkey).is_none() {
             return;
         }
@@ -1110,6 +1177,64 @@ impl Shell {
         let next = (current + step).rem_euclid(count as isize) as usize;
         let pubkey = self.views[next].0.clone();
         self.set_account(&pubkey, window, cx);
+    }
+
+    // -------------------------------------------------------- trust reads
+
+    /// Begin a fresh trust read for one account: bump its generation, mark
+    /// every part pending (the prior answers stay for rendering), and queue
+    /// the runtime command.
+    pub(crate) fn fetch_trust(&mut self, pubkey: &str) {
+        if self.view(pubkey).is_none() {
+            return;
+        }
+        let generation = self
+            .trust
+            .get(pubkey)
+            .map(|state| state.generation + 1)
+            .unwrap_or(1);
+        let entry = self.trust.entry(pubkey.to_string()).or_default();
+        entry.begin(generation, timefmt::now_unix());
+        let _ = self.commands.unbounded_send(Command::FetchTrust {
+            pubkey: pubkey.to_string(),
+            generation,
+        });
+    }
+
+    /// First load / ⌘R: re-read every stored account's trust state.
+    fn fetch_trust_all(&mut self) {
+        let pubkeys: Vec<String> = self.views.iter().map(|(p, _)| p.clone()).collect();
+        for pubkey in pubkeys {
+            self.fetch_trust(&pubkey);
+        }
+    }
+
+    /// The Account page for `pubkey` on `tab` — the destination of the
+    /// dashboard's Fix rows, Accounts › Manage, and the sidebar chip. A page
+    /// whose read has never run (or ran >30 s ago) kicks one off.
+    pub(crate) fn open_account(
+        &mut self,
+        pubkey: &str,
+        tab: Tab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.view(pubkey).is_none() {
+            return;
+        }
+        let stale = self
+            .trust
+            .get(pubkey)
+            .map(|state| {
+                state.requested_at == 0
+                    || timefmt::now_unix().saturating_sub(state.requested_at) > 30
+            })
+            .unwrap_or(true);
+        if stale {
+            self.fetch_trust(pubkey);
+        }
+        self.account_page = Some(AccountPage::new(pubkey, tab));
+        self.go(Screen::Account, window, cx);
     }
 
     // ------------------------------------------------------ account screen
@@ -1849,7 +1974,11 @@ impl Shell {
                     ),
             )
             .child(
-                rail_button(Screen::Accounts, self.screen == Screen::Accounts).on_click(
+                rail_button(
+                    Screen::Accounts,
+                    matches!(self.screen, Screen::Accounts | Screen::Account),
+                )
+                .on_click(
                     cx.listener(|this, _, window, cx| this.go(Screen::Accounts, window, cx)),
                 ),
             )
@@ -2015,7 +2144,7 @@ impl Shell {
                                         div()
                                             .text_size(px(13.5))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child(SharedString::from(name)),
+                                            .child(name),
                                     )
                                     .child(
                                         div()
@@ -2064,10 +2193,26 @@ impl Shell {
                                         )
                                     }),
                             )
-                            .child(div().text_color(rgb(TEXT_DIM)).child("›"))
-                            // The chevron means "next account", like ⌘].
+                            .child(
+                                // The chevron alone keeps its "next account"
+                                // step, like ⌘] — the rest of the chip opens
+                                // the account's Trust tab.
+                                div()
+                                    .id("account-step")
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child("›")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.step_account(1, window, cx);
+                                    })),
+                            )
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.step_account(1, window, cx);
+                                match this.active.clone() {
+                                    Some(active) => {
+                                        this.open_account(&active, Tab::Trust, window, cx)
+                                    }
+                                    None => this.go(Screen::Accounts, window, cx),
+                                }
                             })),
                     ),
             )
@@ -2299,6 +2444,27 @@ impl Shell {
                     )
                     .into_any_element()
             }
+            // Accounts and Account scroll as one page, like the Dashboard.
+            Screen::Accounts | Screen::Account => div()
+                .id("accounts")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(900.))
+                        .mx_auto()
+                        .px(px(28.))
+                        .pt(px(26.))
+                        .pb(px(60.))
+                        .child(if self.screen == Screen::Accounts {
+                            account::render_accounts(self, cx)
+                        } else {
+                            account::render_account(self, cx)
+                        }),
+                )
+                .into_any_element(),
             other => Self::placeholder(other).into_any_element(),
         }
     }

@@ -2,11 +2,11 @@
 
 _**This file is the living source of truth for the map.** The interactive atlas is built from the same data. It describes commit 3bf9877; the working tree holds an uncommitted refactor (see NA)._
 
-_Question status: **54 open · 2 routed · 3 resolved**._
+_Question status: **53 open · 2 routed · 4 resolved**._
 
 ## One paragraph
 
-Magic Carpet Chat is a macOS desktop app, one window on gpui-kit, for a Nostr bounty instance. An issuer publishes a DList (kind 39998) and a bounty; a claimant claims an item (kind 39999); the instance's own auto-pay watcher pays sats and a zap receipt (kind 9735) proves it. The app never pays: it signs events, posts them through one REST door, polls the instance, and shows the money move. Nostr, instance and Coinos traffic runs on a second thread with its own tokio runtime; the window only exchanges Command and Update messages with it. The Chat pane is the exception: it streams Claude replies from the Anthropic API on the window's own executor. Keys live in the macOS keychain. A claimant with no Lightning address can open a Coinos wallet in one click. A worker in the repo does the chat job on a separate tailnet box, and nothing wires the two together. Six of eleven screens are placeholders.
+Magic Carpet Chat is a macOS desktop app, one window on gpui-kit, for a Nostr bounty instance. An issuer publishes a DList (kind 39998) and a bounty; a claimant claims an item (kind 39999); the instance's own auto-pay watcher pays sats and a zap receipt (kind 9735) proves it. The app never pays: it signs events, posts them through one REST door, polls the instance, and shows the money move. Nostr, instance and Coinos traffic runs on a second thread with its own tokio runtime; the window only exchanges Command and Update messages with it. The Chat pane is the exception: it streams Claude replies from the Anthropic API on the window's own executor. Keys live in the macOS keychain. A claimant with no Lightning address can open a Coinos wallet in one click. A worker in the repo does the chat job on a separate tailnet box, and nothing wires the two together. Five of twelve screens are placeholders.
 
 ## Decisions locked
 
@@ -42,7 +42,7 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 8. **A wallet for the key** — A generated key has no Lightning address, so its claims fail at payment; one click opens a Coinos wallet bound to the key. _(adds WA, CO, CX)_
 9. **Telling the payers the address** — Still inside the wallet command, the new address is merged into the key's existing kind-0 profile, only lud16 changed, and published to the instance and then three public relays. _(adds PR)_
 10. **Chat, two ways** — The cmd-8 pane streams Claude straight from Anthropic with the owner's key; a worker in the repo does the same job on a separate tailnet box, and nothing connects them. _(adds CP, AN, CC)_
-11. **Under the floor, and what is moving** — One UI dependency, a copied palette, an unsigned bundle; six placeholder screens; and an uncommitted refactor that changes the key store. _(adds PK, UB, NA)_
+11. **Under the floor, and what is moving** — One UI dependency, a copied palette, an unsigned bundle; five placeholder screens; and an uncommitted refactor that changes the key store. _(adds PK, UB, NA)_
 12. **The whole system** — Everything at once: pick a flow bottom left, hover to read, click to pin, arrow right to go inside.
 
 ## Structures
@@ -135,6 +135,21 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 
 - **Q-NR1** While a text field has focus, cmd-[ and cmd-] indent instead of switching accounts; the binding is gpui-kit's (shell.rs:864-866). Rebind, or document only?
 - **Q-NR2** The top-bar search field reads "Search lists, bounties, profiles…" and has no handler (shell.rs:456-458, 1904). Hide it until built?
+
+#### AC · Accounts and Account screens
+
+**In one line.** The rail's Accounts button lists every stored account; each card's Manage opens one account's page: header plus five tabs, of which Trust is the one with real data.
+
+**What it does.** Accounts renders one card per account in store order — avatar, name, short npub, "active" pill, balance, Switch and Manage. The Account page shows the account it was opened for (not necessarily the active one): "← All accounts", avatar, name, short npub, "View profile" to brainstorm.world, "Switch to this account" when inactive. Tabs: Identity & keys, Trust, Progress, Wallet, Limits & defaults — the four others say "Not built yet." The Trust tab is five cards: Treasure Map (kind-10040 verdict, relays that returned it, rank row, raw event), Trusted Assertions (kind-30382 from the account's provider and the instance issuer's, in two labelled groups), Minimum rank (INSTANCE_MIN_RANK, read-only), Trust Determination (owner PoV, read-only), Web of trust (follows and verified followers).
+
+**How it's built.** `src/account.rs` renders both screens from `shell.views()` plus `shell.trust`, the per-pubkey `TrustState` map in `src/trust_state.rs`. `Shell::open_account(pubkey, tab)` sets `account_page` and goes to `Screen::Account`; entry points are the dashboard's Fix rows, Accounts › Manage, and the sidebar account chip (its chevron alone still steps accounts, via stop_propagation). Raw-event toggles and the "copied" tick live on `AccountPage`. Every event the tab shows was signature-verified in `trust.rs`; a failed read says so and keeps the prior answer instead of reading as absence.
+
+**Steps in execution.**
+
+1. **Open** — Dashboard "Fix →", Accounts › Manage, or the sidebar chip: open_account(pubkey, Trust).
+2. **Fetch** — A stale or never-run read kicks Command::FetchTrust; TrustState::begin bumps the generation and marks parts Loading.
+3. **Render** — Five cards; each part renders its verdict, a failure note, or "Checking…".
+4. **Tabs** — The other four tabs render "Not built yet."
 
 #### WA · Wallet screen
 
@@ -440,6 +455,19 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 - **Q-PR2** Instance and public relays are written in sequence; a public failure leaves them disagreeing until Retry.
 - **Q-PR3** The source disagrees with itself about which one the prod payer reads: nostr.rs:30-34 says the public relays, nostr.rs:667 says the instance. Which is true?
 
+#### BS · Brainstorm (brainstorm.world)
+
+**In one line.** The service that owns trust: the setup API at api.brainstorm.world, the scores relay at wss://scores.brainstorm.world, and the profile pages the Account screen links to.
+
+**What it does.** GET https://api.brainstorm.world/setup/{hex} answers a JSON array of [type, key, relay] triples — the account's current Brainstorm keys, one per score type. wss://scores.brainstorm.world holds kind-30382 Trusted Assertions, addressable by the subject pubkey in the d tag. The app reads both; it never writes to either.
+
+**How it's built.** `fetch_brainstorm_key` (`nostr.rs:1405-1435`) builds its own reqwest client (USER_AGENT, 10 s); `trust::parse_setup` takes the `30382:rank` triple as the rank provider: Assigned { key, relay }. HTTP 404 means the account has never set up at Brainstorm → NoAccount; any other non-2xx or an unparseable body is Err, so a broken endpoint reads as "couldn't check", never as "no account". Kind-30382 reads go to whichever relay the winning Treasure Map row names for its provider, queried with `Filter kind 30382 .identifier(subject)`; the fetched event must be authored by the provider and carry a rank, and the signature is verified.
+
+**Steps in execution.**
+
+1. **Setup** — GET api.brainstorm.world/setup/{hex}: the [type, key, relay] triple whose type is 30382:rank is the provider; 404 is NoAccount.
+2. **Assertion** — kind 30382 on the provider relay, #d = subject, authored by the provider.
+
 ### Keys and wallet
 
 #### KS · Key store
@@ -574,20 +602,20 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 
 #### UB · Unbuilt screens _(not switched on)_
 
-**In one line.** Payments, Claimants, Leaderboards, Tags, Accounts and Settings render "This screen is not built yet." The search field looks live and is not.
+**In one line.** Payments, Claimants, Leaderboards, Tags and Settings render "This screen is not built yet." The search field looks live and is not; so do four of the Account page's five tabs.
 
-**What it does.** Six of the eleven Screen variants are placeholders. cmd-3, 4, 5 and 7 reach four of them; Accounts and Settings are rail buttons with no shortcut. They exist so the nav matches the design mock.
+**What it does.** Five of the twelve Screen variants are placeholders. cmd-3, 4, 5 and 7 reach four of them; Settings is a rail button with no shortcut. Accounts is built (AC), and on the Account page only the Trust tab has real data — Identity & keys, Progress, Wallet and Limits & defaults say "Not built yet." The placeholders exist so the nav matches the design mock.
 
-**How it's built.** `Screen` (`shell.rs:36-49`); `placeholder()` at `shell.rs:1944-1962`; the search InputState at `shell.rs:456-458, 1904`.
+**How it's built.** `Screen` (`shell.rs:36-49`); `placeholder()` at `shell.rs:1944-1962`; the search InputState at `shell.rs:456-458, 1904`; the four tab stubs in `account.rs`.
 
 **Steps in execution.**
 
-1. **Navigate** — cmd-3 Payments, cmd-4 Claimants, cmd-5 Leaderboards, cmd-7 Tags; rail buttons for Accounts and Settings.
+1. **Navigate** — cmd-3 Payments, cmd-4 Claimants, cmd-5 Leaderboards, cmd-7 Tags; rail button for Settings.
 2. **Render** — Label plus the not-built line.
 
 **Questions.**
 
-- **Q-UB1** Do Accounts and Settings stay placeholders for the demo, or does the refactor's account setup take the Accounts slot?
+- ~~**Q-UB1** Do Accounts and Settings stay placeholders for the demo, or does the refactor's account setup take the Accounts slot?~~ ✓ Accounts is built now: account cards plus the per-account page with the Trust tab (src/account.rs, this working tree). Settings is still a placeholder.
 
 #### NA · N-account store (in flight) _(not switched on)_
 
@@ -736,6 +764,22 @@ Payload shapes are illustrative; the ids and the 27 s timing come from the 2026-
 | 10 | SH → OB | ready panel | `{"name":"Matthias","lud16":"m_f_debern@strike.me"}` |
 | 11 | OB → SH | Enter: Start | `{"screen":"Dashboard","account":"Claimant"}` |
 
+### Trust fetch for one account
+
+| # | From → To | Packet | Representative payload |
+|---|---|---|---|
+| 1 | DB → SH | "Fix →" on a trust row | `{"pubkey":"<account>","action":"OpenTrust"}` |
+| 2 | SH → BR | Command::FetchTrust | `{"pubkey":"<account>","generation":"n+1 (begin marks parts Loading)"}` |
+| 3 | BR → RT | dispatch | `{"spawn":"fetch_trust, throwaway client"}` |
+| 4 | RT → PR | kind-10040 and kind-3 per relay | `{"relays":"outbox (kind 10002) ∪ TRUST_FALLBACK_RELAYS","exit":"EOSE or 10 s","verify":"sig, author, tags"}` |
+| 5 | RT → BS | GET api.brainstorm.world/setup/{hex} | `{"body":"[[type, key, relay], …]","rank":"the 30382:rank triple; 404 = NoAccount"}` |
+| 6 | RT → BS | kind 30382 on the provider relay | `{"kinds":[30382],"#d":"<pubkey>","author":"provider from the map row"}` |
+| 7 | RT → BS | kind 30382 for the instance issuer | `{"subject":"issuer_pubkey()","provider":"cached per launch"}` |
+| 8 | RT → BR | Update::Trust ×5 parts | `{"parts":["Designation","Follows","Brainstorm","OwnAssertion","InstanceAssertion"]}` |
+| 9 | BR → SH | apply: drop stale generation | `{"failed":"reread keeps prior answer"}` |
+| 10 | SH → AC | Trust tab cards | `{"cards":["Treasure Map","Trusted Assertions","Minimum rank","Trust Determination","Web of trust"]}` |
+| 11 | SH → DB | attention rows | `{"rows":["Publish your Treasure Map","Follow someone","Gain a follower","Couldn’t check your Treasure Map"]}` |
+
 ## Questions — index
 
 Reference by ID. ✓ resolved (with date) · → routed to a named next step · otherwise open.
@@ -797,7 +841,7 @@ Reference by ID. ✓ resolved (with date) · → routed to a named next step · 
 - **Q-PK1** (PK) make-app.sh says the bundle id must match src/config.rs and a directories crate; neither exists. Which should the id track?
 - **Q-PK2** (PK) README.md still describes a 400-line chat toy with MODEL in main.rs; DEMO.md omits the ~/.config/anthropic/key fallback. Rewrite both?
 - **Q-PK3** (PK) aws-lc-rs compiles in although ring is the provider; reqwest's rustls-tls feature pulls it too, so a gpui-kit feature alone cannot drop it.
-- **Q-UB1** (UB) Do Accounts and Settings stay placeholders for the demo, or does the refactor's account setup take the Accounts slot?
+- ~~**Q-UB1**~~ (UB) ✓ Accounts is built now: account cards plus the per-account page with the Trust tab (src/account.rs, this working tree). Settings is still a placeholder.
 - **Q-NA1** (NA) Which revision should the atlas track once the refactor lands: HEAD, the refactor, or both with a moving marker? → routed: _rebuild after the refactor commit_
 
 ## What the platform gives vs what we own

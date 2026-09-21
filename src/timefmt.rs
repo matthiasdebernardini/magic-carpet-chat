@@ -39,6 +39,27 @@ pub fn relative(now: u64, then: u64) -> String {
     }
 }
 
+/// `"Aug 11, 2026"` — the calendar date beside the relative form, in UTC.
+/// Civil-from-days (Howard Hinnant's algorithm), so no date crate is needed.
+pub fn month_day_year(unix_seconds: u64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = (unix_seconds / 86_400) as i64;
+    // Days since 1970-01-01 → (year, day-of-year), civil calendar.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{} {}, {}", MONTHS[(month - 1) as usize], day, year)
+}
+
 /// `12345` → `"12,345"`. Every sats figure on screen goes through this.
 pub fn fmt_sats(n: u64) -> String {
     let digits = n.to_string();
@@ -78,5 +99,14 @@ mod tests {
         assert_eq!(fmt_sats(100), "100");
         assert_eq!(fmt_sats(5_000), "5,000");
         assert_eq!(fmt_sats(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn calendar_dates_from_unix_days() {
+        assert_eq!(month_day_year(1_786_406_400), "Aug 11, 2026");
+        assert_eq!(month_day_year(0), "Jan 1, 1970");
+        // Leap-day and a year rollover, to pin the civil-from-days math.
+        assert_eq!(month_day_year(1_583_001_600), "Feb 29, 2020");
+        assert_eq!(month_day_year(1_609_459_200), "Jan 1, 2021");
     }
 }

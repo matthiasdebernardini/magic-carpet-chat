@@ -14,3 +14,4 @@ pub mod coinos;
 pub mod events;
 pub mod nostr;
 pub mod secrets;
+pub mod trust;

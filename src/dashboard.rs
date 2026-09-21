@@ -11,9 +11,11 @@ use gpui_kit::component::{h_flex, v_flex};
 use magic_carpet_chat::api;
 use magic_carpet_chat::nostr;
 
+use crate::account::Tab;
 use crate::palette::*;
-use crate::shell::{ActivityItem, Load, Shell};
+use crate::shell::{ActivityItem, Load, Shell, account_hue, display_name, initials};
 use crate::timefmt;
+use crate::trust_state::MapVerdict;
 
 /// The mock's monospace face, used for every sats figure and every npub.
 pub const MONO: &str = "Menlo";
@@ -91,13 +93,65 @@ fn card(
         .child(v_flex().children(rows))
 }
 
-/// A derived "Needs attention" row. `retry` wires the Fix button to a live
-/// refresh; rows whose fix happens outside the app (key import) get none.
+/// What a row's button does. Navigation rows open the account's Trust tab;
+/// retry rows re-run the failed read.
+#[derive(Clone)]
+enum Action {
+    None,
+    /// Re-fetch the bounty list.
+    Refresh,
+    /// Re-run this account's whole trust read.
+    RetryTrust(String),
+    /// Open this account's Account page on the Trust tab.
+    OpenTrust(String),
+}
+
+impl Action {
+    fn label(&self) -> &'static str {
+        match self {
+            Action::Refresh | Action::RetryTrust(_) => "Retry →",
+            Action::OpenTrust(_) | Action::None => "Fix →",
+        }
+    }
+}
+
+/// A derived "Needs attention" row. `avatar` marks the account a row is
+/// about — initials, hue pair, and the name for the title tooltip.
 struct Attention {
     dot: u32,
     title: String,
     description: String,
-    retry: bool,
+    action: Action,
+    avatar: Option<(String, (u32, u32), String, String)>,
+}
+
+impl Attention {
+    fn new(dot: u32, title: String, description: String) -> Self {
+        Self {
+            dot,
+            title,
+            description,
+            action: Action::None,
+            avatar: None,
+        }
+    }
+
+    fn action(mut self, action: Action) -> Self {
+        self.action = action;
+        self
+    }
+
+    /// The account this row is about: initials + hue + name + pubkey (the
+    /// pubkey keys the tooltip element id — display names can collide).
+    fn for_account(mut self, view: &crate::shell::AccountView, ix: usize) -> Self {
+        self.avatar = Some((
+            initials(view),
+            account_hue(ix),
+            display_name(view),
+            view.pubkey.clone(),
+        ));
+        self
+    }
 }
 
 /// The honest to-do list: everything here is read off live state, and an empty
@@ -107,35 +161,103 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
     // Claims are signed with an account's key, so no account means no
     // claiming. The bounty list needs none: it is the house issuer's.
     if shell.active_view().is_none() {
-        rows.push(Attention {
-            dot: TEXT_DIM,
-            title: "Read-only — add an account to claim".into(),
-            description: "Press + in the rail to create an account or paste your \
+        rows.push(Attention::new(
+            TEXT_DIM,
+            "Read-only — add an account to claim".into(),
+            "Press + in the rail to create an account or paste your \
                  nsec. It stays in this Mac's accounts file."
                 .into(),
-            retry: false,
-        });
+        ));
     }
     if !shell.relay_connected {
-        rows.push(Attention {
-            dot: AMBER,
-            title: "Relay disconnected".into(),
-            description: format!("Reconnecting to {}", nostr::relay_url()),
-            retry: false,
-        });
+        rows.push(Attention::new(
+            AMBER,
+            "Relay disconnected".into(),
+            format!("Reconnecting to {}", nostr::relay_url()),
+        ));
     }
     if let Load::Failed(message) = &shell.bounties {
-        rows.push(Attention {
-            dot: RED,
-            title: "Bounty list unavailable".into(),
-            description: message.clone(),
-            retry: true,
-        });
+        rows.push(
+            Attention::new(RED, "Bounty list unavailable".into(), message.clone())
+                .action(Action::Refresh),
+        );
+    }
+    // Then the per-account trust reads, in rail order. A `Loading` part is
+    // not a verdict — its rows appear only when the read has answered.
+    for (ix, view) in shell.views().enumerate() {
+        let Some(state) = shell.trust.get(&view.pubkey) else {
+            continue;
+        };
+        let pubkey = || view.pubkey.clone();
+        if let Some(verdict) = state.needs_map() {
+            let description = match verdict {
+                MapVerdict::Missing => {
+                    "No kind-10040 event found — other apps can’t locate your rank provider."
+                }
+                MapVerdict::Deactivated => {
+                    "Your Treasure Map is empty — other apps can’t locate your rank provider."
+                }
+                MapVerdict::NoRankRow => {
+                    "Your Treasure Map names no rank provider — other apps can’t look up your rank."
+                }
+            };
+            rows.push(
+                Attention::new(AMBER, "Publish your Treasure Map".into(), description.into())
+                    .action(Action::OpenTrust(pubkey()))
+                    .for_account(view, ix),
+            );
+        } else if let Some(message) = state.map_unreadable() {
+            rows.push(
+                Attention::new(
+                    AMBER,
+                    "Couldn’t check your Treasure Map".into(),
+                    message.to_string(),
+                )
+                .action(Action::RetryTrust(pubkey()))
+                .for_account(view, ix),
+            );
+        }
+        if state.no_follows() {
+            rows.push(
+                Attention::new(
+                    AMBER,
+                    "Follow someone".into(),
+                    "Trust scores can’t be calculated for an empty contact list.".into(),
+                )
+                .action(Action::OpenTrust(pubkey()))
+                .for_account(view, ix),
+            );
+        }
+        if state.no_verified_follower() {
+            rows.push(
+                Attention::new(
+                    AMBER,
+                    "Gain a follower".into(),
+                    "You need at least one verified follower for a trust score.".into(),
+                )
+                .action(Action::OpenTrust(pubkey()))
+                .for_account(view, ix),
+            );
+        }
     }
     rows
 }
 
+/// The account name behind an attention row's avatar: gpui tooltips need a
+/// view, so the name rides in a one-line entity.
+struct NameTip(String);
+
+impl Render for NameTip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        SharedString::from(self.0.clone())
+    }
+}
+
 fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
+    let has_action = !matches!(row.action, Action::None);
+    // The title keys the avatar's element id; it moves into the row text
+    // before the avatar closure runs, so take a copy up front.
+    let row_key = row.title.clone();
     h_flex()
         .gap(px(11.))
         .items_start()
@@ -155,10 +277,27 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                 .flex_1()
                 .min_w(px(0.))
                 .child(
-                    div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(SharedString::from(row.title)),
+                    h_flex()
+                        .gap(px(7.))
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(SharedString::from(row.title)),
+                        )
+                        .when_some(row.avatar, |this, (letters, hue, name, pubkey)| {
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "attn-avatar-{row_key}-{pubkey}"
+                                    )))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| NameTip(name.clone())).into()
+                                    })
+                                    .child(avatar(letters, hue, 18., 8.5)),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -168,10 +307,17 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                         .child(SharedString::from(row.description)),
                 ),
         )
-        .when(row.retry, |this| {
+        .when(has_action, |this| {
+            let label = row.action.label();
+            let id = match &row.action {
+                Action::Refresh => "attention-refresh".to_string(),
+                Action::RetryTrust(pubkey) => format!("attention-retry-{pubkey}"),
+                Action::OpenTrust(pubkey) => format!("attention-fix-{pubkey}"),
+                Action::None => unreachable!(),
+            };
             this.child(
                 div()
-                    .id("retry")
+                    .id(id)
                     .flex_shrink_0()
                     .mt(px(1.))
                     .px(px(11.))
@@ -182,8 +328,18 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                     .cursor_pointer()
                     .text_size(px(11.5))
                     .text_color(rgb(ACCENT_LIGHT))
-                    .child("Retry →")
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| match &row.action {
+                        Action::Refresh => this.refresh(cx),
+                        Action::RetryTrust(pubkey) => {
+                            this.fetch_trust(pubkey);
+                            cx.notify();
+                        }
+                        Action::OpenTrust(pubkey) => {
+                            this.open_account(pubkey, Tab::Trust, window, cx)
+                        }
+                        Action::None => {}
+                    })),
             )
         })
         .into_any_element()
@@ -193,7 +349,7 @@ fn all_clear(shell: &Shell) -> AnyElement {
     let (dot, text): (u32, &str) = if matches!(shell.bounties, Load::Loading) {
         (TEXT_DIM, "Loading the bounty list…")
     } else {
-        (GREEN, "All clear — relay connected, bounty list live.")
+        (GREEN, "Nothing needs you right now. The carpet flies itself.")
     };
     h_flex()
         .gap(px(11.))

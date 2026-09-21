@@ -284,38 +284,6 @@ fn balance_line(state: &WalletState, first_funding: bool) -> AnyElement {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    // Named imports: `super::*` would bring gpui's `test` attribute along.
-    use super::{WalletState, delta_text};
-    use crate::timefmt;
-
-    #[test]
-    fn the_delta_tag_reads_as_a_signed_change_and_the_old_balance() {
-        assert_eq!(delta_text(439, 409), ("−30".to_string(), "was 439".to_string()));
-        assert_eq!(delta_text(40, 55), ("+15".to_string(), "was 40".to_string()));
-        assert_eq!(
-            delta_text(1_000, 12_345),
-            (
-                format!("+{}", timefmt::fmt_sats(11_345)),
-                format!("was {}", timefmt::fmt_sats(1_000))
-            )
-        );
-    }
-
-    #[test]
-    fn the_first_balance_read_is_not_a_change() {
-        let mut state = WalletState::default();
-        assert_eq!(state.record_balance(40), None, "nothing to compare with yet");
-        assert_eq!(state.record_balance(40), None, "the same number is not a change");
-        let delta = state.record_balance(55).expect("an increase");
-        assert_eq!((delta.previous, delta.current), (40, 55));
-        let again = state.record_balance(25).expect("a decrease");
-        assert!(again.seq > delta.seq, "each change restarts the fade");
-        assert_eq!(state.balance, Some(25));
-    }
-}
-
 /// Recipient, amount, Send, and the status line under them. `Send` is inert
 /// while a send is in flight, so a double click cannot pay twice.
 fn send_block(state: &WalletState, inputs: &SendInputs, cx: &mut Context<Shell>) -> AnyElement {
@@ -489,4 +457,36 @@ pub fn panel(
         this.child(muted(error, RED))
     })
     .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    // Named imports: `super::*` would bring gpui's `test` attribute along.
+    use super::{WalletState, delta_text};
+    use crate::timefmt;
+
+    #[test]
+    fn the_delta_tag_reads_as_a_signed_change_and_the_old_balance() {
+        assert_eq!(delta_text(439, 409), ("−30".to_string(), "was 439".to_string()));
+        assert_eq!(delta_text(40, 55), ("+15".to_string(), "was 40".to_string()));
+        assert_eq!(
+            delta_text(1_000, 12_345),
+            (
+                format!("+{}", timefmt::fmt_sats(11_345)),
+                format!("was {}", timefmt::fmt_sats(1_000))
+            )
+        );
+    }
+
+    #[test]
+    fn the_first_balance_read_is_not_a_change() {
+        let mut state = WalletState::default();
+        assert_eq!(state.record_balance(40), None, "nothing to compare with yet");
+        assert_eq!(state.record_balance(40), None, "the same number is not a change");
+        let delta = state.record_balance(55).expect("an increase");
+        assert_eq!((delta.previous, delta.current), (40, 55));
+        let again = state.record_balance(25).expect("a decrease");
+        assert!(again.seq > delta.seq, "each change restarts the fade");
+        assert_eq!(state.balance, Some(25));
+    }
 }

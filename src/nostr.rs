@@ -23,6 +23,7 @@ use crate::api::{Api, ApiError, Bounty, BountyDetail, CreateBounty};
 use crate::coinos;
 use crate::events::{self, EventError};
 use crate::secrets::{self, Secret, SecretError};
+use crate::trust::{self, Assertion, BrainstormKey, Designation};
 
 pub const INSTANCE_RELAY: &str = "wss://magic-carpet.brainstorm.world/relay";
 
@@ -35,6 +36,16 @@ const PUBLIC_RELAYS: [&str; 3] = [
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.primal.net",
+];
+
+/// The read set a `FetchTrust` falls back to when the account's kind-10002
+/// cannot be read — the mock's "Popular relays" list (app.jsx:113), also the
+/// set every trust read unions the outbox relays with.
+const TRUST_FALLBACK_RELAYS: [&str; 4] = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://purplepag.es",
 ];
 
 /// The instance's house issuer — PUBLIC key material only. The read paths
@@ -131,6 +142,13 @@ pub enum Command {
     /// a time; watching a new one stops the old watcher, but its ledger (what
     /// was already reported) survives, so re-watching never replays history.
     WatchBounty { id: String },
+    /// Read everything the Trust tab and the dashboard attention rows need:
+    /// the account's kind-10040 designation and kind-3 contact list from its
+    /// outbox relays, the Brainstorm setup endpoint, then the kind-30382
+    /// assertions the map and the instance name. One `Update::Trust` per
+    /// `TrustPart`, as soon as it is known. `generation` lets the UI drop a
+    /// late answer from a fetch it already superseded.
+    FetchTrust { pubkey: String, generation: u32 },
     Shutdown,
 }
 
@@ -257,9 +275,40 @@ pub enum Update {
         message: String,
         may_have_paid: bool,
     },
+    /// One finished piece of a `FetchTrust` — five of these arrive per fetch,
+    /// each the moment its read completes rather than all at the end.
+    Trust {
+        pubkey: String,
+        generation: u32,
+        part: TrustPart,
+    },
     Error {
         source: ErrorSource,
         message: String,
+    },
+}
+
+/// One piece of a trust read, in the order the runtime resolves them. `Ok`
+/// is a real answer (including "checked, and there is none"); `Err` is a
+/// fixed message, never a relay's or endpoint's raw reply.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrustPart {
+    /// The account's kind-10040: `Err` when every relay failed, `Ok(None…)`
+    /// via [`Designation::None`] when relays answered with nothing.
+    Designation(Result<Designation, String>),
+    /// The Brainstorm setup endpoint's answer for this npub.
+    Brainstorm(Result<BrainstormKey, String>),
+    /// Distinct `p` tags on the newest valid kind-3; `Ok(None)` = none found.
+    Follows(Result<Option<u32>, String>),
+    /// The assertion from the rank provider the account's own map names —
+    /// omitted entirely when the map has no `30382:rank` row.
+    OwnAssertion(Result<Option<Assertion>, String>),
+    /// The assertion from the instance's provider, plus the provider that was
+    /// resolved (`None` when resolution itself failed, so the card can say
+    /// which half broke).
+    InstanceAssertion {
+        provider: Option<(String, String)>,
+        result: Result<Option<Assertion>, String>,
     },
 }
 
@@ -404,6 +453,12 @@ async fn run(
 
     let sessions: SharedSessions = Arc::new(TokioMutex::new(HashMap::new()));
     let balance_failures: BalanceFailures = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    // The instance's rank provider `(key, relay)`, resolved once — the
+    // issuer's designation changes rarely and resolving it costs a relay
+    // round-trip per FetchTrust. Filled only on success: a failed lookup is
+    // retried on the next fetch rather than cached as broken.
+    let instance_provider: Arc<TokioMutex<Option<(String, String)>>> =
+        Arc::new(TokioMutex::new(None));
     let mut watchers: HashMap<String, Watcher> = HashMap::new();
     // Ledgers outlive their watchers: what was already reported for a bounty
     // is permanent state, so stopping and re-watching never replays history
@@ -561,6 +616,11 @@ async fn run(
                     subscription.clone(),
                 ));
                 watchers.insert(id, Watcher { task, subscription });
+            }
+            Command::FetchTrust { pubkey, generation } => {
+                let provider = instance_provider.clone();
+                let updates = updates.clone();
+                tokio::spawn(fetch_trust(pubkey, generation, provider, updates));
             }
             Command::Shutdown => break,
         }
@@ -1455,6 +1515,299 @@ async fn watch_bounty(
             return;
         }
     }
+}
+
+/// A `FetchTrust`, on a throwaway client: the runtime's connected `client`
+/// belongs to the instance relay, and trust reads must not grow its relay
+/// set or its subscriptions. Emits each [`TrustPart`] the moment it is
+/// known, so a slow relay never holds back the parts that already landed.
+async fn fetch_trust(
+    pubkey: String,
+    generation: u32,
+    instance_provider: Arc<TokioMutex<Option<(String, String)>>>,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let send = |part: TrustPart| {
+        let _ = updates.unbounded_send(Update::Trust {
+            pubkey: pubkey.clone(),
+            generation,
+            part,
+        });
+    };
+
+    let client = Client::default();
+    for url in TRUST_FALLBACK_RELAYS {
+        let _ = client.add_relay(url).await;
+    }
+    client.connect().await;
+
+    // The account's outbox relays (kind-10002), unioned with the fallback
+    // set; a failed 10002 read quietly yields just the fallbacks.
+    let outbox = outbox_relays(&client, &pubkey).await;
+    for url in &outbox {
+        let _ = client.add_relay(url.as_str()).await;
+    }
+    client.connect().await;
+
+    // Independent reads, concurrently: designation, contact list, setup.
+    let (designation, follows, brainstorm) = futures::join!(
+        read_designation(&client, &pubkey, &outbox),
+        read_follows(&client, &pubkey, &outbox),
+        fetch_brainstorm_key(&pubkey),
+    );
+    send(TrustPart::Designation(designation.clone()));
+    send(TrustPart::Follows(follows));
+    send(TrustPart::Brainstorm(brainstorm));
+
+    // The provider the account's own map names — skipped entirely when the
+    // map is missing or has no rank row (there is no provider to read).
+    if let Some(row) = designation.as_ref().ok().and_then(Designation::rank_row) {
+        send(TrustPart::OwnAssertion(
+            read_assertion(&client, &row.key, &row.relay, &pubkey).await,
+        ));
+    }
+
+    // The provider the instance's issuer designates.
+    match resolve_instance_provider(&client, &instance_provider).await {
+        Some((key, relay)) => {
+            let result = read_assertion(&client, &key, &relay, &pubkey).await;
+            send(TrustPart::InstanceAssertion {
+                provider: Some((key, relay)),
+                result,
+            });
+        }
+        None => send(TrustPart::InstanceAssertion {
+            provider: None,
+            result: Err("Couldn't determine the instance's rank provider.".into()),
+        }),
+    }
+
+    client.disconnect().await;
+}
+
+/// The relays the account claims to write to: `r` tags of its newest
+/// kind-10002 that carry no marker or marker `write`, unioned with
+/// [`TRUST_FALLBACK_RELAYS`]. A failed or absent 10002 yields the fallback
+/// set on its own — never an error.
+async fn outbox_relays(client: &Client, pubkey: &str) -> Vec<String> {
+    let mut urls: BTreeSet<String> = TRUST_FALLBACK_RELAYS
+        .iter()
+        .map(|url| url.to_string())
+        .collect();
+    let Ok(public) = PublicKey::parse(pubkey) else {
+        return urls.into_iter().collect();
+    };
+    let filter = Filter::new()
+        .kind(Kind::Custom(10002))
+        .author(public)
+        .limit(1);
+    let read = client
+        .fetch_events(filter)
+        .timeout(Duration::from_secs(10))
+        .await;
+    if let Ok(events) = read
+        && let Some(event) = events.iter().max_by_key(|event| event.created_at)
+    {
+        for tag in event.tags.iter() {
+            let parts = tag.as_slice();
+            let Some(url) = parts.get(1) else { continue };
+            let marker = parts.get(2).map(String::as_str);
+            if parts.first().map(String::as_str) == Some("r")
+                && marker.is_none_or(|m| m == "write")
+                && (url.starts_with("wss://") || url.starts_with("ws://"))
+            {
+                urls.insert(url.clone());
+            }
+        }
+    }
+    urls.into_iter().collect()
+}
+
+/// Run `filter` against each relay individually and keep the results apart:
+/// `Ok` means that relay answered (EOSE), `Err` means it failed — the
+/// difference between "no event exists" and "nobody answered".
+async fn read_per_relay(
+    client: &Client,
+    urls: &[String],
+    filter: Filter,
+) -> Vec<(String, Result<Vec<Event>, ()>)> {
+    futures::future::join_all(urls.iter().map(|url| {
+        let url = url.clone();
+        let filter = filter.clone();
+        async move {
+            let relay = match client.relay(url.as_str()).await {
+                Ok(Some(relay)) => relay,
+                _ => return (url, Err(())),
+            };
+            let events = relay
+                .fetch_events(filter)
+                .timeout(Duration::from_secs(10))
+                .policy(ReqExitPolicy::ExitOnEOSE)
+                .await
+                .map(|events| events.into_iter().collect())
+                .map_err(|_| ());
+            (url, events)
+        }
+    }))
+    .await
+}
+
+/// `Ok` events from the answering relays, and how many answered.
+fn answered(results: Vec<(String, Result<Vec<Event>, ()>)>) -> (usize, Vec<(String, Event)>) {
+    let mut answered = 0;
+    let mut events = Vec::new();
+    for (url, result) in results {
+        if let Ok(found) = result {
+            answered += 1;
+            events.extend(found.into_iter().map(|event| (url.clone(), event)));
+        }
+    }
+    (answered, events)
+}
+
+/// kind-10040 per relay. `Err` only when every relay failed; an answered
+/// relay set with no valid event is `Ok(Designation::None)`.
+async fn read_designation(
+    client: &Client,
+    pubkey: &str,
+    outbox: &[String],
+) -> Result<Designation, String> {
+    let Ok(public) = PublicKey::parse(pubkey) else {
+        return Err("Couldn't read kind-10040 from the relays.".into());
+    };
+    let filter = Filter::new().kind(Kind::Custom(10040)).author(public);
+    let results = read_per_relay(client, outbox, filter).await;
+    let total = results.len();
+    let (answered, events) = answered(results);
+    if answered == 0 {
+        return Err(format!("Couldn't read kind-10040 from {total} relays."));
+    }
+    Ok(trust::parse_designation(&events, pubkey))
+}
+
+/// The newest valid kind-3's distinct `p` count. Same failure rule as the
+/// designation: every relay failing is `Err`, answered-but-empty is
+/// `Ok(None)`.
+async fn read_follows(
+    client: &Client,
+    pubkey: &str,
+    outbox: &[String],
+) -> Result<Option<u32>, String> {
+    let Ok(public) = PublicKey::parse(pubkey) else {
+        return Err("Couldn't read kind-3 from the relays.".into());
+    };
+    let filter = Filter::new()
+        .kind(Kind::ContactList)
+        .author(public)
+        .limit(1);
+    let results = read_per_relay(client, outbox, filter).await;
+    let total = results.len();
+    let (answered, events) = answered(results);
+    if answered == 0 {
+        return Err(format!("Couldn't read kind-3 from {total} relays."));
+    }
+    Ok(events
+        .iter()
+        .filter_map(|(_, event)| {
+            trust::follow_count(event, pubkey).map(|n| (event.created_at, n))
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, n)| n))
+}
+
+/// The newest valid kind-30382 `provider` signed about `subject` on `relay`
+/// — the relay is the one the map (or the issuer's map) names, so the read
+/// is deliberately single-relay: an assertion anywhere else is not the
+/// provider's word.
+async fn read_assertion(
+    client: &Client,
+    provider: &str,
+    relay: &str,
+    subject: &str,
+) -> Result<Option<Assertion>, String> {
+    let Ok(provider_key) = PublicKey::parse(provider) else {
+        return Err("Couldn't read the provider's assertions.".into());
+    };
+    let _ = client.add_relay(relay).await;
+    client.connect().await;
+    let filter = Filter::new()
+        .kind(Kind::Custom(30382))
+        .author(provider_key)
+        .identifier(subject);
+    let results = read_per_relay(client, &[relay.to_string()], filter).await;
+    match results.into_iter().next() {
+        Some((_, Ok(events))) => {
+            let mut assertion = trust::parse_assertion(&events, provider, subject);
+            if let Some(assertion) = &mut assertion {
+                assertion.relay = relay.to_string();
+            }
+            Ok(assertion)
+        }
+        _ => Err(format!("Couldn't read {relay}.")),
+    }
+}
+
+/// `GET https://api.brainstorm.world/setup/{hex}`: 404 means the npub has no
+/// Brainstorm account (`Ok(NoAccount)`); any other failure is `Err` with
+/// fixed wording — the endpoint's own error text is never shown.
+async fn fetch_brainstorm_key(hex: &str) -> Result<BrainstormKey, String> {
+    let http = reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Couldn't reach the Brainstorm setup service.".to_string())?;
+    let response = http
+        .get(format!("{}{hex}", trust::BRAINSTORM_SETUP))
+        .send()
+        .await
+        .map_err(|_| "Couldn't reach the Brainstorm setup service.".to_string())?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(BrainstormKey::NoAccount);
+    }
+    if !response.status().is_success() {
+        return Err("The Brainstorm setup service returned an error.".into());
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|_| "The Brainstorm setup answer could not be read.".to_string())?;
+    trust::parse_setup(&body)
+        .ok_or_else(|| "The Brainstorm setup answer could not be read.".to_string())
+}
+
+/// `(key, relay)` of the provider the instance scores from: the issuer's own
+/// kind-10040 rank row, falling back to its Brainstorm setup answer. Cached
+/// on first success only — a failure is retried on the next `FetchTrust`.
+async fn resolve_instance_provider(
+    client: &Client,
+    cache: &Arc<TokioMutex<Option<(String, String)>>>,
+) -> Option<(String, String)> {
+    if let Some(cached) = cache.lock().await.clone() {
+        return Some(cached);
+    }
+    let issuer = issuer_pubkey();
+    let outbox = outbox_relays(client, &issuer).await;
+    for url in &outbox {
+        let _ = client.add_relay(url.as_str()).await;
+    }
+    client.connect().await;
+    let resolved = match read_designation(client, &issuer, &outbox).await {
+        Ok(designation) => designation
+            .rank_row()
+            .map(|row| (row.key.clone(), row.relay.clone())),
+        Err(_) => None,
+    };
+    let resolved = match resolved {
+        Some(provider) => Some(provider),
+        None => match fetch_brainstorm_key(&issuer).await {
+            Ok(BrainstormKey::Assigned { key, relay }) => Some((key, relay)),
+            _ => None,
+        },
+    };
+    if let Some(provider) = &resolved {
+        *cache.lock().await = Some(provider.clone());
+    }
+    resolved
 }
 
 #[cfg(test)]

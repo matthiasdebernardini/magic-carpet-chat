@@ -10,6 +10,7 @@ use gpui_kit::*;
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::component::Root;
 
+mod account;
 mod account_setup;
 mod bounties;
 mod chat;
@@ -18,6 +19,7 @@ mod icons;
 mod palette;
 mod shell;
 mod timefmt;
+mod trust_state;
 mod wallet;
 
 fn main() {
