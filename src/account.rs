@@ -1011,7 +1011,7 @@ fn map_card(
     if !matches!(designation, Some(Designation::Set { .. })) || failed_message.is_some() {
         let pubkey = pubkey.to_string();
         body = body.child(
-            div().mt(px(12.)).child(outline_button(
+            h_flex().mt(px(12.)).child(outline_button(
                 "check-again-map",
                 "Check again",
                 TEXT_MUTED,

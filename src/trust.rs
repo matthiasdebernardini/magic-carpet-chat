@@ -103,6 +103,22 @@ fn is_hex64(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Canonical relay URL — scheme and authority lowercased, trailing `/`
+/// stripped — so `wss://nos.lol/` and `wss://nos.lol` count as one relay in
+/// relay sets, `found_on` lists, and displayed facts.
+pub fn normalize_relay(url: &str) -> String {
+    let trimmed = url.trim();
+    let (scheme, rest) = trimmed.split_once("://").unwrap_or(("", trimmed));
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut out = format!("{}://{}", scheme.to_lowercase(), authority.to_lowercase());
+    let path = path.trim_end_matches('/');
+    if !path.is_empty() {
+        out.push('/');
+        out.push_str(path);
+    }
+    out
+}
+
 /// The value half of a `["name", "value", …]` tag.
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     event.tags.iter().find_map(|tag| {
@@ -127,14 +143,14 @@ fn parse_row(tag: &Tag) -> Option<Row> {
         return None;
     }
     let key = parts.get(1)?;
-    let relay = parts.get(2)?;
+    let relay = normalize_relay(parts.get(2)?);
     if !is_hex64(key) || !(relay.starts_with("wss://") || relay.starts_with("ws://")) {
         return None;
     }
     Some(Row {
         kind_tag: kind_tag.clone(),
         key: key.clone(),
-        relay: relay.clone(),
+        relay,
     })
 }
 
@@ -239,7 +255,7 @@ pub fn parse_setup(body: &str) -> Option<BrainstormKey> {
         {
             return Some(BrainstormKey::Assigned {
                 key: key.to_string(),
-                relay: relay.to_string(),
+                relay: normalize_relay(relay),
             });
         }
     }
@@ -611,5 +627,13 @@ mod tests {
             100,
         );
         assert_eq!(follow_count(&wrong_kind, &keys.public_key().to_hex()), None);
+    }
+
+    #[test]
+    fn normalize_relay_canonicalizes_scheme_host_and_trailing_slash() {
+        assert_eq!(normalize_relay("wss://nos.lol/"), "wss://nos.lol");
+        assert_eq!(normalize_relay("WSS://Relay.Damus.io/"), "wss://relay.damus.io");
+        assert_eq!(normalize_relay("wss://x.y/relay/"), "wss://x.y/relay");
+        assert_eq!(normalize_relay("wss://nos.lol"), "wss://nos.lol");
     }
 }

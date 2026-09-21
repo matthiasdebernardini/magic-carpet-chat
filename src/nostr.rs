@@ -1592,7 +1592,7 @@ async fn fetch_trust(
 async fn outbox_relays(client: &Client, pubkey: &str) -> Vec<String> {
     let mut urls: BTreeSet<String> = TRUST_FALLBACK_RELAYS
         .iter()
-        .map(|url| url.to_string())
+        .map(|url| trust::normalize_relay(url))
         .collect();
     let Ok(public) = PublicKey::parse(pubkey) else {
         return urls.into_iter().collect();
@@ -1611,12 +1611,13 @@ async fn outbox_relays(client: &Client, pubkey: &str) -> Vec<String> {
         for tag in event.tags.iter() {
             let parts = tag.as_slice();
             let Some(url) = parts.get(1) else { continue };
+            let url = trust::normalize_relay(url);
             let marker = parts.get(2).map(String::as_str);
             if parts.first().map(String::as_str) == Some("r")
                 && marker.is_none_or(|m| m == "write")
                 && (url.starts_with("wss://") || url.starts_with("ws://"))
             {
-                urls.insert(url.clone());
+                urls.insert(url);
             }
         }
     }
@@ -1728,18 +1729,19 @@ async fn read_assertion(
     let Ok(provider_key) = PublicKey::parse(provider) else {
         return Err("Couldn't read the provider's assertions.".into());
     };
-    let _ = client.add_relay(relay).await;
+    let relay = trust::normalize_relay(relay);
+    let _ = client.add_relay(relay.as_str()).await;
     client.connect().await;
     let filter = Filter::new()
         .kind(Kind::Custom(30382))
         .author(provider_key)
         .identifier(subject);
-    let results = read_per_relay(client, &[relay.to_string()], filter).await;
+    let results = read_per_relay(client, &[relay.clone()], filter).await;
     match results.into_iter().next() {
         Some((_, Ok(events))) => {
             let mut assertion = trust::parse_assertion(&events, provider, subject);
             if let Some(assertion) = &mut assertion {
-                assertion.relay = relay.to_string();
+                assertion.relay = relay.clone();
             }
             Ok(assertion)
         }
