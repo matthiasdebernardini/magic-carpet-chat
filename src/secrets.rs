@@ -308,6 +308,17 @@ pub fn keys(pubkey: &str) -> Result<Option<Keys>, SecretError> {
         .map_err(|_| SecretError::InvalidKey("A stored key"))
 }
 
+/// The stored nsec itself, bech32 (`add_account` normalised it), read
+/// fresh from the store. `Ok(None)` means no such account. Only the Identity
+/// tab calls this: to copy it to the clipboard or show it for 30 s.
+pub fn nsec(pubkey: &str) -> Result<Option<Secret>, SecretError> {
+    Ok(load()?
+        .accounts
+        .into_iter()
+        .find(|a| a.pubkey == pubkey)
+        .map(|a| a.nsec))
+}
+
 /// `MC_NSECS`: comma-separated nsecs, added if not already stored. Called at
 /// every launch and by `--import-keys`, so it must be idempotent: a key
 /// already in the store is left alone (its active flag included). Returns
@@ -421,6 +432,21 @@ mod tests {
         assert!(keys(&rb.pubkey).unwrap().is_none());
         remove_account(&ra.pubkey).unwrap();
         assert_eq!(load().unwrap().active, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nsec_returns_the_stored_bech32_key() {
+        let dir = std::env::temp_dir().join(format!("mc-nsec-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+
+        let keys = Keys::generate();
+        // Stored from hex, handed back as bech32.
+        let record = add_account(&Secret::new(keys.secret_key().to_secret_hex())).unwrap();
+        let stored = nsec(&record.pubkey).unwrap().unwrap();
+        assert_eq!(stored.expose(), keys.secret_key().to_bech32().unwrap());
+        assert!(nsec(&"cc".repeat(32)).unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

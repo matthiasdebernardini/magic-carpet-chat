@@ -7,7 +7,7 @@
 //! the same task-held-in-`self` pattern as the chat's streaming reply.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -652,8 +652,6 @@ impl Shell {
     /// Folds one runtime update into the state every screen renders from.
     fn apply(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
         let now = timefmt::now_unix();
-        // A removal armed a moment ago is about a screen that just changed.
-        self.confirm_remove = None;
         // The "copied" tick lives until the next update lands.
         if let Some(page) = &mut self.account_page {
             page.copied = None;
@@ -713,6 +711,21 @@ impl Shell {
                 // Trust state follows the account set: removed accounts lose
                 // their entries, and everyone gets a fresh read.
                 self.trust.retain(|p, _| pubkeys.contains(p));
+                // Disarm only when the armed account is gone. Trust parts
+                // land mid-confirm and must not reset the second click.
+                if self
+                    .confirm_remove
+                    .as_ref()
+                    .is_some_and(|p| !pubkeys.contains(p))
+                {
+                    self.confirm_remove = None;
+                }
+                // A removed account's page shows "removed", not its key.
+                if let Some(page) = &mut self.account_page
+                    && !pubkeys.contains(&page.pubkey)
+                {
+                    page.hide_nsec();
+                }
                 self.fetch_trust_all();
                 // No account: first launch, or the last one was just removed.
                 // Not a ⌘R while already browsing read-only — that would
@@ -1135,6 +1148,9 @@ impl Shell {
     pub(crate) fn go(&mut self, screen: Screen, window: &mut Window, cx: &mut Context<Self>) {
         self.screen = screen;
         self.confirm_remove = None;
+        if screen != Screen::Account {
+            self.hide_nsec();
+        }
         if screen == Screen::Chat {
             self.chat.focus_handle(cx).focus(window, cx);
         } else {
@@ -1250,6 +1266,7 @@ impl Shell {
         self.close_forms(window, cx);
         self.setup = AccountSetup::new(first_launch, window, cx);
         self.screen = Screen::AccountSetup;
+        self.hide_nsec();
         self.focus.focus(window, cx);
         self.sync_balance_poll(cx);
         cx.notify();
@@ -1479,11 +1496,103 @@ impl Shell {
         cx.notify();
     }
 
+    /// "Copy" on the Identity tab's nsec row: the same path as
+    /// [`Self::copy_coinos_password`] — store to clipboard, nothing kept,
+    /// nothing logged. Works with the key masked.
+    pub(crate) fn copy_nsec(&mut self, pubkey: &str, cx: &mut Context<Self>) {
+        match secrets::nsec(pubkey) {
+            Ok(Some(nsec)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(nsec.expose().to_string()));
+                if let Some(page) = &mut self.account_page {
+                    page.copied = Some("nsec".into());
+                }
+            }
+            Ok(None) => self.push_activity(
+                AMBER,
+                "No secret key is stored for this account".into(),
+                timefmt::now_unix(),
+            ),
+            Err(e) => self.push_activity(RED, e.to_string(), timefmt::now_unix()),
+        }
+        cx.notify();
+    }
+
+    /// "Reveal": read the nsec fresh into the page for
+    /// [`account::NSEC_SHOWN_FOR`], re-rendering every second for the
+    /// countdown. A second Reveal restarts the clock (the old task drops).
+    pub(crate) fn reveal_nsec(&mut self, pubkey: &str, cx: &mut Context<Self>) {
+        let nsec = match secrets::nsec(pubkey) {
+            Ok(Some(nsec)) => nsec,
+            Ok(None) => {
+                self.push_activity(
+                    AMBER,
+                    "No secret key is stored for this account".into(),
+                    timefmt::now_unix(),
+                );
+                cx.notify();
+                return;
+            }
+            Err(e) => {
+                self.push_activity(RED, e.to_string(), timefmt::now_unix());
+                cx.notify();
+                return;
+            }
+        };
+        let Some(page) = self.account_page.as_mut().filter(|p| p.pubkey == pubkey) else {
+            return;
+        };
+        page.revealed = Some(account::Revealed {
+            nsec,
+            hide_at: Instant::now() + account::NSEC_SHOWN_FOR,
+        });
+        page.reveal_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(1))
+                    .await;
+                let Ok(hidden) = this.update(cx, |shell, cx| {
+                    cx.notify();
+                    let Some(page) = &mut shell.account_page else {
+                        return true;
+                    };
+                    let expired = page
+                        .revealed
+                        .as_ref()
+                        .is_none_or(|r| Instant::now() >= r.hide_at);
+                    if expired {
+                        // Only the key: this task is `reveal_timer` and ends
+                        // by returning, not by dropping itself.
+                        page.revealed = None;
+                    }
+                    expired
+                }) else {
+                    return;
+                };
+                if hidden {
+                    return;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Masks the Account page's nsec, if one is showing.
+    fn hide_nsec(&mut self) {
+        if let Some(page) = &mut self.account_page {
+            page.hide_nsec();
+        }
+    }
+
+    /// Whether the next remove click on `pubkey` deletes it.
+    pub(crate) fn remove_armed(&self, pubkey: &str) -> bool {
+        self.confirm_remove.as_deref() == Some(pubkey)
+    }
+
     /// "Remove this account", in two clicks: the first arms it (the link
     /// reads "Click again to remove"), the second has the runtime delete the
     /// nsec and Coinos login and re-announce the store; `AccountsLoaded`
     /// then moves the active account if it was this one.
-    fn remove_account(&mut self, pubkey: String, cx: &mut Context<Self>) {
+    pub(crate) fn remove_account(&mut self, pubkey: String, cx: &mut Context<Self>) {
         if self.confirm_remove.as_deref() == Some(pubkey.as_str()) {
             self.confirm_remove = None;
             let _ = self
