@@ -1,0 +1,50 @@
+name: linux-build
+
+# Builds the Linux x86_64 binary as a workflow artifact, with no tag and no
+# release. workflow_dispatch only works once this file is on the default
+# branch, so a push to an e2e/ branch builds on its own.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "e2e/**"
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x86_64
+    # Same runner as release.yml: 22.04's glibc is the floor the binary needs.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64
+
+      # gpui on Linux talks to X11, Wayland, xkbcommon, fontconfig and Vulkan.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake pkg-config \
+            libasound2-dev libfontconfig-dev libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-xkb-dev \
+            libxcb-xinput-dev libxcb-cursor-dev libvulkan-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: magic-carpet-chat-linux-x86_64
+          path: target/release/magic-carpet-chat
+          if-no-files-found: error
+          retention-days: 14
