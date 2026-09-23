@@ -21,6 +21,7 @@ use gpui_kit::component::{
 
 use magic_carpet_chat::api::{Bounty, BountyDetail, CreateBounty};
 use magic_carpet_chat::coinos;
+use magic_carpet_chat::events;
 use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated};
 use magic_carpet_chat::secrets::{self, Secret};
 
@@ -178,8 +179,20 @@ pub(crate) struct AccountView {
     pub picture: Option<String>,
     /// The kind-0's Lightning address — payouts need one.
     pub lud16: Option<String>,
+    /// Where the kind-0 read stands. Only `Read` makes a missing `lud16`
+    /// mean "none" rather than "unknown".
+    pub profile: ProfileRead,
     /// The Coinos wallet, shared by the account screen's ready panel and ⌘6.
     pub wallet: WalletState,
+}
+
+/// The account's kind-0 read: under way, failed, or done (found or
+/// confirmed absent).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileRead {
+    Checking,
+    Failed,
+    Read,
 }
 
 impl AccountView {
@@ -190,6 +203,7 @@ impl AccountView {
             kind0_name: None,
             picture: None,
             lud16: None,
+            profile: ProfileRead::Checking,
             wallet: WalletState::default(),
         }
     }
@@ -246,10 +260,13 @@ pub(crate) fn initials(view: &AccountView) -> String {
 
 /// Item 1 of the money path: the panel pre-fills a stored wallet's address
 /// on launch, but only the profile as the relays have it says whether the
-/// payer can see that address. `None` = they agree; `Some` = the text the
-/// panel shows next to "Retry publishing".
-pub(crate) fn relay_address_gap(relay_lud16: Option<&str>, wallet_address: &str) -> Option<String> {
-    (relay_lud16 != Some(wallet_address))
+/// payer can see that address. `Some` = the profile has no lud16, and the
+/// text the panel shows next to "Retry publishing". A different lud16 is
+/// `None`: it is never overwritten, so there is nothing to retry — the
+/// panel names that address instead.
+pub(crate) fn relay_address_gap(relay_lud16: Option<&str>) -> Option<String> {
+    relay_lud16
+        .is_none()
         .then(|| "The profile on the relays does not carry this address yet".to_string())
 }
 
@@ -449,7 +466,8 @@ pub struct Shell {
     balance_poll: Option<(String, Task<()>)>,
     /// "Remove this account" is armed for this pubkey: the next click on it
     /// deletes the nsec and the Coinos password together, so one click is
-    /// not enough. Anything else that happens disarms it.
+    /// not enough. Navigation, an account switch, or an AccountsLoaded
+    /// without that account disarms it; other runtime updates leave it alone.
     confirm_remove: Option<String>,
     /// The Wallet screen's recipient and amount; cleared on an account switch.
     send_inputs: SendInputs,
@@ -744,14 +762,20 @@ impl Shell {
                     view.kind0_name = name;
                     view.picture = picture;
                     view.lud16 = lud16;
+                    view.profile = ProfileRead::Read;
                     // A wallet pre-filled from the store on launch claimed
                     // nothing about the relays; the profile read settles
                     // whether "Retry publishing" is due.
                     if let Some(created) = &mut view.wallet.created {
                         created.publish_error =
-                            relay_address_gap(view.lud16.as_deref(), &created.lightning_address);
+                            relay_address_gap(view.lud16.as_deref());
                     }
                     view.sync_qr();
+                }
+            }
+            Update::ProfileUnavailable { pubkey } => {
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.profile = ProfileRead::Failed;
                 }
             }
             Update::AddAccountFailed { message } => {
@@ -775,6 +799,13 @@ impl Shell {
                 if self.view(&pubkey).is_none() {
                     self.views
                         .push((pubkey.clone(), AccountView::new(pubkey.clone(), npub.clone())));
+                }
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.profile = if profile_checked {
+                        ProfileRead::Read
+                    } else {
+                        ProfileRead::Failed
+                    };
                 }
                 // A new account's trust read starts the moment it lands.
                 self.fetch_trust(&pubkey);
@@ -986,6 +1017,7 @@ impl Shell {
                     now,
                 );
                 self.bounty_form = None;
+                self.pending_bounty = None;
                 self.focus.focus(window, cx);
                 self.selected = Some(id.clone());
                 // The detail pane shows the submitted values immediately; the
@@ -1082,13 +1114,23 @@ impl Shell {
                 // command — everything else (watch polls, account refreshes)
                 // is feed-only noise as far as the forms are concerned.
                 match source {
-                    ErrorSource::DList | ErrorSource::Bounty => {
+                    ErrorSource::DList
+                    | ErrorSource::Bounty
+                    | ErrorSource::BountyOutcomeUnknown => {
                         if let Some(form) = &mut self.bounty_form
                             && form.submitting {
                                 form.submitting = false;
                                 form.error = Some(message.clone());
                                 self.pending_bounty = None;
                                 self.submitted_bounty = None;
+                                if source == ErrorSource::BountyOutcomeUnknown {
+                                    // A timeout or dropped reply says nothing
+                                    // about whether the server created it.
+                                    form.error = Some(format!(
+                                        "{message} The server may have created this bounty; check the list before retrying."
+                                    ));
+                                    let _ = self.commands.unbounded_send(Command::FetchBounties);
+                                }
                             }
                     }
                     ErrorSource::Claim => {
@@ -1165,6 +1207,12 @@ impl Shell {
             return;
         }
         if self.active.as_deref() != Some(pubkey) {
+            // The form's reply would land under the other account, and a
+            // retry would go out as it.
+            if self.hold_for_submit() {
+                cx.notify();
+                return;
+            }
             self.active = Some(pubkey.to_string());
             self.confirm_remove = None;
             // An open form belongs to the account that opened it.
@@ -1263,6 +1311,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Leaving the setup screen can switch accounts; see set_account.
+        if self.hold_for_submit() {
+            cx.notify();
+            return;
+        }
         self.close_forms(window, cx);
         self.setup = AccountSetup::new(first_launch, window, cx);
         self.screen = Screen::AccountSetup;
@@ -1483,9 +1536,7 @@ impl Shell {
     /// feed, and that message carries a path, not a secret.
     pub(crate) fn copy_coinos_password(&mut self, pubkey: &str, cx: &mut Context<Self>) {
         match secrets::load_coinos_login(pubkey) {
-            Ok(Some(login)) => cx.write_to_clipboard(ClipboardItem::new_string(
-                login.password.expose().to_string(),
-            )),
+            Ok(Some(login)) => copy_secret(login.password, cx),
             Ok(None) => self.push_activity(
                 AMBER,
                 "No Coinos login is stored for this account".into(),
@@ -1502,7 +1553,7 @@ impl Shell {
     pub(crate) fn copy_nsec(&mut self, pubkey: &str, cx: &mut Context<Self>) {
         match secrets::nsec(pubkey) {
             Ok(Some(nsec)) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(nsec.expose().to_string()));
+                copy_secret(nsec, cx);
                 if let Some(page) = &mut self.account_page {
                     page.copied = Some("nsec".into());
                 }
@@ -1588,17 +1639,42 @@ impl Shell {
         self.confirm_remove.as_deref() == Some(pubkey)
     }
 
+    /// The armed remove's warning when the wallet still holds sats. Arming
+    /// re-reads the balance, so this is current by the second click.
+    pub(crate) fn sats_left_warning(&self, pubkey: &str) -> Option<String> {
+        let sats = self.view(pubkey)?.wallet.balance?;
+        (self.remove_armed(pubkey) && sats > 0).then(|| {
+            format!(
+                "This wallet still holds {} sats. Send them first, \
+                 or copy the Coinos username and password.",
+                timefmt::fmt_sats(sats)
+            )
+        })
+    }
+
     /// "Remove this account", in two clicks: the first arms it (the link
     /// reads "Click again to remove"), the second has the runtime delete the
     /// nsec and Coinos login and re-announce the store; `AccountsLoaded`
     /// then moves the active account if it was this one.
     pub(crate) fn remove_account(&mut self, pubkey: String, cx: &mut Context<Self>) {
         if self.confirm_remove.as_deref() == Some(pubkey.as_str()) {
+            // Removing the active account moves it; see set_account.
+            if self.active.as_deref() == Some(pubkey.as_str()) && self.hold_for_submit() {
+                cx.notify();
+                return;
+            }
             self.confirm_remove = None;
             let _ = self
                 .commands
                 .unbounded_send(Command::RemoveAccount { pubkey });
         } else {
+            // The armed card warns about sats still in the wallet; read the
+            // balance fresh for it.
+            if self.view(&pubkey).is_some_and(|view| view.wallet.has_token) {
+                let _ = self.commands.unbounded_send(Command::FetchBalance {
+                    pubkey: pubkey.clone(),
+                });
+            }
             self.confirm_remove = Some(pubkey);
         }
         cx.notify();
@@ -1638,6 +1714,12 @@ impl Shell {
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         let _ = self.commands.unbounded_send(Command::FetchBounties);
         let _ = self.commands.unbounded_send(Command::LoadAccounts);
+        // LoadAccounts re-reads every kind-0; a failed one is pending again.
+        for (_, view) in &mut self.views {
+            if view.profile == ProfileRead::Failed {
+                view.profile = ProfileRead::Checking;
+            }
+        }
         if !matches!(self.bounties, Load::Ready(_)) {
             self.bounties = Load::Loading;
         }
@@ -1712,7 +1794,33 @@ impl Shell {
         }
     }
 
+    /// A bounty or claim request is out and unanswered.
+    fn form_in_flight(&self) -> bool {
+        self.bounty_form.as_ref().is_some_and(|f| f.submitting)
+            || self.claim_form.as_ref().is_some_and(|f| f.submitting)
+    }
+
+    /// Refuses the actions that would drop or re-own an in-flight form,
+    /// saying so in the feed. True when the caller must stop.
+    fn hold_for_submit(&mut self) -> bool {
+        let held = self.form_in_flight();
+        if held {
+            self.push_activity(
+                AMBER,
+                "A submit is in flight; wait for it to finish".into(),
+                timefmt::now_unix(),
+            );
+        }
+        held
+    }
+
+    /// Closes both forms — except mid-submit (esc, Cancel, or the account
+    /// vanishing): the request is out, and a closed form invites a resubmit
+    /// and a second bounty or claim. The reply closes or re-enables it.
     pub(crate) fn close_forms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.form_in_flight() {
+            return;
+        }
         if self.bounty_form.is_some() || self.claim_form.is_some() {
             self.bounty_form = None;
             self.claim_form = None;
@@ -1862,6 +1970,24 @@ impl Shell {
                 }
             }
         };
+
+        // A bounty on this list already exists — typically a timed-out
+        // submit the server finished anyway. The server never dedupes. Only
+        // as good as the last list read: a create that lands after it (the
+        // FetchBounties sent on the unknown outcome is still out) slips by.
+        let coordinate = nostr_sdk::prelude::PublicKey::from_hex(&pubkey)
+            .map(|pk| events::header_coordinate(&pk, &events::header_dtag(&singular)))
+            .ok();
+        if let (Load::Ready(bounties), Some(coordinate)) = (&self.bounties, &coordinate)
+            && bounties.iter().any(|b| {
+                &b.list_coordinate == coordinate && b.effective_status() == "open"
+            })
+        {
+            fail = fail.or(Some((
+                "An open bounty for this list already exists. Pick it from the list instead.",
+                F_SINGULAR,
+            )));
+        }
 
         if let Some((message, field)) = fail {
             if let Some(form) = &mut self.bounty_form {
@@ -2169,6 +2295,7 @@ impl Shell {
         let address = view.and_then(|v| v.payout_address()).map(SharedString::new);
         let active = self.active.clone();
         let remove_armed = active.is_some() && self.confirm_remove == active;
+        let sats_left = active.as_deref().and_then(|p| self.sats_left_warning(p));
 
         // The three cards are the issuer's live bounty economics; before the
         // list loads (or when it failed) they say so instead of guessing.
@@ -2299,6 +2426,15 @@ impl Shell {
                                                         this.remove_account(pubkey.clone(), cx)
                                                     },
                                                 )),
+                                        )
+                                    })
+                                    .when_some(sats_left, |this, warning| {
+                                        this.child(
+                                            div()
+                                                .mt(px(2.))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(AMBER))
+                                                .child(warning),
                                         )
                                     }),
                             )
@@ -2579,6 +2715,33 @@ impl Shell {
     }
 }
 
+/// How long a copied nsec or Coinos password stays on the clipboard.
+const SECRET_ON_CLIPBOARD_FOR: Duration = Duration::from_secs(30);
+
+/// Copy `secret`, then clear the clipboard after [`SECRET_ON_CLIPBOARD_FOR`]
+/// if it still holds exactly that value — something copied since is left
+/// alone. gpui has no concealed-clipboard flag, so clipboard managers may
+/// still keep their own copy. On Wayland the clear only takes effect while
+/// the window has focus, and quitting within the 30 s leaves the clipboard
+/// as it is. The value lives only in this task.
+fn copy_secret(secret: Secret, cx: &mut Context<Shell>) {
+    cx.write_to_clipboard(ClipboardItem::new_string(secret.expose().to_string()));
+    cx.spawn(async move |_, cx| {
+        cx.background_executor().timer(SECRET_ON_CLIPBOARD_FOR).await;
+        cx.update(|cx| {
+            let unchanged = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .is_some_and(|text| text == secret.expose());
+            if unchanged {
+                // An empty item is clearContents on macOS.
+                cx.write_to_clipboard(ClipboardItem { entries: vec![] });
+            }
+        });
+    })
+    .detach();
+}
+
 /// The just-created bounty, rebuilt from the values the server was actually
 /// sent, so the detail pane renders them instantly. Server data replaces it
 /// as soon as the first list/detail arrives — this is a stopgap for the
@@ -2710,11 +2873,12 @@ mod tests {
     fn a_stored_wallet_shows_retry_until_the_relays_carry_its_address() {
         // Relaunch: the panel pre-fills the Coinos address from the store.
         // Only a profile read decides whether the payer can see it.
-        assert_eq!(relay_address_gap(Some("carpet12@coinos.io"), "carpet12@coinos.io"), None);
-        assert!(relay_address_gap(None, "carpet12@coinos.io").is_some(), "confirmed-empty profile");
-        assert!(
-            relay_address_gap(Some("me@strike.me"), "carpet12@coinos.io").is_some(),
-            "a different lud16 on the relays is a gap too"
+        assert_eq!(relay_address_gap(Some("carpet12@coinos.io")), None);
+        assert!(relay_address_gap(None).is_some(), "confirmed-empty profile");
+        assert_eq!(
+            relay_address_gap(Some("me@strike.me")),
+            None,
+            "a different lud16 is never overwritten, so there is no retry"
         );
     }
 

@@ -37,6 +37,9 @@ if [ -z "$VERSION" ]; then
   VERSION=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
 fi
 VERSION=${VERSION#v}
+# CFBundleVersion must be numeric dots; a pre-release suffix (0.5.0-rc.1)
+# stays in the short version string only.
+BUILD_VERSION=${VERSION%%-*}
 
 APP="$OUT_DIR/$APP_NAME.app"
 rm -rf "$APP"
@@ -69,7 +72,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleShortVersionString</key>
 	<string>$VERSION</string>
 	<key>CFBundleVersion</key>
-	<string>$VERSION</string>
+	<string>$BUILD_VERSION</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>12.0</string>
 	<key>NSHighResolutionCapable</key>

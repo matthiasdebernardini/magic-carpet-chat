@@ -871,6 +871,7 @@ fn secret_key_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyE
 /// The two-click remove, the same flow as the sidebar's link.
 fn remove_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElement {
     let armed = shell.remove_armed(pubkey);
+    let sats_left = shell.sats_left_warning(pubkey);
     let pubkey = pubkey.to_string();
     card()
         .border_color(rgba(0xe5646c33))
@@ -898,7 +899,16 @@ fn remove_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyEleme
                                     "Deletes the nsec and Coinos login from accounts.json. \
                                      Export the nsec first if you ever want this identity back.",
                                 ),
-                        ),
+                        )
+                        .when_some(sats_left, |this, warning| {
+                            this.child(
+                                div()
+                                    .mt(px(6.))
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(AMBER))
+                                    .child(warning),
+                            )
+                        }),
                 )
                 .child(
                     div()

@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the map.** The interactive atlas is built from the same data. It describes commit 3bf9877; the working tree holds an uncommitted refactor (see NA)._
 
-_Question status: **53 open · 2 routed · 4 resolved**._
+_Question status: **52 open · 2 routed · 5 resolved**._
 
 ## One paragraph
 
@@ -261,7 +261,7 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 **Questions.**
 
 - **Q-RT1** spawn_runtime reports a thread or tokio build failure as Error { Runtime }, but the handle then has no live receiver. Does the UI treat that as fatal?
-- **Q-RT2** No 401 handling resets Session.logged_in; only re-pasting the key evicts the session, so an expired cookie turns CreateBounty into 401 until then (nostr.rs:535-538, 868).
+- ~~**Q-RT2** No 401 handling resets Session.logged_in; only re-pasting the key evicts the session, so an expired cookie turns CreateBounty into 401 until then (nostr.rs:535-538, 868).~~ ✓ create_bounty now treats a 401 as an expired session: it clears logged_in, logs in again on the same cookie jar and retries once. The server cookie lasts 24 h with no rolling renewal (magic-carpet-v2/src/middleware/sessionStore.js:9,146; fixed 2026-09-22).
 
 #### FM · Forms
 
@@ -806,7 +806,7 @@ Reference by ID. ✓ resolved (with date) · → routed to a named next step · 
 - **Q-SH2** (SH) Every unbounded_send drops its Result; if the runtime thread died, a submit does nothing beyond the earlier Error { Runtime } line.
 - **Q-BR1** (BR) Both channels are unbounded; a window that stops draining never applies backpressure. Fine for one window?
 - **Q-RT1** (RT) spawn_runtime reports a thread or tokio build failure as Error { Runtime }, but the handle then has no live receiver. Does the UI treat that as fatal?
-- **Q-RT2** (RT) No 401 handling resets Session.logged_in; only re-pasting the key evicts the session, so an expired cookie turns CreateBounty into 401 until then (nostr.rs:535-538, 868).
+- ~~**Q-RT2**~~ (RT) ✓ create_bounty now treats a 401 as an expired session: it clears logged_in, logs in again on the same cookie jar and retries once. The server cookie lasts 24 h with no rolling renewal (magic-carpet-v2/src/middleware/sessionStore.js:9,146; fixed 2026-09-22).
 - **Q-FM1** (FM) esc between PublishDList and DListPublished orphans the DList: published and logged, no bounty (shell.rs:1187, 692-693).
 - **Q-FM2** (FM) autoPay is hardcoded true, so an issuer off the server allowlist gets 403 every time. Is a manual-pay bounty ever needed from this UI?
 - **Q-FM3** (FM) An open, unsubmitted claim form retargets to whichever bounty you arrow to (shell.rs:1116-1127). Intended for a stage demo?
