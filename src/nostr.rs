@@ -264,6 +264,10 @@ pub enum Update {
     WalletFailed { pubkey: String, message: String },
     /// The Coinos balance, in sats.
     Balance { pubkey: String, sats: u64 },
+    /// A balance read for this account failed or found no login. Sent on
+    /// every failure (the feed's `Error` is sent once per streak), so a
+    /// waiting remove confirm always gets an answer.
+    BalanceFailed { pubkey: String },
     /// Coinos accepted the payment: `sats` left this account's wallet for
     /// `to`. A `Balance` follows.
     Sent {
@@ -1054,7 +1058,10 @@ async fn fetch_balance(
 ) {
     let login = match secrets::load_coinos_login(&pubkey) {
         Ok(Some(login)) if login.has_token() => login,
-        _ => return,
+        _ => {
+            let _ = updates.unbounded_send(Update::BalanceFailed { pubkey });
+            return;
+        }
     };
     let mark = |failing: bool| -> bool {
         let mut set = failures.lock().unwrap_or_else(|p| p.into_inner());
@@ -1076,6 +1083,7 @@ async fn fetch_balance(
                     message: format!("Balance check failed: {e}"),
                 });
             }
+            let _ = updates.unbounded_send(Update::BalanceFailed { pubkey });
         }
     }
 }

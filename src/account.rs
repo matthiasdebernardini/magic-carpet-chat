@@ -871,7 +871,7 @@ fn secret_key_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyE
 /// The two-click remove, the same flow as the sidebar's link.
 fn remove_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElement {
     let armed = shell.remove_armed(pubkey);
-    let sats_left = shell.sats_left_warning(pubkey);
+    let sats_left = shell.remove_warning(pubkey);
     let pubkey = pubkey.to_string();
     card()
         .border_color(rgba(0xe5646c33))
