@@ -541,7 +541,7 @@ fn form_card(
     title: String,
     rows: Vec<AnyElement>,
     error: Option<String>,
-    submitting: bool,
+    busy: Option<&'static str>,
     hint_text: &'static str,
     cx: &mut Context<Shell>,
 ) -> AnyElement {
@@ -590,11 +590,7 @@ fn form_card(
                     .child(SharedString::from(error)),
             )
         })
-        .child(if submitting {
-            hint("Publishing…").into_any_element()
-        } else {
-            hint(hint_text).into_any_element()
-        })
+        .child(hint(busy.unwrap_or(hint_text)))
         .into_any_element()
 }
 
@@ -625,7 +621,11 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             "New DList + bounty".into(),
             rows,
             form.error.clone(),
-            form.submitting,
+            if form.checking_list.is_some() {
+                Some("Checking the list…")
+            } else {
+                form.submitting.then_some("Publishing…")
+            },
             "Enter advances · Enter on the last field publishes the 39998 list, then creates the auto-pay bounty · esc cancels",
             cx,
         ));
@@ -662,7 +662,7 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             format!("Claim an item on {dtag}{reward}"),
             rows,
             form.error.clone(),
-            form.submitting,
+            form.submitting.then_some("Publishing…"),
             "Enter publishes the kind-39999 claim through the instance · esc cancels",
             cx,
         ));

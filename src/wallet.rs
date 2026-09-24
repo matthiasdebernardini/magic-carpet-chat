@@ -31,7 +31,7 @@ use magic_carpet_chat::nostr::{self, WalletCreated};
 
 use crate::dashboard::{MONO, muted};
 use crate::palette::*;
-use crate::shell::{AccountView, Shell};
+use crate::shell::{AccountView, ProfileRead, Shell};
 use crate::timefmt;
 
 /// The wallet as the UI sees it, one per account view.
@@ -381,6 +381,12 @@ pub fn panel(
                 this.child(send_block(state, inputs, cx))
             })
             .when_some(created, |this, created| {
+                // The relays carry someone else's address: it is never
+                // overwritten, so payouts go there and a retry cannot help.
+                let other = view
+                    .lud16
+                    .clone()
+                    .filter(|l| !l.eq_ignore_ascii_case(&created.lightning_address));
                 let username = created.username.clone();
                 let for_password = pubkey.clone();
                 this.child(
@@ -413,22 +419,31 @@ pub fn panel(
                                 ),
                         ),
                 )
-                .when_some(created.publish_error.clone(), |this, error| {
-                    let for_retry = pubkey.clone();
+                .when_some(other.clone(), |this, other| {
                     this.child(muted(
-                        "The wallet exists, but the address is not on your profile yet — \
-                         claims will not be paid until it is.",
+                        format!("Your profile pays {other}; this wallet is not on it."),
                         AMBER,
                     ))
-                    .child(
-                        button("wallet-retry-publish", "Retry publishing", false).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.create_wallet(for_retry.clone(), cx)
-                            }),
-                        ),
-                    )
-                    .child(muted(error, AMBER))
                 })
+                .when_some(
+                    created.publish_error.clone().filter(|_| other.is_none()),
+                    |this, error| {
+                        let for_retry = pubkey.clone();
+                        this.child(muted(
+                            "The wallet exists, but the address is not on your profile yet — \
+                             claims will not be paid until it is.",
+                            AMBER,
+                        ))
+                        .child(
+                            button("wallet-retry-publish", "Retry publishing", false).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.create_wallet(for_retry.clone(), cx)
+                                }),
+                            ),
+                        )
+                        .child(muted(error, AMBER))
+                    },
+                )
             })
     } else if nostr::is_issuer(&pubkey) {
         // The house issuer's wallet is the prod payer's, managed elsewhere;
@@ -437,6 +452,17 @@ pub fn panel(
             "The house key's wallet is not managed here.",
             TEXT_MUTED,
         ))
+    } else if view.profile == ProfileRead::Checking {
+        v_flex().child(muted("Checking the profile…", TEXT_MUTED))
+    } else if view.profile == ProfileRead::Failed {
+        // Unknown is not "none": offer no wallet until the read succeeds.
+        v_flex()
+            .gap(px(10.))
+            .child(muted("Couldn't read this profile.", AMBER))
+            .child(
+                button("wallet-profile-retry", "Try again", false)
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+            )
     } else {
         let for_create = pubkey.clone();
         v_flex()

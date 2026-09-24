@@ -189,6 +189,7 @@ async fn poll_balance(
             .commands
             .unbounded_send(Command::FetchBalance {
                 pubkey: account.pubkey.clone(),
+                request: None,
             })
             .unwrap();
         let next_ask = Instant::now() + POLL_EVERY;
@@ -205,7 +206,7 @@ async fn poll_balance(
             }
             if let Some(update) = try_next(&mut handle.updates, left.min(deadline - now)).await {
                 fail_on_error(&update);
-                if let Update::Balance { pubkey, sats } = update
+                if let Update::Balance { pubkey, sats, .. } = update
                     && pubkey == account.pubkey
                     && enough(sats)
                 {

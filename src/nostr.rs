@@ -78,12 +78,13 @@ pub enum Command {
     /// Open the relay connection. Idempotent.
     Connect,
     /// Read the store, then each account's kind-0 from the instance. Emits
-    /// `AccountsLoaded`, then `ProfileLoaded` for whichever accounts have a
-    /// profile (a failed scan is silent).
+    /// `AccountsLoaded`, then per account `ProfileLoaded` or, when the scan
+    /// failed, `ProfileUnavailable`.
     LoadAccounts,
     /// GET the issuer's bounty list (status=all). Emits `Bounties` or
-    /// `BountiesFailed`.
-    FetchBounties,
+    /// `BountiesFailed` carrying the same `seq`, so the UI can tell a reply
+    /// to this read from one to an earlier read.
+    FetchBounties { seq: u64 },
     PublishDList {
         pubkey: String,
         singular: String,
@@ -125,9 +126,13 @@ pub enum Command {
     /// `WalletFailed`. Idempotent: a login already stored for the account is
     /// reused, so a retry after a publish failure never opens a second one.
     CreateCoinosWallet { pubkey: String },
-    /// Read the wallet balance with the stored token. Emits `Balance`, or
-    /// nothing (one feed line per failure streak).
-    FetchBalance { pubkey: String },
+    /// Read the wallet balance with the stored token. Emits `Balance` or
+    /// `BalanceFailed` carrying the same `request`, plus one feed line per
+    /// failure streak. `None` for polls; the armed remove sets its own id.
+    FetchBalance {
+        pubkey: String,
+        request: Option<u64>,
+    },
     /// Pay `sats` from this account's Coinos wallet to the Lightning address
     /// `to` (any domain: another account here, Strike, …). Emits `Sent` and
     /// then a fresh `Balance`, or `SendFailed`.
@@ -163,8 +168,11 @@ pub enum ErrorSource {
     Accounts,
     /// PublishDList.
     DList,
-    /// CreateBounty.
+    /// CreateBounty, refused: no bounty was made.
     Bounty,
+    /// CreateBounty, unanswered (transport error, timeout, 5xx, unreadable
+    /// reply): the server may have made the bounty anyway.
+    BountyOutcomeUnknown,
     /// PublishClaim.
     Claim,
     /// Background bounty watching (API polls, receipt subscriptions).
@@ -194,6 +202,9 @@ pub enum Update {
         /// fact: the account screen warns, because a payout needs one.
         lud16: Option<String>,
     },
+    /// The account's kind-0 could not be read. Nothing is known about its
+    /// lud16, so the UI must not offer to write one.
+    ProfileUnavailable { pubkey: String },
     /// A secret was rejected or could not be stored. Fixed text from
     /// [`SecretError`] — it never echoes the input.
     AddAccountFailed { message: String },
@@ -212,8 +223,8 @@ pub enum Update {
         profile_found: bool,
     },
     /// The issuer's bounty list, freshly fetched.
-    Bounties(Vec<Bounty>),
-    BountiesFailed(String),
+    Bounties { seq: u64, list: Vec<Bounty> },
+    BountiesFailed { seq: u64, message: String },
     /// A fresh full snapshot of a watched bounty (emitted only on change).
     /// Boxed: the snapshot dwarfs every other variant on the channel.
     BountyDetail(Box<BountyDetail>),
@@ -257,7 +268,18 @@ pub enum Update {
     /// password.
     WalletFailed { pubkey: String, message: String },
     /// The Coinos balance, in sats.
-    Balance { pubkey: String, sats: u64 },
+    Balance {
+        pubkey: String,
+        sats: u64,
+        request: Option<u64>,
+    },
+    /// A balance read for this account failed or found no login. Sent on
+    /// every failure (the feed's `Error` is sent once per streak), so a
+    /// waiting remove confirm always gets an answer.
+    BalanceFailed {
+        pubkey: String,
+        request: Option<u64>,
+    },
     /// Coinos accepted the payment: `sats` left this account's wallet for
     /// `to`. A `Balance` follows.
     Sent {
@@ -361,6 +383,18 @@ enum BridgeError {
     /// owner put there, and this string reaches the feed and the wallet panel.
     #[error("{0}")]
     Profile(&'static str),
+    /// The create request went out and no clear answer came back.
+    #[error(transparent)]
+    OutcomeUnknown(ApiError),
+}
+
+/// A failed create, split by whether the server may still have made it.
+fn create_outcome(e: ApiError) -> BridgeError {
+    match e {
+        ApiError::Http(_) | ApiError::Decode(_) => BridgeError::OutcomeUnknown(e),
+        ApiError::Status { status, .. } if status >= 500 => BridgeError::OutcomeUnknown(e),
+        e => BridgeError::Api(e),
+    }
 }
 
 /// Start the named runtime thread. Returns immediately; a thread or runtime
@@ -473,8 +507,8 @@ async fn run(
             Command::LoadAccounts => {
                 tokio::spawn(load_accounts(updates.clone()));
             }
-            Command::FetchBounties => {
-                tokio::spawn(fetch_bounties(updates.clone()));
+            Command::FetchBounties { seq } => {
+                tokio::spawn(fetch_bounties(seq, updates.clone()));
             }
             Command::AddAccount {
                 secret,
@@ -506,10 +540,10 @@ async fn run(
                 let updates = updates.clone();
                 tokio::spawn(create_coinos_wallet(sessions, pubkey, None, updates));
             }
-            Command::FetchBalance { pubkey } => {
+            Command::FetchBalance { pubkey, request } => {
                 let failures = balance_failures.clone();
                 let updates = updates.clone();
-                tokio::spawn(fetch_balance(pubkey, failures, updates));
+                tokio::spawn(fetch_balance(pubkey, request, failures, updates));
             }
             Command::Send { pubkey, to, sats } => {
                 let failures = balance_failures.clone();
@@ -555,7 +589,11 @@ async fn run(
                     let update = match create_bounty(&sessions, &pubkey, &req).await {
                         Ok(id) => Update::BountyCreated { id },
                         Err(e) => Update::Error {
-                            source: ErrorSource::Bounty,
+                            source: if matches!(e, BridgeError::OutcomeUnknown(_)) {
+                                ErrorSource::BountyOutcomeUnknown
+                            } else {
+                                ErrorSource::Bounty
+                            },
                             message: e.to_string(),
                         },
                     };
@@ -682,7 +720,17 @@ async fn create_bounty(
         session.api.login(&session.keys).await?;
         session.logged_in = true;
     }
-    let bounty = session.api.create_bounty(req).await?;
+    // The server's session cookie dies after 24 h with no renewal, while
+    // `logged_in` lives as long as the app: a 401 means log in again, once.
+    let bounty = match session.api.create_bounty(req).await {
+        Err(ApiError::Status { status: 401, .. }) => {
+            session.logged_in = false;
+            session.api.login(&session.keys).await?;
+            session.logged_in = true;
+            session.api.create_bounty(req).await.map_err(create_outcome)?
+        }
+        result => result.map_err(create_outcome)?,
+    };
     Ok(bounty.id)
 }
 
@@ -786,6 +834,15 @@ fn merge_lud16(
             }
         },
     };
+    // A Lightning address set elsewhere is where this person already gets
+    // paid; replacing it would reroute their payouts. The same address is a
+    // retry and goes through.
+    let current = Profile::from_value(&serde_json::Value::Object(profile.clone())).lud16;
+    if current.is_some_and(|current| !current.eq_ignore_ascii_case(lud16.trim())) {
+        return Err(BridgeError::Profile(
+            "Your profile already has a Lightning address; it was left alone",
+        ));
+    }
     profile.insert("lud16".into(), serde_json::Value::String(lud16.to_string()));
     if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty())
         && Profile::from_value(&serde_json::Value::Object(profile.clone()))
@@ -1003,17 +1060,21 @@ async fn send_sats(
     }
     // Either way the wallet may have changed: the panel shows the new
     // balance at once, not on the next poll.
-    fetch_balance(pubkey, failures, updates).await;
+    fetch_balance(pubkey, None, failures, updates).await;
 }
 
 async fn fetch_balance(
     pubkey: String,
+    request: Option<u64>,
     failures: BalanceFailures,
     updates: mpsc::UnboundedSender<Update>,
 ) {
     let login = match secrets::load_coinos_login(&pubkey) {
         Ok(Some(login)) if login.has_token() => login,
-        _ => return,
+        _ => {
+            let _ = updates.unbounded_send(Update::BalanceFailed { pubkey, request });
+            return;
+        }
     };
     let mark = |failing: bool| -> bool {
         let mut set = failures.lock().unwrap_or_else(|p| p.into_inner());
@@ -1026,7 +1087,11 @@ async fn fetch_balance(
     match coinos::balance(&login.token).await {
         Ok(sats) => {
             mark(false);
-            let _ = updates.unbounded_send(Update::Balance { pubkey, sats });
+            let _ = updates.unbounded_send(Update::Balance {
+                pubkey,
+                sats,
+                request,
+            });
         }
         Err(e) => {
             if mark(true) {
@@ -1035,6 +1100,7 @@ async fn fetch_balance(
                     message: format!("Balance check failed: {e}"),
                 });
             }
+            let _ = updates.unbounded_send(Update::BalanceFailed { pubkey, request });
         }
     }
 }
@@ -1077,19 +1143,25 @@ async fn load_accounts(updates: mpsc::UnboundedSender<Update>) {
         return;
     }
 
-    // A scan failure is not an error state: the UI's fallback labels are
-    // the defined behaviour when no profile is known. A CONFIRMED-empty
-    // profile is reported, though: the UI pre-fills a stored wallet's address
-    // from the store, and only a real profile read can say whether the
-    // relays carry that lud16 yet.
-    let Ok(api) = Api::new() else { return };
+    // A CONFIRMED-empty profile is reported: the UI pre-fills a stored
+    // wallet's address from the store, and only a real profile read can say
+    // whether the relays carry that lud16 yet. A failed scan is reported
+    // too, so the UI never mistakes "unknown" for "no Lightning address".
+    let api = Api::new();
     for account in &store.accounts {
-        if let Ok(content) = fetch_kind0(&api, &account.pubkey).await {
-            let _ = updates.unbounded_send(profile_loaded(
+        let read = match &api {
+            Ok(api) => fetch_kind0(api, &account.pubkey).await,
+            Err(_) => Err(()),
+        };
+        let _ = updates.unbounded_send(match read {
+            Ok(content) => profile_loaded(
                 account.pubkey.clone(),
                 content.map(|c| parse_profile(&c)).unwrap_or_default(),
-            ));
-        }
+            ),
+            Err(()) => Update::ProfileUnavailable {
+                pubkey: account.pubkey.clone(),
+            },
+        });
     }
 }
 
@@ -1191,15 +1263,18 @@ pub fn is_issuer(pubkey: &str) -> bool {
     pubkey == issuer_pubkey()
 }
 
-async fn fetch_bounties(updates: mpsc::UnboundedSender<Update>) {
+async fn fetch_bounties(seq: u64, updates: mpsc::UnboundedSender<Update>) {
     let result = async {
         let api = Api::new()?;
         Ok::<_, BridgeError>(api.list_bounties(&issuer_pubkey()).await?)
     }
     .await;
     let update = match result {
-        Ok(bounties) => Update::Bounties(bounties),
-        Err(e) => Update::BountiesFailed(e.to_string()),
+        Ok(list) => Update::Bounties { seq, list },
+        Err(e) => Update::BountiesFailed {
+            seq,
+            message: e.to_string(),
+        },
     };
     let _ = updates.unbounded_send(update);
 }
@@ -1539,7 +1614,8 @@ async fn fetch_trust(
     for url in TRUST_FALLBACK_RELAYS {
         let _ = client.add_relay(url).await;
     }
-    client.connect().await;
+    // Reads on a relay still connecting fail; give them a moment first.
+    client.connect().and_wait(Duration::from_secs(5)).await;
 
     // The account's outbox relays (kind-10002), unioned with the fallback
     // set; a failed 10002 read quietly yields just the fallbacks.
@@ -1625,8 +1701,8 @@ async fn outbox_relays(client: &Client, pubkey: &str) -> Vec<String> {
 }
 
 /// Run `filter` against each relay individually and keep the results apart:
-/// `Ok` means that relay answered (EOSE), `Err` means it failed — the
-/// difference between "no event exists" and "nobody answered".
+/// `Ok` means that relay answered, `Err` means it failed — the difference
+/// between "no event exists" and "nobody answered". See [`relay_answer`].
 async fn read_per_relay(
     client: &Client,
     urls: &[String],
@@ -1640,17 +1716,36 @@ async fn read_per_relay(
                 Ok(Some(relay)) => relay,
                 _ => return (url, Err(())),
             };
-            let events = relay
-                .fetch_events(filter)
-                .timeout(Duration::from_secs(10))
-                .policy(ReqExitPolicy::ExitOnEOSE)
-                .await
-                .map(|events| events.into_iter().collect())
-                .map_err(|_| ());
-            (url, events)
+            // No SDK `.timeout()`: it ends the read with `Ok(empty)`, which
+            // looks exactly like an answer. Without it the fetch ends at
+            // EOSE, CLOSED or disconnect, and this timeout bounds the rest.
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(10),
+                relay.fetch_events(filter).policy(ReqExitPolicy::ExitOnEOSE),
+            )
+            .await
+            .ok()
+            .map(|read| {
+                read.map(|events| events.into_iter().collect())
+                    .map_err(|_| ())
+            });
+            let answer = relay_answer(fetched, relay.status().is_connected());
+            (url, answer)
         }
     }))
     .await
+}
+
+/// One relay's read, classified. `fetched` is `None` on the outer timeout.
+/// The SDK also returns `Ok(empty)` when the relay dropped (or never came
+/// up) mid-read, so an empty answer only counts from a relay still
+/// connected — otherwise a dead relay would read as "no event exists".
+fn relay_answer(fetched: Option<Result<Vec<Event>, ()>>, connected: bool) -> Result<Vec<Event>, ()> {
+    match fetched {
+        None => Err(()),
+        Some(Ok(events)) if events.is_empty() && !connected => Err(()),
+        Some(read) => read,
+    }
 }
 
 /// `Ok` events from the answering relays, and how many answered.
@@ -1736,7 +1831,7 @@ async fn read_assertion(
         .kind(Kind::Custom(30382))
         .author(provider_key)
         .identifier(subject);
-    let results = read_per_relay(client, &[relay.clone()], filter).await;
+    let results = read_per_relay(client, std::slice::from_ref(&relay), filter).await;
     match results.into_iter().next() {
         Some((_, Ok(events))) => {
             let mut assertion = trust::parse_assertion(&events, provider, subject);
@@ -1816,6 +1911,40 @@ async fn resolve_instance_provider(
 mod tests {
     use super::*;
     use crate::api::parse_detail;
+
+    #[test]
+    fn only_an_unanswered_create_is_outcome_unknown() {
+        let unknown = |e| matches!(create_outcome(e), BridgeError::OutcomeUnknown(_));
+        assert!(unknown(ApiError::Http("timed out".into())));
+        assert!(unknown(ApiError::Decode("eof".into())));
+        assert!(unknown(ApiError::Status { status: 502, message: String::new() }));
+        assert!(!unknown(ApiError::Status { status: 400, message: String::new() }));
+        assert!(!unknown(ApiError::Status { status: 401, message: String::new() }));
+        assert!(!unknown(ApiError::Rejected("no".into())));
+    }
+
+    #[test]
+    fn a_silent_or_dropped_relay_is_a_failed_read_not_no_events() {
+        let event = EventBuilder::new(Kind::TextNote, "x").finalize(&Keys::generate()).unwrap();
+        // Timed out: never an answer, connected or not.
+        assert_eq!(relay_answer(None, true), Err(()));
+        // The SDK's Ok(empty) after a disconnect, or from a relay never up.
+        assert_eq!(relay_answer(Some(Ok(vec![])), false), Err(()));
+        // A connected relay that reached EOSE with nothing: a real "none".
+        assert_eq!(relay_answer(Some(Ok(vec![])), true), Ok(vec![]));
+        assert_eq!(
+            relay_answer(Some(Ok(vec![event.clone()])), false),
+            Ok(vec![event])
+        );
+        assert_eq!(relay_answer(Some(Err(())), true), Err(()));
+        // All timed out: nobody answered, so the designation read is Err and
+        // Evidence::apply keeps the prior verdict.
+        let (count, events) = answered(vec![
+            ("wss://a".into(), relay_answer(None, true)),
+            ("wss://b".into(), relay_answer(Some(Ok(vec![])), false)),
+        ]);
+        assert_eq!((count, events.len()), (0, 0));
+    }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/bounty-5f44688e.json");
     const CLAIM_ID: &str = "afb4bfe5b6556aa4a65a3c51a82d0e974c234dbe9551963d347208aa5d4ebc85";
@@ -1973,8 +2102,13 @@ mod tests {
         // What goes on the wire: every original key plus lud16, nothing else.
         assert_eq!(merged.len(), 6);
 
-        // An existing lud16 is replaced, not duplicated.
-        let merged = merge_lud16(Some(r#"{"lud16":"old@strike.me","name":"M"}"#), "new@coinos.io", None).unwrap();
+        // A different existing lud16 is never replaced: payouts go there.
+        assert!(matches!(
+            merge_lud16(Some(r#"{"lud16":"old@strike.me","name":"M"}"#), "new@coinos.io", None),
+            Err(BridgeError::Profile(_))
+        ));
+        // The same one (a retry) goes through, not duplicated.
+        let merged = merge_lud16(Some(r#"{"lud16":"new@coinos.io","name":"M"}"#), "new@coinos.io", None).unwrap();
         assert_eq!(merged["lud16"], "new@coinos.io");
         assert_eq!(merged["name"], "M");
         assert_eq!(merged.len(), 2);

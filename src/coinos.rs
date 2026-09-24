@@ -388,20 +388,31 @@ pub async fn pay_invoice(token: &Secret, bolt11: &str, sats: u64) -> Result<(), 
                 CoinosError::OutcomeUnknown
             }
         })?;
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(CoinosError::Refused("the wallet token was not accepted".into()));
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
     }
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let body = body.trim();
-        let reason = match body.char_indices().nth(REFUSAL_TEXT_CAP) {
-            Some((cut, _)) => format!("{}…", &body[..cut]),
-            None if body.is_empty() => "payment not accepted".to_string(),
-            None => body.to_string(),
-        };
-        return Err(CoinosError::Refused(reason));
+    let body = resp.text().await.unwrap_or_default();
+    Err(payment_refusal(status, &body))
+}
+
+/// A non-2xx answer to `POST /api/payments`. A 5xx is a coinos or proxy
+/// failure that may have come after the payment left, so it is
+/// [`CoinosError::OutcomeUnknown`]; only a 4xx is a refusal.
+fn payment_refusal(status: reqwest::StatusCode, body: &str) -> CoinosError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return CoinosError::Refused("the wallet token was not accepted".into());
     }
-    Ok(())
+    if status.is_server_error() {
+        return CoinosError::OutcomeUnknown;
+    }
+    let body = body.trim();
+    let reason = match body.char_indices().nth(REFUSAL_TEXT_CAP) {
+        Some((cut, _)) => format!("{}…", &body[..cut]),
+        None if body.is_empty() => "payment not accepted".to_string(),
+        None => body.to_string(),
+    };
+    CoinosError::Refused(reason)
 }
 
 /// bech32 with HRP `lnurl`. The original checksum, NOT bech32m: LUD-01
@@ -468,6 +479,24 @@ mod tests {
         assert!(matches!(
             invoice_for("lnbc1notaninvoice", 21),
             Err(CoinosError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn a_payment_5xx_is_outcome_unknown_and_a_4xx_is_a_refusal() {
+        use reqwest::StatusCode;
+        // A 502 can come from a proxy after coinos already paid.
+        assert!(matches!(
+            payment_refusal(StatusCode::BAD_GATEWAY, "<html>Bad Gateway</html>"),
+            CoinosError::OutcomeUnknown
+        ));
+        match payment_refusal(StatusCode::BAD_REQUEST, " Insufficient funds ") {
+            CoinosError::Refused(reason) => assert_eq!(reason, "Insufficient funds"),
+            other => panic!("a 400 must be a refusal: {other:?}"),
+        }
+        assert!(matches!(
+            payment_refusal(StatusCode::UNAUTHORIZED, ""),
+            CoinosError::Refused(_)
         ));
     }
 

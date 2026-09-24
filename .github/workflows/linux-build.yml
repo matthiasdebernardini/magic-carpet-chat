@@ -1,0 +1,57 @@
+name: linux-build
+
+# Builds the Linux x86_64 binary as a workflow artifact, with no tag and no
+# release. workflow_dispatch only works once this file is on the default
+# branch, so a push to an e2e/ branch builds on its own.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "e2e/**"
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x86_64
+    # Same runner as release.yml: 22.04's glibc is the floor the binary needs.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # 1.98.1 matches rust-toolchain.toml; bump both together.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: linux-x86_64
+
+      # gpui on Linux talks to X11, Wayland, xkbcommon, fontconfig and Vulkan.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake pkg-config \
+            libasound2-dev libfontconfig-dev libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-xkb-dev \
+            libxcb-xinput-dev libxcb-cursor-dev libvulkan-dev
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: magic-carpet-chat-linux-x86_64
+          path: target/release/magic-carpet-chat
+          if-no-files-found: error
+          retention-days: 14

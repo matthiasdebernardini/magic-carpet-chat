@@ -1,6 +1,11 @@
 //! The Accounts screen — one card per stored account — and the Account
-//! page: header, five-tab strip, and the Trust tab, the one tab with real
-//! data so far.
+//! page: header, five-tab strip, and the two tabs with real content so far:
+//! Identity & keys (npub, nsec export, remove) and Trust.
+//!
+//! The nsec leaves the store only two ways: straight to the clipboard, or
+//! into [`Revealed`] while the Identity tab shows it. That copy is a
+//! [`Secret`], lives at most [`NSEC_SHOWN_FOR`], and is dropped on Hide,
+//! on a tab change, and on leaving the page.
 //!
 //! Everything the Trust tab shows came through `TrustState`: signature-
 //! verified kind-10040 / kind-30382 / kind-3 reads plus the Brainstorm setup
@@ -8,6 +13,7 @@
 //! never answers reads as "couldn't check", never as "none".
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -15,6 +21,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use nostr_sdk::prelude::*;
 
 use magic_carpet_chat::nostr;
+use magic_carpet_chat::secrets::Secret;
 use magic_carpet_chat::trust::{self, Assertion, BrainstormKey, Designation};
 
 use crate::dashboard::{MONO, muted};
@@ -55,6 +62,31 @@ pub(crate) struct AccountPage {
     pub open_raw: HashSet<String>,
     /// Set by a copy click; the next update clears it.
     pub copied: Option<String>,
+    /// The nsec while "Reveal" is on; `None` is the masked row.
+    pub revealed: Option<Revealed>,
+    /// The 1 s countdown behind `revealed`. Cancel-on-drop, so clearing it
+    /// stops the clock.
+    pub reveal_timer: Option<Task<()>>,
+}
+
+/// How long a revealed nsec stays on screen.
+pub(crate) const NSEC_SHOWN_FOR: Duration = Duration::from_secs(30);
+
+/// A revealed nsec and the moment it hides again. `Secret` keeps it out of
+/// any `{:?}`; only the Identity tab's render calls `expose`.
+pub(crate) struct Revealed {
+    pub nsec: Secret,
+    pub hide_at: Instant,
+}
+
+impl Revealed {
+    /// Whole seconds left, rounded up, so the first frame reads 30.
+    pub(crate) fn seconds_left(&self) -> u64 {
+        self.hide_at
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .div_ceil(1000) as u64
+    }
 }
 
 impl AccountPage {
@@ -64,7 +96,15 @@ impl AccountPage {
             tab,
             open_raw: HashSet::new(),
             copied: None,
+            revealed: None,
+            reveal_timer: None,
         }
+    }
+
+    /// Masks the nsec again and stops its countdown.
+    pub(crate) fn hide_nsec(&mut self) {
+        self.revealed = None;
+        self.reveal_timer = None;
     }
 }
 
@@ -451,7 +491,7 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
                             ACCENT_LIGHT,
                             cx,
                             move |this, window, cx| {
-                                this.open_account(&pubkey, Tab::Trust, window, cx);
+                                this.open_account(&pubkey, Tab::Identity, window, cx);
                             },
                         )),
                 ),
@@ -462,8 +502,8 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
 // ------------------------------------------------------------- Account page
 
 /// The Account screen: the mock's `isAccountDetail` block — back link,
-/// header, tab strip, and the tab's body. Only Trust has real data; the
-/// other four tabs say so.
+/// header, tab strip, and the tab's body. Identity & keys and Trust are
+/// built; the other three tabs say "Not built yet."
 pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let Some(page) = &shell.account_page else {
         return muted("No account selected.", TEXT_MUTED);
@@ -598,6 +638,9 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                             .child(item.label())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(page) = &mut this.account_page {
+                                    if page.tab != item {
+                                        page.hide_nsec();
+                                    }
                                     page.tab = item;
                                 }
                                 cx.notify();
@@ -606,9 +649,288 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                 ),
         )
         .child(match tab {
+            Tab::Identity => render_identity(shell, &pubkey, &npub, cx),
             Tab::Trust => render_trust(shell, &pubkey, cx),
             _ => muted("Not built yet.", TEXT_MUTED),
         })
+        .into_any_element()
+}
+
+// ---------------------------------------------------------- Identity tab
+
+/// The mock's Identity & keys tab: public identity, the nsec export, and
+/// the remove card.
+fn render_identity(
+    shell: &Shell,
+    pubkey: &str,
+    npub: &str,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    v_flex()
+        .gap(px(16.))
+        .child(public_identity_card(shell, npub, cx))
+        .child(secret_key_card(shell, pubkey, cx))
+        .child(remove_card(shell, pubkey, cx))
+        .into_any_element()
+}
+
+/// The card title the Identity tab uses: no kind, no pill.
+fn plain_title(title: &'static str) -> impl IntoElement {
+    div()
+        .mb(px(4.))
+        .text_size(px(14.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(title)
+}
+
+fn card_note(text: &'static str) -> impl IntoElement {
+    div()
+        .mb(px(12.))
+        .text_size(px(12.5))
+        .text_color(rgb(TEXT_MUTED))
+        .child(text)
+}
+
+/// The dark inset row a key sits in, with its buttons at the right.
+fn key_row(border: u32) -> Div {
+    h_flex()
+        .gap(px(12.))
+        .items_center()
+        .bg(rgb(BG_APP))
+        .border_1()
+        .border_color(rgba(border))
+        .rounded(px(10.))
+        .px(px(14.))
+        .py(px(12.))
+}
+
+/// The key text: mono, and free to wrap anywhere inside the row.
+fn key_text(text: impl Into<SharedString>, color: u32) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w(px(0.))
+        .font_family(MONO)
+        .text_size(px(12.5))
+        .text_color(rgb(color))
+        .child(text.into())
+}
+
+/// A filled small button ("Reveal", "Hide").
+fn fill_button(
+    id: &'static str,
+    label: &'static str,
+    color: u32,
+    cx: &mut Context<Shell>,
+    on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .px(px(14.))
+        .py(px(7.))
+        .rounded(px(7.))
+        .bg(rgb(BG_NAV_ON))
+        .cursor_pointer()
+        .text_size(px(12.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(color))
+        .hover(|this| this.bg(rgb(0x32324c)))
+        .child(label)
+        .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+}
+
+fn public_identity_card(shell: &Shell, npub: &str, cx: &mut Context<Shell>) -> AnyElement {
+    let copied = shell
+        .account_page
+        .as_ref()
+        .is_some_and(|page| page.copied.as_deref() == Some("npub"));
+    let copy = npub.to_string();
+    card()
+        .child(plain_title("Public identity"))
+        .child(card_note(
+            "Safe to share — this is how vouchers and bounty lists find you.",
+        ))
+        .child(
+            key_row(0x2a2a40ff)
+                .child(key_text(npub.to_string(), TEXT))
+                .child(outline_button(
+                    "copy-npub",
+                    if copied { "copied" } else { "copy" },
+                    ACCENT_LIGHT,
+                    cx,
+                    move |this, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                        if let Some(page) = &mut this.account_page {
+                            page.copied = Some("npub".into());
+                        }
+                        cx.notify();
+                    },
+                )),
+        )
+        .child(div().mt(px(12.)).child(open_link(
+            "identity-view-profile",
+            "View this profile on Brainstorm ↗",
+            format!("https://brainstorm.world/profile/{npub}"),
+            cx,
+        )))
+        .into_any_element()
+}
+
+fn secret_key_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElement {
+    let page = shell.account_page.as_ref();
+    let copied = page.is_some_and(|page| page.copied.as_deref() == Some("nsec"));
+    let revealed = page.and_then(|page| page.revealed.as_ref());
+    let copy_button = {
+        let pubkey = pubkey.to_string();
+        outline_button(
+            "copy-nsec",
+            if copied { "copied" } else { "copy" },
+            ACCENT_LIGHT,
+            cx,
+            move |this, _, cx| this.copy_nsec(&pubkey, cx),
+        )
+        .into_any_element()
+    };
+    let body = match revealed {
+        None => {
+            let pubkey = pubkey.to_string();
+            key_row(0x2a2a40ff)
+                .child(key_text(
+                    "nsec1••••••••••••••••••••••••••••••••••••••••••••••••••••",
+                    TEXT_DIM,
+                ))
+                .child(fill_button(
+                    "reveal-nsec",
+                    "Reveal",
+                    TEXT,
+                    cx,
+                    move |this, _, cx| this.reveal_nsec(&pubkey, cx),
+                ))
+                .child(copy_button)
+                .into_any_element()
+        }
+        Some(revealed) => v_flex()
+            .child(
+                key_row(0xe5646c55)
+                    // The one place the nsec is formatted for display.
+                    .child(key_text(revealed.nsec.expose().to_string(), 0xf0c9cc))
+                    .child(copy_button)
+                    .child(fill_button(
+                        "hide-nsec",
+                        "Hide",
+                        TEXT_MUTED,
+                        cx,
+                        |this, _, cx| {
+                            if let Some(page) = &mut this.account_page {
+                                page.hide_nsec();
+                            }
+                            cx.notify();
+                        },
+                    )),
+            )
+            .child(
+                h_flex()
+                    .mt(px(10.))
+                    .gap(px(10.))
+                    .items_start()
+                    .bg(wash(0xe5646c14))
+                    .border_1()
+                    .border_color(rgba(0xe5646c44))
+                    .rounded(px(9.))
+                    .px(px(13.))
+                    .py(px(11.))
+                    .text_size(px(12.5))
+                    .text_color(rgb(0xf0a9ae))
+                    .child(
+                        div()
+                            .text_color(rgb(RED))
+                            .font_weight(FontWeight::BOLD)
+                            .child("!"),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).child(format!(
+                        "Anyone with this key is this identity — they can spend from \
+                         its wallet connection and sign as you. Paste it only into a \
+                         signer you trust (a browser extension or native app), never \
+                         into a website. It hides again in {}s.",
+                        revealed.seconds_left()
+                    ))),
+            )
+            .into_any_element(),
+    };
+    card()
+        .child(plain_title("Secret key (nsec)"))
+        .child(card_note(
+            "Stored on this computer in accounts.json. Export it to move this \
+             identity into another signer — a browser extension like Alby or \
+             nos2x, or another machine.",
+        ))
+        .child(body)
+        .into_any_element()
+}
+
+/// The two-click remove, the same flow as the sidebar's link.
+fn remove_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElement {
+    let armed = shell.remove_armed(pubkey);
+    let sats_left = shell.remove_warning(pubkey);
+    let pubkey = pubkey.to_string();
+    card()
+        .border_color(rgba(0xe5646c33))
+        .child(
+            h_flex()
+                .gap(px(16.))
+                .items_center()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(
+                            div()
+                                .text_size(px(14.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(0xf0a9ae))
+                                .child("Remove this account"),
+                        )
+                        .child(
+                            div()
+                                .mt(px(2.))
+                                .text_size(px(12.5))
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(
+                                    "Deletes the nsec and Coinos login from accounts.json. \
+                                     Export the nsec first if you ever want this identity back.",
+                                ),
+                        )
+                        .when_some(sats_left, |this, warning| {
+                            this.child(
+                                div()
+                                    .mt(px(6.))
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(AMBER))
+                                    .child(warning),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .id("remove-this-account")
+                        .flex_shrink_0()
+                        .px(px(16.))
+                        .py(px(8.))
+                        .rounded(px(9.))
+                        .border_1()
+                        .border_color(rgba(if armed { 0xe5646cff } else { 0xe5646c66 }))
+                        .when(armed, |this| this.bg(wash(0xe5646c14)))
+                        .cursor_pointer()
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(RED))
+                        .hover(|this| this.bg(wash(0xe5646c14)))
+                        .child(if armed { "Click again to remove" } else { "Remove…" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_account(pubkey.clone(), cx)
+                        })),
+                ),
+        )
         .into_any_element()
 }
 

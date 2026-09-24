@@ -308,6 +308,17 @@ pub fn keys(pubkey: &str) -> Result<Option<Keys>, SecretError> {
         .map_err(|_| SecretError::InvalidKey("A stored key"))
 }
 
+/// The stored nsec itself, bech32 (`add_account` normalised it), read
+/// fresh from the store. `Ok(None)` means no such account. Only the Identity
+/// tab calls this: to copy it to the clipboard or show it for 30 s.
+pub fn nsec(pubkey: &str) -> Result<Option<Secret>, SecretError> {
+    Ok(load()?
+        .accounts
+        .into_iter()
+        .find(|a| a.pubkey == pubkey)
+        .map(|a| a.nsec))
+}
+
 /// `MC_NSECS`: comma-separated nsecs, added if not already stored. Called at
 /// every launch and by `--import-keys`, so it must be idempotent: a key
 /// already in the store is left alone (its active flag included). Returns
@@ -343,6 +354,11 @@ pub fn import_from_env() -> Result<Vec<String>, SecretError> {
 mod tests {
     use super::*;
 
+    /// `MC_STORE_DIR` is process-wide. nextest gives each test its own
+    /// process, but `cargo test` (CI) runs them as threads of one, so the
+    /// store tests take turns.
+    static STORE_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn secret_never_prints_its_value() {
         let s = Secret::new("nsec1verysecretvalue");
@@ -371,8 +387,7 @@ mod tests {
     fn the_store_round_trips_accounts_wallets_and_the_active_flag() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        // nextest runs each test in its own process, so the env override
-        // cannot bleed into another test.
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("mc-store-test-{}", std::process::id()));
         unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
         assert!(load().unwrap().accounts.is_empty(), "missing file is an empty store");
@@ -421,6 +436,22 @@ mod tests {
         assert!(keys(&rb.pubkey).unwrap().is_none());
         remove_account(&ra.pubkey).unwrap();
         assert_eq!(load().unwrap().active, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nsec_returns_the_stored_bech32_key() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-nsec-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+
+        let keys = Keys::generate();
+        // Stored from hex, handed back as bech32.
+        let record = add_account(&Secret::new(keys.secret_key().to_secret_hex())).unwrap();
+        let stored = nsec(&record.pubkey).unwrap().unwrap();
+        assert_eq!(stored.expose(), keys.secret_key().to_bech32().unwrap());
+        assert!(nsec(&"cc".repeat(32)).unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
