@@ -354,6 +354,11 @@ pub fn import_from_env() -> Result<Vec<String>, SecretError> {
 mod tests {
     use super::*;
 
+    /// `MC_STORE_DIR` is process-wide. nextest gives each test its own
+    /// process, but `cargo test` (CI) runs them as threads of one, so the
+    /// store tests take turns.
+    static STORE_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn secret_never_prints_its_value() {
         let s = Secret::new("nsec1verysecretvalue");
@@ -382,8 +387,7 @@ mod tests {
     fn the_store_round_trips_accounts_wallets_and_the_active_flag() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        // nextest runs each test in its own process, so the env override
-        // cannot bleed into another test.
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("mc-store-test-{}", std::process::id()));
         unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
         assert!(load().unwrap().accounts.is_empty(), "missing file is an empty store");
@@ -438,6 +442,7 @@ mod tests {
 
     #[test]
     fn nsec_returns_the_stored_bech32_key() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("mc-nsec-test-{}", std::process::id()));
         unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
 
