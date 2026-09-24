@@ -1831,7 +1831,7 @@ async fn read_assertion(
         .kind(Kind::Custom(30382))
         .author(provider_key)
         .identifier(subject);
-    let results = read_per_relay(client, &[relay.clone()], filter).await;
+    let results = read_per_relay(client, std::slice::from_ref(&relay), filter).await;
     match results.into_iter().next() {
         Some((_, Ok(events))) => {
             let mut assertion = trust::parse_assertion(&events, provider, subject);
