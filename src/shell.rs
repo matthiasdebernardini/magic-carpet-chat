@@ -288,33 +288,78 @@ pub(crate) fn pick_active(pubkeys: &[String], preferred: Option<&str>) -> Option
         .or_else(|| pubkeys.first().cloned())
 }
 
-/// The list read sent on an unknown create outcome is out until a bounty
-/// list, or its failure, lands.
-fn still_checking_list(checking: bool, update: &Update) -> bool {
-    checking && !matches!(update, Update::Bounties(_) | Update::BountiesFailed(_))
+/// The list read sent on an unknown create outcome (its `seq`) is out
+/// until a reply to it, or to a later read, lands. A reply to an earlier
+/// read (a ⌘R sent mid-create) holds the pre-timeout list and unlocks
+/// nothing.
+fn still_checking_list(checking: Option<u64>, update: &Update) -> Option<u64> {
+    let reply = match update {
+        Update::Bounties { seq, .. } | Update::BountiesFailed { seq, .. } => *seq,
+        _ => return checking,
+    };
+    checking.filter(|&wanted| reply < wanted)
+}
+
+/// A bounty form is locked while its request is out, or while the list
+/// read after an unknown outcome is.
+fn form_locked(submitting: bool, checking_list: Option<u64>) -> bool {
+    submitting || checking_list.is_some()
 }
 
 /// Where the armed remove's balance read stands. The second click waits
 /// while it is `Checking`, so a fast double-click cannot skip the warning.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BalanceCheck {
-    Checking,
+    /// The arming click's `FetchBalance`, by request id, is out.
+    Checking(u64),
     Done,
     Failed,
 }
 
 impl BalanceCheck {
-    /// The check for the `armed` account after `update`: a balance ends it,
-    /// a failed read ends it as `Failed`. A failure after a good read
-    /// changes nothing.
+    /// The check for the `armed` account after `update`: only the reply to
+    /// the arming click's own read ends it. A poll or a send's re-read sent
+    /// before arming carries another id and changes nothing.
     fn after(self, armed: &str, update: &Update) -> Self {
+        let Self::Checking(id) = self else {
+            return self;
+        };
         match update {
-            Update::Balance { pubkey, .. } if pubkey == armed => Self::Done,
-            Update::BalanceFailed { pubkey } if pubkey == armed && self == Self::Checking => {
+            Update::Balance { pubkey, request, .. } if pubkey == armed && *request == Some(id) => {
+                Self::Done
+            }
+            Update::BalanceFailed { pubkey, request }
+                if pubkey == armed && *request == Some(id) =>
+            {
                 Self::Failed
             }
             _ => self,
         }
+    }
+}
+
+/// What a click on "Remove this account" does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RemoveAction {
+    /// First click: arm it and read the balance.
+    Arm,
+    /// Armed, but the balance read is still out: do nothing yet.
+    Wait,
+    /// Armed, but a submit is in flight for this account: refuse and disarm.
+    Refuse,
+    Remove,
+}
+
+/// `held`: this is the active account and a form is in flight.
+fn remove_click(armed: bool, check: BalanceCheck, held: bool) -> RemoveAction {
+    if !armed {
+        RemoveAction::Arm
+    } else if matches!(check, BalanceCheck::Checking(_)) {
+        RemoveAction::Wait
+    } else if held {
+        RemoveAction::Refuse
+    } else {
+        RemoveAction::Remove
     }
 }
 
@@ -435,7 +480,7 @@ pub(crate) struct BountyForm {
     /// The create's outcome is unknown and a list read is out: the form
     /// stays locked until it lands, so the duplicate check can see the
     /// bounty the server may have made.
-    pub checking_list: bool,
+    pub checking_list: Option<u64>,
     _subs: Vec<Subscription>,
 }
 
@@ -505,6 +550,10 @@ pub struct Shell {
     confirm_remove: Option<String>,
     /// The arming click's balance read for `confirm_remove`.
     remove_check: BalanceCheck,
+    /// The last arming click's `FetchBalance` request id.
+    balance_request: u64,
+    /// The last `FetchBounties` sequence number sent.
+    bounties_seq: u64,
     /// The Wallet screen's recipient and amount; cleared on an account switch.
     send_inputs: SendInputs,
     /// Per-account NIP-85 state (Treasure Map, assertions, follows), keyed by
@@ -531,7 +580,11 @@ impl Shell {
         // nothing tokio-dependent is ever awaited on the gpui executor.
         let handle = nostr::spawn_runtime();
         let commands = handle.commands;
-        for command in [Command::Connect, Command::LoadAccounts, Command::FetchBounties] {
+        for command in [
+            Command::Connect,
+            Command::LoadAccounts,
+            Command::FetchBounties { seq: 0 },
+        ] {
             let _ = commands.unbounded_send(command);
         }
 
@@ -616,6 +669,8 @@ impl Shell {
             balance_poll: None,
             confirm_remove: None,
             remove_check: BalanceCheck::Done,
+            balance_request: 0,
+            bounties_seq: 0,
             send_inputs,
             trust: HashMap::new(),
             account_page: None,
@@ -916,7 +971,7 @@ impl Shell {
                 self.push_activity(RED, format!("Coinos wallet for {who} failed: {message}"), now);
                 self.finish_setup_wallet(&pubkey);
             }
-            Update::Balance { pubkey, sats } => {
+            Update::Balance { pubkey, sats, .. } => {
                 // A number that just flips is easy to miss: a change gets a
                 // fading tag beside the balance, and a toast with the math
                 // — one per send (keyed by the pending `Sent`), or one per
@@ -1005,7 +1060,7 @@ impl Shell {
                     view.wallet.send = Some(SendState::Failed(message));
                 }
             }
-            Update::Bounties(list) => {
+            Update::Bounties { list, .. } => {
                 if self.selected.is_none()
                     && let Some(first) = list.first() {
                         self.select(first.id.clone());
@@ -1026,7 +1081,7 @@ impl Shell {
                 }
                 self.bounties = Load::Ready(list);
             }
-            Update::BountiesFailed(message) => {
+            Update::BountiesFailed { message, .. } => {
                 // Keep data already on screen; only a first load fails visibly.
                 if !matches!(self.bounties, Load::Ready(_)) {
                     self.bounties = Load::Failed(message.clone());
@@ -1072,7 +1127,7 @@ impl Shell {
                 }
                 self.scroll_to = Some(id.clone());
                 let _ = self.commands.unbounded_send(Command::WatchBounty { id });
-                let _ = self.commands.unbounded_send(Command::FetchBounties);
+                self.fetch_bounties();
             }
             Update::ClaimPublished {
                 bounty_id,
@@ -1174,8 +1229,12 @@ impl Shell {
                                     form.error = Some(format!(
                                         "{message} The server may have created this bounty; check the list before retrying."
                                     ));
-                                    form.checking_list = true;
-                                    let _ = self.commands.unbounded_send(Command::FetchBounties);
+                                    self.bounties_seq += 1;
+                                    let seq = self.bounties_seq;
+                                    form.checking_list = Some(seq);
+                                    let _ = self
+                                        .commands
+                                        .unbounded_send(Command::FetchBounties { seq });
                                 }
                             }
                     }
@@ -1693,7 +1752,7 @@ impl Shell {
             return None;
         }
         match self.remove_check {
-            BalanceCheck::Checking => return Some("Checking balance…".into()),
+            BalanceCheck::Checking(_) => return Some("Checking balance…".into()),
             BalanceCheck::Failed => {
                 return Some(
                     "The balance could not be read. Click again to remove anyway.".into(),
@@ -1716,39 +1775,40 @@ impl Shell {
     /// nsec and Coinos login and re-announce the store; `AccountsLoaded`
     /// then moves the active account if it was this one.
     pub(crate) fn remove_account(&mut self, pubkey: String, cx: &mut Context<Self>) {
-        if self.confirm_remove.as_deref() == Some(pubkey.as_str()) {
-            // The arming click's balance read is still out; the warning
-            // shows "Checking balance…" and this click does nothing.
-            if self.remove_check == BalanceCheck::Checking {
-                cx.notify();
-                return;
-            }
-            // Removing the active account moves it; see set_account.
-            if self.active.as_deref() == Some(pubkey.as_str()) && self.hold_for_submit() {
-                // Refused, so disarmed: the next click arms it afresh.
+        let armed = self.confirm_remove.as_deref() == Some(pubkey.as_str());
+        // Removing the active account moves it; see set_account.
+        let held = self.active.as_deref() == Some(pubkey.as_str()) && self.form_in_flight();
+        match remove_click(armed, self.remove_check, held) {
+            // The warning shows "Checking balance…" until the read lands.
+            RemoveAction::Wait => {}
+            RemoveAction::Refuse => {
+                // Says so in the feed. Refused, so disarmed: the next click
+                // arms it afresh.
+                self.hold_for_submit();
                 self.confirm_remove = None;
-                cx.notify();
-                return;
             }
-            self.confirm_remove = None;
-            let _ = self
-                .commands
-                .unbounded_send(Command::RemoveAccount { pubkey });
-        } else {
-            // The armed card warns about sats still in the wallet; read the
-            // balance fresh for it.
-            let has_token = self.view(&pubkey).is_some_and(|view| view.wallet.has_token);
-            if has_token {
-                let _ = self.commands.unbounded_send(Command::FetchBalance {
-                    pubkey: pubkey.clone(),
-                });
+            RemoveAction::Remove => {
+                self.confirm_remove = None;
+                let _ = self
+                    .commands
+                    .unbounded_send(Command::RemoveAccount { pubkey });
             }
-            self.remove_check = if has_token {
-                BalanceCheck::Checking
-            } else {
-                BalanceCheck::Done
-            };
-            self.confirm_remove = Some(pubkey);
+            RemoveAction::Arm => {
+                // The armed card warns about sats still in the wallet; read
+                // the balance fresh for it, under its own request id.
+                let has_token = self.view(&pubkey).is_some_and(|view| view.wallet.has_token);
+                self.remove_check = if has_token {
+                    self.balance_request += 1;
+                    let _ = self.commands.unbounded_send(Command::FetchBalance {
+                        pubkey: pubkey.clone(),
+                        request: Some(self.balance_request),
+                    });
+                    BalanceCheck::Checking(self.balance_request)
+                } else {
+                    BalanceCheck::Done
+                };
+                self.confirm_remove = Some(pubkey);
+            }
         }
         cx.notify();
     }
@@ -1774,6 +1834,7 @@ impl Shell {
                 loop {
                     let _ = commands.unbounded_send(Command::FetchBalance {
                         pubkey: polled.clone(),
+                        request: None,
                     });
                     cx.background_executor()
                         .timer(Duration::from_secs(3))
@@ -1784,8 +1845,16 @@ impl Shell {
         });
     }
 
+    /// Asks for the bounty list under the next sequence number.
+    fn fetch_bounties(&mut self) {
+        self.bounties_seq += 1;
+        let _ = self.commands.unbounded_send(Command::FetchBounties {
+            seq: self.bounties_seq,
+        });
+    }
+
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
-        let _ = self.commands.unbounded_send(Command::FetchBounties);
+        self.fetch_bounties();
         let _ = self.commands.unbounded_send(Command::LoadAccounts);
         // LoadAccounts re-reads every kind-0; a failed one is pending again.
         for (_, view) in &mut self.views {
@@ -1870,7 +1939,9 @@ impl Shell {
     /// A bounty or claim request is out and unanswered, or the list read
     /// after an unknown create outcome is.
     fn form_in_flight(&self) -> bool {
-        self.bounty_form.as_ref().is_some_and(|f| f.submitting || f.checking_list)
+        self.bounty_form
+            .as_ref()
+            .is_some_and(|f| form_locked(f.submitting, f.checking_list))
             || self.claim_form.as_ref().is_some_and(|f| f.submitting)
     }
 
@@ -1949,7 +2020,7 @@ impl Shell {
             fields,
             error: None,
             submitting: false,
-            checking_list: false,
+            checking_list: None,
             _subs: subs,
         });
         self.focus_bounty_field(F_SINGULAR, window, cx);
@@ -1969,7 +2040,7 @@ impl Shell {
         let Some(form) = &self.bounty_form else {
             return;
         };
-        if form.submitting || form.checking_list {
+        if form_locked(form.submitting, form.checking_list) {
             return;
         }
         // Forms close on an account switch, so the active account is the
@@ -2049,8 +2120,9 @@ impl Shell {
         // A bounty on this list already exists — typically a timed-out
         // submit the server finished anyway. The server never dedupes. Only
         // as good as the last list read: the form stays locked until the
-        // read sent on the unknown outcome lands, but a create the server
-        // finishes after that read still slips by.
+        // reply to the read sent on the unknown outcome (or a later one)
+        // lands. A create the server finishes after that read still slips
+        // by, and a BountiesFailed unlocks against the old list.
         let coordinate = nostr_sdk::prelude::PublicKey::from_hex(&pubkey)
             .map(|pk| events::header_coordinate(&pk, &events::header_dtag(&singular)))
             .ok();
@@ -2927,8 +2999,8 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        BalanceCheck, RANK_NOTE, claim_notice, pick_active, relay_address_gap,
-        still_checking_list,
+        BalanceCheck, RANK_NOTE, RemoveAction, claim_notice, form_locked, pick_active,
+        relay_address_gap, remove_click, still_checking_list,
     };
     use magic_carpet_chat::nostr::Update;
 
@@ -2974,34 +3046,65 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_create_keeps_the_form_locked_until_the_list_read_lands() {
+    fn an_unknown_create_keeps_the_form_locked_until_its_own_list_read_lands() {
+        let bounties = |seq| Update::Bounties {
+            seq,
+            list: Vec::new(),
+        };
         let other = Update::RelayStatus(true);
-        assert!(still_checking_list(true, &other), "an unrelated update unlocked it");
-        assert!(!still_checking_list(true, &Update::Bounties(Vec::new())));
+        assert_eq!(still_checking_list(Some(5), &other), Some(5));
+        // A ⌘R sent before the timeout answers with the old list.
+        assert_eq!(still_checking_list(Some(5), &bounties(4)), Some(5));
+        assert_eq!(still_checking_list(Some(5), &bounties(5)), None);
+        assert_eq!(still_checking_list(Some(5), &bounties(6)), None);
         // A failed read unlocks too, so the form can never stay locked.
-        assert!(!still_checking_list(true, &Update::BountiesFailed("down".into())));
-        assert!(!still_checking_list(false, &other));
+        let failed = Update::BountiesFailed {
+            seq: 5,
+            message: "down".into(),
+        };
+        assert_eq!(still_checking_list(Some(5), &failed), None);
+        assert_eq!(still_checking_list(None, &bounties(9)), None);
+        // The check counts as a submit in flight.
+        assert!(form_locked(false, Some(5)));
+        assert!(form_locked(true, None));
+        assert!(!form_locked(false, None));
     }
 
     #[test]
-    fn the_second_remove_click_waits_for_the_armed_accounts_balance() {
-        let balance = |pubkey: &str| Update::Balance {
+    fn the_second_remove_click_waits_for_the_arming_clicks_own_balance_read() {
+        let balance = |pubkey: &str, request| Update::Balance {
             pubkey: pubkey.into(),
             sats: 5,
+            request,
         };
-        let failed = |pubkey: &str| Update::BalanceFailed {
+        let failed = |pubkey: &str, request| Update::BalanceFailed {
             pubkey: pubkey.into(),
+            request,
         };
-        let checking = BalanceCheck::Checking;
-        // Another account's answer does not end this account's check.
-        assert_eq!(checking.after("a", &balance("b")), BalanceCheck::Checking);
-        assert_eq!(checking.after("a", &failed("b")), BalanceCheck::Checking);
-        assert_eq!(checking.after("a", &balance("a")), BalanceCheck::Done);
+        let checking = BalanceCheck::Checking(7);
+        // A poll (no id), an earlier arm, or another account changes nothing.
+        assert_eq!(checking.after("a", &failed("a", None)), checking);
+        assert_eq!(checking.after("a", &balance("a", None)), checking);
+        assert_eq!(checking.after("a", &failed("a", Some(6))), checking);
+        assert_eq!(checking.after("a", &balance("b", Some(7))), checking);
+        assert_eq!(checking.after("a", &balance("a", Some(7))), BalanceCheck::Done);
         // A failed read ends the wait; the confirm then says so.
-        assert_eq!(checking.after("a", &failed("a")), BalanceCheck::Failed);
-        // A later poll failure keeps a good read; a later balance replaces
-        // a failed one.
-        assert_eq!(BalanceCheck::Done.after("a", &failed("a")), BalanceCheck::Done);
-        assert_eq!(BalanceCheck::Failed.after("a", &balance("a")), BalanceCheck::Done);
+        assert_eq!(checking.after("a", &failed("a", Some(7))), BalanceCheck::Failed);
+        assert_eq!(
+            BalanceCheck::Done.after("a", &failed("a", Some(7))),
+            BalanceCheck::Done
+        );
+    }
+
+    #[test]
+    fn a_remove_click_arms_waits_refuses_or_removes() {
+        use RemoveAction::*;
+        let checking = BalanceCheck::Checking(1);
+        assert_eq!(remove_click(false, BalanceCheck::Done, true), Arm);
+        assert_eq!(remove_click(true, checking, false), Wait);
+        assert_eq!(remove_click(true, checking, true), Wait);
+        assert_eq!(remove_click(true, BalanceCheck::Done, true), Refuse);
+        assert_eq!(remove_click(true, BalanceCheck::Failed, false), Remove);
+        assert_eq!(remove_click(true, BalanceCheck::Done, false), Remove);
     }
 }

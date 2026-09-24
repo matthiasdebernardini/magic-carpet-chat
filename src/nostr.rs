@@ -82,8 +82,9 @@ pub enum Command {
     /// failed, `ProfileUnavailable`.
     LoadAccounts,
     /// GET the issuer's bounty list (status=all). Emits `Bounties` or
-    /// `BountiesFailed`.
-    FetchBounties,
+    /// `BountiesFailed` carrying the same `seq`, so the UI can tell a reply
+    /// to this read from one to an earlier read.
+    FetchBounties { seq: u64 },
     PublishDList {
         pubkey: String,
         singular: String,
@@ -125,9 +126,13 @@ pub enum Command {
     /// `WalletFailed`. Idempotent: a login already stored for the account is
     /// reused, so a retry after a publish failure never opens a second one.
     CreateCoinosWallet { pubkey: String },
-    /// Read the wallet balance with the stored token. Emits `Balance`, or
-    /// nothing (one feed line per failure streak).
-    FetchBalance { pubkey: String },
+    /// Read the wallet balance with the stored token. Emits `Balance` or
+    /// `BalanceFailed` carrying the same `request`, plus one feed line per
+    /// failure streak. `None` for polls; the armed remove sets its own id.
+    FetchBalance {
+        pubkey: String,
+        request: Option<u64>,
+    },
     /// Pay `sats` from this account's Coinos wallet to the Lightning address
     /// `to` (any domain: another account here, Strike, …). Emits `Sent` and
     /// then a fresh `Balance`, or `SendFailed`.
@@ -218,8 +223,8 @@ pub enum Update {
         profile_found: bool,
     },
     /// The issuer's bounty list, freshly fetched.
-    Bounties(Vec<Bounty>),
-    BountiesFailed(String),
+    Bounties { seq: u64, list: Vec<Bounty> },
+    BountiesFailed { seq: u64, message: String },
     /// A fresh full snapshot of a watched bounty (emitted only on change).
     /// Boxed: the snapshot dwarfs every other variant on the channel.
     BountyDetail(Box<BountyDetail>),
@@ -263,11 +268,18 @@ pub enum Update {
     /// password.
     WalletFailed { pubkey: String, message: String },
     /// The Coinos balance, in sats.
-    Balance { pubkey: String, sats: u64 },
+    Balance {
+        pubkey: String,
+        sats: u64,
+        request: Option<u64>,
+    },
     /// A balance read for this account failed or found no login. Sent on
     /// every failure (the feed's `Error` is sent once per streak), so a
     /// waiting remove confirm always gets an answer.
-    BalanceFailed { pubkey: String },
+    BalanceFailed {
+        pubkey: String,
+        request: Option<u64>,
+    },
     /// Coinos accepted the payment: `sats` left this account's wallet for
     /// `to`. A `Balance` follows.
     Sent {
@@ -495,8 +507,8 @@ async fn run(
             Command::LoadAccounts => {
                 tokio::spawn(load_accounts(updates.clone()));
             }
-            Command::FetchBounties => {
-                tokio::spawn(fetch_bounties(updates.clone()));
+            Command::FetchBounties { seq } => {
+                tokio::spawn(fetch_bounties(seq, updates.clone()));
             }
             Command::AddAccount {
                 secret,
@@ -528,10 +540,10 @@ async fn run(
                 let updates = updates.clone();
                 tokio::spawn(create_coinos_wallet(sessions, pubkey, None, updates));
             }
-            Command::FetchBalance { pubkey } => {
+            Command::FetchBalance { pubkey, request } => {
                 let failures = balance_failures.clone();
                 let updates = updates.clone();
-                tokio::spawn(fetch_balance(pubkey, failures, updates));
+                tokio::spawn(fetch_balance(pubkey, request, failures, updates));
             }
             Command::Send { pubkey, to, sats } => {
                 let failures = balance_failures.clone();
@@ -1048,18 +1060,19 @@ async fn send_sats(
     }
     // Either way the wallet may have changed: the panel shows the new
     // balance at once, not on the next poll.
-    fetch_balance(pubkey, failures, updates).await;
+    fetch_balance(pubkey, None, failures, updates).await;
 }
 
 async fn fetch_balance(
     pubkey: String,
+    request: Option<u64>,
     failures: BalanceFailures,
     updates: mpsc::UnboundedSender<Update>,
 ) {
     let login = match secrets::load_coinos_login(&pubkey) {
         Ok(Some(login)) if login.has_token() => login,
         _ => {
-            let _ = updates.unbounded_send(Update::BalanceFailed { pubkey });
+            let _ = updates.unbounded_send(Update::BalanceFailed { pubkey, request });
             return;
         }
     };
@@ -1074,7 +1087,11 @@ async fn fetch_balance(
     match coinos::balance(&login.token).await {
         Ok(sats) => {
             mark(false);
-            let _ = updates.unbounded_send(Update::Balance { pubkey, sats });
+            let _ = updates.unbounded_send(Update::Balance {
+                pubkey,
+                sats,
+                request,
+            });
         }
         Err(e) => {
             if mark(true) {
@@ -1083,7 +1100,7 @@ async fn fetch_balance(
                     message: format!("Balance check failed: {e}"),
                 });
             }
-            let _ = updates.unbounded_send(Update::BalanceFailed { pubkey });
+            let _ = updates.unbounded_send(Update::BalanceFailed { pubkey, request });
         }
     }
 }
@@ -1246,15 +1263,18 @@ pub fn is_issuer(pubkey: &str) -> bool {
     pubkey == issuer_pubkey()
 }
 
-async fn fetch_bounties(updates: mpsc::UnboundedSender<Update>) {
+async fn fetch_bounties(seq: u64, updates: mpsc::UnboundedSender<Update>) {
     let result = async {
         let api = Api::new()?;
         Ok::<_, BridgeError>(api.list_bounties(&issuer_pubkey()).await?)
     }
     .await;
     let update = match result {
-        Ok(bounties) => Update::Bounties(bounties),
-        Err(e) => Update::BountiesFailed(e.to_string()),
+        Ok(list) => Update::Bounties { seq, list },
+        Err(e) => Update::BountiesFailed {
+            seq,
+            message: e.to_string(),
+        },
     };
     let _ = updates.unbounded_send(update);
 }

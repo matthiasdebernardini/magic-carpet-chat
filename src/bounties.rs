@@ -621,7 +621,7 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             "New DList + bounty".into(),
             rows,
             form.error.clone(),
-            if form.checking_list {
+            if form.checking_list.is_some() {
                 Some("Checking the list…")
             } else {
                 form.submitting.then_some("Publishing…")
