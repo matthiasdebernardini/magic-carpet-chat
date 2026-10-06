@@ -4,3 +4,4 @@
 /dist
 /dist-live
 /.codegraph
+.wrangler/

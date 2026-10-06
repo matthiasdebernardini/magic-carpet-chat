@@ -1,0 +1,6 @@
+// Static site: `wrangler deploy` from this directory publishes ./public.
+{
+  "name": "app-test-cycles",
+  "compatibility_date": "2026-08-01",
+  "assets": { "directory": "./public" }
+}

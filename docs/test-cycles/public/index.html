@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10.1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Automated app test cycles</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: 1.5em;}
+    div.column{flex: auto;}
+    @media screen {
+    div.columns{gap: min(4vw, 1.5em);}
+    div.column{overflow-x: auto;}
+    }
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Automated app test cycles with Cua, Jev, Claude Code
+and Cap</h1>
+<p class="subtitle">A desktop app, a Linux sandbox, an evidence-based
+decision loop, a coding agent that closes the loop, and a recording you
+can send to someone.</p>
+</header>
+<h2 id="what-you-end-up-with">What you end up with</h2>
+<p>One command runs your desktop app through a real user journey on a
+real screen. Jev picks every UI action from a candidate table and judges
+every postcondition from what the screen shows. When a step fails,
+Claude Code reads the log, fixes the app, ships a release, and reruns.
+Cap records the run so a cofounder can watch it.</p>
+<p>The example below is a plain app with a list and a form: open the
+list, open the “New item” form, fill it, submit, and see the item
+appear. Swap in your own screens.</p>
+<h2 id="the-parts">The parts</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Part</th>
+<th>Role</th>
+<th>What it needs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cua (trycua)</td>
+<td>A Linux desktop in a container, with a screenshot, mouse, keyboard
+and shell API.</td>
+<td>Docker. Image
+<code>public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04:docker-latest</code>.</td>
+</tr>
+<tr>
+<td>Jev (TypeSafe)</td>
+<td>Answers two questions per step: which candidate to run, and whether
+the postcondition holds. Returns a probability, never free text.</td>
+<td><code>TYPESAFE_API_KEY</code>, the <code>typesafe-sdk</code> Python
+package.</td>
+</tr>
+<tr>
+<td>Claude Code</td>
+<td>Authors the candidate tables, drives the box over ssh, reads the run
+logs, fixes the app, tags the release, reruns.</td>
+<td>A goal prompt with the human handoffs marked.</td>
+</tr>
+<tr>
+<td>Cap</td>
+<td>Records the run, exports mp4, uploads to a share link.</td>
+<td><code>cap</code> CLI on the Mac. Inside the container,
+<code>ffmpeg -f x11grab</code>.</td>
+</tr>
+<tr>
+<td>echt (optional)</td>
+<td>Keeps the chain: prompt, commit, run log, crash.</td>
+<td>A Sentry DSN for the app and an ingest key for the loop.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="the-loop">The loop</h2>
+<p>One step is a goal, a candidate table and a postcondition.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>Step(</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  goal<span class="op">=</span><span class="st">&quot;Open the New item form.&quot;</span>,</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  cands<span class="op">=</span>[NEW_FORM, REFRESH],</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  done<span class="op">=</span><span class="st">&quot;A form titled &#39;New item&#39; is open.&quot;</span>,</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  cues<span class="op">=</span>(<span class="st">&quot;New item&quot;</span>, <span class="st">&quot;Cancel&quot;</span>),</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<p>The runner appends three candidates the app does not own:
+<code>already-done</code> (the screen already shows the goal),
+<code>reobserve</code> (wait and look again) and <code>abstain</code>
+(nothing here is safe). Jev picks one id. An unknown id halts the run.
+So does a pick under 0.5 confidence. After the action settles, Jev
+scores the postcondition from a fresh screenshot. Under 0.6 it tries
+again, three times at most, then halts.</p>
+<p>The screen reaches Jev as text: Tesseract reads a grayscale
+screenshot upscaled two times, because small text on a dark UI is lost
+otherwise. The <code>cues</code> are phrases whose presence or absence
+in that text goes to Jev as evidence, so the judgment does not rest on
+raw OCR alone.</p>
+<p>Every event goes to a JSONL log with an epoch timestamp:
+<code>start</code>, <code>choice</code>, <code>act</code>,
+<code>verify</code>, <code>halt</code>, <code>end</code>. That log is
+the whole output. Captions, echt events and the next Claude Code prompt
+all come from it.</p>
+<h2 id="set-up-the-box">Set up the box</h2>
+<ol type="1">
+<li>Create a box. On exe.dev:
+<code>ssh exe.dev "new --name=my-app-cua --cpu=2 --memory=4GB --disk=25GB"</code>.
+Any Linux host with Docker works.</li>
+<li>Start the desktop:
+<code>docker run -d --name sandbox --restart unless-stopped --shm-size 1g &lt;cua image&gt;</code>.
+Publish no ports. VNC and the API stay on the Docker bridge.</li>
+<li>Install the app’s runtime libraries inside the container, plus
+<code>tesseract-ocr</code>, <code>xdotool</code> and
+<code>ffmpeg</code>.</li>
+<li>Copy the app’s release binary in. Never compile on the box: a
+release tag builds the Linux binary in CI, and the box downloads
+it.</li>
+<li>On the host: <code>tesseract</code>, <code>jq</code>, and a Python
+venv with <code>cua</code> and <code>typesafe-sdk</code>.</li>
+<li>Put secrets in files with mode 600. A step file names a secret as
+<code>$user_password</code>. The runner reads it from the key file at
+the moment it types, so it never reaches a log.</li>
+<li>To watch: <code>tailscale up</code>, then
+<code>tailscale serve --bg http://172.17.0.2:6080</code> and open
+<code>/vnc.html?autoconnect=1</code> on the tailnet name.</li>
+</ol>
+<h2 id="write-a-step-file">Write a step file</h2>
+<p>A step file is Python that imports <code>Step</code> and
+<code>Cand</code> and exports <code>STEPS</code>. Rules that held:</p>
+<ul>
+<li><strong>Candidates are complete actions.</strong> “Type the four
+fields, Enter after each” is one candidate. Jev picks. It does not
+compose.</li>
+<li><strong>Every table has a way out.</strong> A <code>cancel</code>
+candidate beside <code>submit</code>, for the form that is not the one
+you expected.</li>
+<li><strong>Postconditions name text the OCR can see.</strong> “The list
+shows ‘Item saved’”, not “the save worked”.</li>
+<li><strong>Focus first.</strong> Each candidate starts with a
+<code>focus</code> action on the app window and parks the pointer in a
+corner. A hovering pointer opens tooltips that hide the header
+text.</li>
+<li><strong>Keyboard over mouse.</strong> Some UI toolkits ignore
+synthetic mouse events, so the journey runs on keystrokes through
+<code>xdotool key</code>. A click that cannot be avoided gets a fixed
+coordinate.</li>
+<li><strong>Settle times are per step.</strong> A submit that talks to a
+server needs ten seconds. Opening a form needs two.</li>
+</ul>
+<h2 id="run-it">Run it</h2>
+<pre><code>. .venv/bin/activate
+python agent.py demo_open_form   # open the list, open the New item form
+python agent.py demo_submit      # fill it, submit, see the item listed</code></pre>
+<p>Without <code>TYPESAFE_API_KEY</code> the loop runs in mock mode and
+takes the first candidate blindly. Mock checks that the actions land.
+Live checks that the app is right.</p>
+<p>Read the log with the halt in view:</p>
+<pre><code>jq -c &#39;select(.event==&quot;halt&quot; or .event==&quot;verify&quot;) | {event, step, reason, p, screen}&#39; runs/&lt;run&gt;.jsonl</code></pre>
+<p>A <code>verify</code> with a low <code>p</code> and its OCR text says
+what the screen showed instead of what you expected. That is the bug
+report.</p>
+<h2 id="close-the-cycle-with-claude-code">Close the cycle with Claude
+Code</h2>
+<p>Give Claude Code one goal prompt with the outcome, the rules and the
+steps, and mark every human handoff with <strong>ME</strong> (a login
+URL to approve, a key to paste). It builds the box, writes the step
+files, runs the loop, and stops at the handoffs.</p>
+<p>When a step halts, the log is the prompt. Claude Code reads the OCR
+text, maps it to the screen in the source, changes the app, runs the
+tests, tags a release, installs the CI binary on the box, and reruns
+from <code>FROM_STEP=&lt;n&gt;</code>. Our first failing cycle found a
+toast so large it covered the card it announced. The fix shipped in the
+next tag.</p>
+<p>Two habits keep the cycle honest. Keep <code>already-done</code> in
+every table, because a rerun starts from a screen that may already show
+the goal. Verify side effects outside the UI, in the database or the
+API, because the screen can say “saved” and be wrong.</p>
+<h2 id="record-it-with-cap">Record it with Cap</h2>
+<p>Start the recorder inside the container before the first step,
+<code>ffmpeg -f x11grab -i :1 -r 10 /tmp/demo.mp4</code>, and stop it
+after the last. Copy it out with <code>docker cp</code>, then
+<code>cap upload --json</code> on the Mac gives the share link.</p>
+<p>The run log is the caption track. Each event has an epoch time, and
+the video starts at the file’s mtime minus its duration, so every
+caption lands where the screen changed. Cut the dead start: two
+already-satisfied steps cost 27 seconds of nothing. Burn captions in
+with ffmpeg’s <code>subtitles</code> filter on the box, which has
+libass. Narration is one ElevenLabs call per caption, mixed with
+<code>adelay</code> and <code>amix</code>.</p>
+<h2 id="keep-the-chain-in-echt">Keep the chain in echt</h2>
+<p>Point the app at a Sentry DSN from
+<code>echt token new --sentry --project &lt;name&gt;</code>, and the
+stock Sentry SDK reports panics and surfaced errors. Ship each run log
+as a <code>log</code> event with a signed POST to
+<code>/ingest/v1/events</code>. Claude Code’s session already lands
+there through hooks. A crash, the run that triggered it, the prompt that
+fixed it and the commit that shipped it become one chain, and
+<code>echt brain context --commit HEAD</code> walks it.</p>
+<h2 id="gotchas-we-paid-for">Gotchas we paid for</h2>
+<ul>
+<li>Two async runtimes in one process do not mix. Keep the UI’s executor
+and the network runtime on separate threads.</li>
+<li>Sentry’s transport builds TLS at init, before the app installs its
+own crypto provider. Install the provider first thing in
+<code>main</code>.</li>
+<li>The container has no MagicDNS. Pin the tailnet hostname in its
+<code>/etc/hosts</code> before the app dials it.</li>
+<li>Homebrew’s ffmpeg has no <code>subtitles</code> filter. Burn
+captions on the Linux box.</li>
+<li>libass scales the SRT font to a 288-line canvas. Size 9 is readable
+at 1440 by 1080. Size 20 covers the screen.</li>
+<li>The recording is real time. A long wait after submit is the server,
+not the loop.</li>
+</ul>
+<footer>Nashville Automation · Matthias Debernardini</footer>
+</body>
+</html>
