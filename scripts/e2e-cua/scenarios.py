@@ -16,14 +16,16 @@ from suite import has
 FOCUS = ("focus", "Magic Carpet")
 PARK = ("shell", "xdotool mousemove 20 740")   # hover tooltips hide the header
 # Rail geometry at 1280x960 (window at 0,0): the avatars sit 55 px apart.
-HOUSE_XY, CLAIMANT_XY, PLUS_XY = (34, 190), (34, 245), (34, 300)
+# Rail avatar clicks go through the "avatar" action: the driver maps
+# a name to a window-local point, which differs per target (the
+# box coordinates date to an older rail layout than the omac one).
 
 BOUNTIES = Cand("open-bounties", "Press super+2 to open the Bounties screen.", [FOCUS, ("key", "super+2")])
 DASHBOARD = Cand("open-dashboard", "Press super+1 to open the Dashboard.", [FOCUS, ("key", "super+1")])
 WALLET = Cand("open-wallet", "Press super+6 to open the Wallet screen of the selected account.", [FOCUS, ("key", "super+6")])
 NEW_FORM = Cand("new-bounty-form", "Press super+n to open the 'New DList + bounty' form.", [FOCUS, ("key", "super+n")])
 HOUSE = Cand("click-house-avatar", "Click the first avatar in the left rail to select the house issuer, then press super+2 to return to Bounties.",
-             [FOCUS, ("click", HOUSE_XY), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])
+             [FOCUS, ("avatar", "house"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])
 NEXT_ACCOUNT = Cand("next-account", "Press super+] to select the next account in the rail.", [FOCUS, ("key", "super+bracketright")])
 HOUSE_CUES = ("New DList + bounty", "Submit a bounty claim", "Bounties")
 
@@ -77,7 +79,7 @@ async def scenario_a(sc):
               fill("hang-city").do + [
                   ("wait", 1.5), ("snap", "submitted"),
                   ("key", "super+bracketright"), ("wait", 0.8), ("snap", "after super+]"),
-                  ("click", PLUS_XY), ("wait", 0.8), PARK, ("snap", "after plus"),
+                  ("avatar", "plus"), ("wait", 0.8), PARK, ("snap", "after plus"),
                   ("click_fine", "Remove this account"), ("wait", 0.8), ("click_fine", "Click again to remove"), ("wait", 0.8), PARK,
                   ("snap", "after remove x2"),
                   ("key", "Escape"), ("stamp", "attempts done"), ("wait", 0.8)])],
@@ -298,7 +300,7 @@ async def scenario_h(sc):
     # The avatar click is idempotent; a retried super+] would toggle back.
     await sc.step(Step("Select the claimant account and show Bounties (the claimant's header button reads 'Submit a bounty claim').",
                        [Cand("claimant-avatar", "Click the second avatar in the left rail, then press super+2 for Bounties.",
-                             [FOCUS, ("click", CLAIMANT_XY), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])],
+                             [FOCUS, ("avatar", "claimant"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])],
                        "The Bounties header button reads 'Submit a bounty claim'.", settle=3,
                        cues=("Submit a bounty claim", "New DList + bounty")), label="claimant")
     sc.check_screen("claimant selected", ["Submit a bounty claim"])
@@ -379,6 +381,317 @@ def has_failed(screen):
     return "auto-pay failed" in screen.lower()
 
 
+# ------------------------------------------------------------ L..Q: trust
+# Feature 2: "Your Trusted Community". Every scenario runs its own throwaway
+# account key and its own throwaway owner (well-known account) — the house and
+# claimant keys never appear here. The app talks Brainstorm to the fake on
+# :8788 and trust reads/publishes to the local nak relay on :10547.
+import json
+from suite import run
+
+LOCAL_RELAY = "ws://127.0.0.1:10547"
+BS = "http://127.0.0.1:8788"
+
+
+def fresh_key():
+    """A throwaway keypair via nak: hex sec, hex pub, npub."""
+    sec = run(["nak", "key", "generate"], timeout=15).stdout.strip()
+    pub = run(["nak", "key", "public", sec], timeout=15).stdout.strip()
+    npub = run(["nak", "encode", "npub", pub], timeout=15).stdout.strip()
+    return {"sec": sec, "pub": pub, "npub": npub}
+
+
+def nak_publish(sec, kind, content, tags=()):
+    """Sign and publish an event to the local relay. sec stays an argument,
+    never logged; nak itself is trusted (same as on the box)."""
+    cmd = ["nak", "event", "-k", str(kind), "-c", content]
+    for t in tags:
+        cmd += ["-t", t]
+    cmd += ["--sec", sec, LOCAL_RELAY]
+    r = run(cmd, timeout=30)
+    return r.returncode == 0
+
+
+def nak_req(kind, author_hex):
+    """Events for (kind, author) on the local relay, newest first."""
+    r = run(["nak", "req", "-k", str(kind), "-a", author_hex, LOCAL_RELAY], timeout=30)
+    evs = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                evs.append(json.loads(line))
+            except ValueError:
+                pass
+    return sorted(evs, key=lambda e: e.get("created_at", 0), reverse=True)
+
+
+def bs_setup_rows():
+    import urllib.request
+    body = json.load(urllib.request.urlopen(f"{BS}/setup/{fresh_key()['pub']}", timeout=10))
+    # The fake answers every hex; the argument above only needs to be valid hex.
+    return body
+
+
+def publish_owner_profile(owner, run_id):
+    """A kind-0 name so the recommended row shows a name, not a bare npub."""
+    nak_publish(owner["sec"], 0, json.dumps(
+        {"name": f"E2E Owner {run_id[-4:]}", "display_name": f"E2E Owner {run_id[-4:]}"}))
+
+
+TRUST_TAB = Step(
+    "Open the active account's page and select its 'Trust' tab. If a Dashboard shows, click the account name at the top of the left sidebar first.",
+    [Cand("chip-then-trust", "Click the account name at the top of the left sidebar, then click the 'Trust' tab beside 'Identity & keys'.",
+          [FOCUS, ("click", CHIP_XY), ("wait", 1.5), PARK,
+           ("click_text", {"text": "Trust", "near": "Identity"}), ("wait", 1), PARK]),
+     Cand("avatar-then-trust", "Click the first avatar in the left rail, then the account name at the top of the sidebar, then the 'Trust' tab.",
+          [FOCUS, ("avatar", "house"), ("wait", 1.5), PARK,
+           ("click", CHIP_XY), ("wait", 1.5), PARK,
+           ("click_text", {"text": "Trust", "near": "Identity"}), ("wait", 1), PARK])],
+    "The account page's 'Trust' tab is selected and shows the 'Your Trusted Community' steps: 'Follow at least one well-known account', 'Ask Brainstorm to calculate', 'Publish your Treasure Map'.",
+    tries=4, settle=3,
+    cues=("Follow at least one well-known account", "Calculate my trust scores",
+          "Publish my Treasure Map", "Located", "Your Trusted Community"))
+
+
+async def open_trust(sc):
+    return await sc.step(TRUST_TAB, label="trust tab")
+
+
+async def follow_owner(sc, expect_confirm):
+    """Click Follow on the recommended owner row; if the first-list amber box
+    shows, approve it. Returns True once '✓ Following' / 'Saved to' shows."""
+    ok = await sc.step(Step(
+        "Click 'Follow' on the recommended row ('RECOMMENDED — YOUR OWNER NPUB') in the 'Your Trusted Community' steps.",
+        [Cand("follow-owner", "Click the 'Follow' button on the recommended owner row.",
+              [FOCUS, ("click_pill", "RECOMMENDED"), ("wait", 1), PARK])],
+        "After the click, either a confirmation box offers the buttons 'Start a new follow list' and 'Cancel', or the row already reads '✓ Following' or 'Saved to'.",
+        tries=4, settle=6,
+        cues=("Start a new follow list", "Following", "Saved to", "Couldn't confirm", "RECOMMENDED")),
+        must_act=True, label="follow owner")
+    if not ok:
+        return False
+    if has(sc.screen, "existing follow list"):
+        if not expect_confirm:
+            sc.notes.append("unexpected first-list confirmation for an account that has a kind-3")
+            return False
+        return await sc.step(Step(
+            "Approve the first follow list: click 'Start a new follow list' in the confirmation box.",
+            [Cand("confirm-first-list", "Click the 'Start a new follow list' button beside 'Cancel' in the confirmation box.",
+                  [FOCUS, ("click_pill", "cancel"), ("wait", 1), PARK])],
+            "The recommended row reads '✓ Following' and a 'Saved to N of M relays' line is shown.",
+            tries=4, settle=8, cues=("Following", "Saved to", "existing follow list")),
+            must_act=True, label="confirm first list")
+    return True
+
+
+async def calculate(sc, done_cond="Step 2 shows 'Brainstorm confirmed — your community's trust scores are in the process of being calculated'.",
+                    label="calculate", tries=4):
+    # tries=1 for error paths: every click is one graperank request (the real
+    # API rate-limits to 3/30 min), so a retried click falsifies the test.
+    return await sc.step(Step(
+        "Click 'Calculate my trust scores' in step 2.",
+        [Cand("calculate", "Click the 'Calculate my trust scores' button.",
+              [FOCUS, ("click_pill", "Ask Brainstorm to calculate"), ("wait", 1), PARK])],
+        done_cond, tries=tries, settle=10,
+        cues=("Brainstorm confirmed", "Asking the Brainstorm", "Calculate my trust scores",
+              "Please wait", "temporarily unavailable")),
+        must_act=True, label=label)
+
+
+async def publish_map(sc):
+    ok = await sc.step(Step(
+        "Click 'Publish my Treasure Map' in step 3.",
+        [Cand("publish-map", "Click the 'Publish my Treasure Map' button.",
+              [FOCUS, ("click_pill", "Publish your Treasure Map"), ("wait", 1), PARK])],
+        "The publish started: 'Fetching tag data' shows, or the card already reads 'Located'.",
+        tries=3, settle=6,
+        cues=("Fetching tag data", "Located", "Publish my Treasure Map")),
+        must_act=True, label="publish map")
+    if not ok:
+        return False
+    screen = await sc.wait_for(["Located"], timeout=45, every=4, label="map lands")
+    return has(screen, "Located")
+
+
+def check_map_rows(sc, acct_pub):
+    """The relay's kind-10040 tags must equal the fake /setup rows, in order."""
+    maps = nak_req(10040, acct_pub)
+    sc.check("a kind-10040 exists on the local relay", bool(maps), f"{len(maps)} events")
+    if not maps:
+        return
+    try:
+        rows = bs_setup_rows()
+    except Exception as e:
+        sc.check("the fake /setup answered for the check", False, e)
+        return
+    sc.check("the map's tags are the fake /setup rows verbatim, in order",
+             maps[0].get("tags") == rows,
+             f"tags={json.dumps(maps[0].get('tags'))[:300]}")
+
+
+# ---------------------------------------------------------------- L
+async def scenario_l(sc):
+    """Fresh account, no kind-3: confirm the first list, follow the owner,
+    calculate, publish the map."""
+    acct, owner = fresh_key(), fresh_key()
+    sc.box.start_fake({})
+    publish_owner_profile(owner, sc.suite.run_id)
+    sc.box.launch("L", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
+    if not await open_trust(sc):
+        return
+    if not await follow_owner(sc, expect_confirm=True):
+        return
+    sc.check_screen("owner followed: '✓ Following' and a 'Saved to' line", ["Following", "Saved to"])
+    if not await calculate(sc):
+        return
+    if not await publish_map(sc):
+        return
+    k3 = nak_req(3, acct["pub"])
+    sc.check("a kind-3 on the local relay", bool(k3), f"{len(k3)} events")
+    if k3:
+        p_owner = any(t[:2] == ["p", owner["pub"]] for t in k3[0].get("tags", []))
+        sc.check("the newest kind-3 follows the owner", p_owner,
+                 f"{len(k3[0].get('tags', []))} tags")
+    check_map_rows(sc, acct["pub"])
+    await sc.see("located")
+    sc.check_screen("the Trust card reads 'Located'", ["Located"])
+
+
+# ---------------------------------------------------------------- M
+async def scenario_m(sc):
+    """Existing kind-3 (three follows, content 'e2e old content'): following
+    the owner appends one p tag and keeps the content byte-for-byte."""
+    acct, owner = fresh_key(), fresh_key()
+    others = [fresh_key()["pub"] for _ in range(3)]
+    sc.box.start_fake({})
+    publish_owner_profile(owner, sc.suite.run_id)
+    nak_publish(acct["sec"], 3, "e2e old content", [f"p={p}" for p in others])
+    await asyncio.sleep(1)
+    sc.box.launch("M", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
+    if not await open_trust(sc):
+        return
+    if not await follow_owner(sc, expect_confirm=False):
+        return
+    sc.check_screen("owner followed without a confirmation", ["Following"], ["Start a new follow list"])
+    k3 = nak_req(3, acct["pub"])
+    sc.check("a kind-3 on the local relay", bool(k3), f"{len(k3)} events")
+    if k3:
+        ps = [t for t in k3[0].get("tags", []) if t and t[0] == "p"]
+        sc.check("the newest kind-3 has four p tags", len(ps) == 4, f"{len(ps)} p tags")
+        sc.check("the owner is among them", any(t[1] == owner["pub"] for t in ps if len(t) > 1))
+        sc.check("the content is unchanged", k3[0].get("content") == "e2e old content",
+                 k3[0].get("content", "")[:60])
+
+
+# ---------------------------------------------------------------- N
+async def scenario_n(sc):
+    """Local relay plus a dead one: the follow read is inconclusive, the error
+    line shows, and nothing is published."""
+    acct, owner = fresh_key(), fresh_key()
+    sc.box.start_fake({})
+    publish_owner_profile(owner, sc.suite.run_id)
+    sc.box.launch("N", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"],
+                             "MC_TRUST_RELAYS": f"{LOCAL_RELAY}, ws://127.0.0.1:10599"})
+    if not await open_trust(sc):
+        return
+    await sc.step(Step(
+        "Click 'Follow' on the recommended row; the relay answer must come back inconclusive.",
+        [Cand("follow-owner", "Click the 'Follow' button on the recommended owner row.",
+              [FOCUS, ("click_pill", "RECOMMENDED"), ("wait", 1), PARK])],
+        "An error line 'Couldn't confirm your current follow list' is shown.",
+        tries=4, settle=8,
+        cues=("Couldn't confirm your current follow list", "Start a new follow list", "Following")),
+        must_act=True, label="follow inconclusive")
+    screen = await sc.wait_for(["Couldn't confirm your current follow list"],
+                               ["Following"], timeout=30, every=3, label="inconclusive")
+    sc.check_screen("the inconclusive error line shows", ["Couldn't confirm your current follow list"],
+                    ["Following"], screen=screen)
+    await asyncio.sleep(2)
+    sc.check("no kind-3 was published to the local relay", not nak_req(3, acct["pub"]))
+
+
+# ---------------------------------------------------------------- O
+async def scenario_o(sc):
+    """graperank 429, then 403, then 503: each click shows the right wording
+    and can be retried; followList is posted at most once."""
+    acct, owner = fresh_key(), fresh_key()
+    sc.box.start_fake({"graperank": ["429", "403", "503"]})
+    publish_owner_profile(owner, sc.suite.run_id)
+    nak_publish(acct["sec"], 3, "", [f"p={owner['pub']}"])
+    await asyncio.sleep(1)
+    sc.box.launch("O", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
+    if not await open_trust(sc):
+        return
+    # The account already follows the owner, so step 2 is enabled at once.
+    # The Noul postcondition judges the state generically (an error line and
+    # the button back); the exact wording per status is the hard check after
+    # each click — a second click would spend the next scripted answer.
+    sc.box.mark("O 429")
+    await calculate(sc, done_cond="Step 2 shows the error 'Please wait a few minutes "
+                    "before recalculating' and the 'Calculate my trust scores' button.",
+                    label="calc 429", tries=1)
+    screen = await sc.wait_for(["Please wait a few minutes before recalculating"],
+                               ["Brainstorm confirmed"], timeout=25, every=3, label="429 wording")
+    sc.check_screen("429 wording", ["Please wait a few minutes before recalculating"], screen=screen)
+    sc.box.mark("O 403")
+    await calculate(sc, done_cond="Step 2 shows the error 'Please wait a few minutes "
+                    "before recalculating' and the 'Calculate my trust scores' button.",
+                    label="calc 403", tries=1)
+    screen = await sc.wait_for(["Please wait a few minutes before recalculating"],
+                               ["Brainstorm confirmed"], timeout=25, every=3, label="403 wording")
+    sc.check_screen("403 wording", ["Please wait a few minutes before recalculating"], screen=screen)
+    sc.box.mark("O 503")
+    await calculate(sc, done_cond="Step 2 shows the error 'The Brainstorm server is "
+                    "temporarily unavailable' and the 'Calculate my trust scores' button.",
+                    label="calc 503", tries=1)
+    screen = await sc.wait_for(["The Brainstorm server is temporarily unavailable"],
+                               ["Brainstorm confirmed"], timeout=25, every=3, label="503 wording")
+    sc.check_screen("503 wording", ["The Brainstorm server is temporarily unavailable"],
+                    ["Brainstorm confirmed"])
+    lines = sc.box.server_log().splitlines()
+    grapes = [l for l in lines if "/user/graperank" in l]
+    follows = [l for l in lines if "followList" in l]
+    sc.check("exactly three graperank requests", len(grapes) == 3, grapes)
+    sc.check("followList posted at most once", len(follows) <= 1, follows)
+
+
+# ---------------------------------------------------------------- Q
+async def scenario_q(sc):
+    """graperank ok but /setup 404: Publish stays disabled, a click sends
+    nothing, no kind-10040 lands."""
+    acct, owner = fresh_key(), fresh_key()
+    sc.box.start_fake({"setup": "404"})
+    publish_owner_profile(owner, sc.suite.run_id)
+    nak_publish(acct["sec"], 3, "", [f"p={owner['pub']}"])
+    await asyncio.sleep(1)
+    sc.box.launch("Q", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
+    if not await open_trust(sc):
+        return
+    if not await calculate(sc):
+        return
+    screen = await sc.wait_for(["Brainstorm has no Treasure Map data"], timeout=30, every=3,
+                               label="setup missing")
+    sc.check_screen("Brainstorm has no data wording", ["Brainstorm has no Treasure Map data"],
+                    screen=screen)
+    sc.box.mark("Q publish attempt")
+    # The button renders disabled: a click must send nothing anywhere.
+    try:
+        await sc.suite.driver.act("click_pill", "Publish your Treasure Map")
+    except Exception as e:
+        sc.notes.append(f"publish click found no button ({e})")
+    await asyncio.sleep(4)
+    sc.check("no kind-10040 on the local relay", not nak_req(10040, acct["pub"]))
+    lines = sc.log_after("Q publish attempt")
+    posts = [l for l in lines if l.startswith("BS POST")]
+    sc.check("the disabled publish sent no Brainstorm request", not posts, posts)
+
+
 SCENARIOS = {
     "A": ("submit lock while a create hangs", scenario_a),
     "B": ("502 on create: hint and refetch", scenario_b),
@@ -388,5 +701,10 @@ SCENARIOS = {
     "F": ("profile scan 500, then Try again", scenario_f),
     "G": ("nsec leaves the clipboard after 30 s", scenario_g),
     "H": ("two-click remove arms and disarms", scenario_h),
+    "L": ("trust: first list, follow owner, calc, map", scenario_l),
+    "M": ("trust: follow merges into an existing kind-3", scenario_m),
+    "N": ("trust: inconclusive contact read refuses", scenario_n),
+    "O": ("trust: graperank 429/403/503 wording and retries", scenario_o),
+    "Q": ("trust: /setup 404 keeps publish disabled", scenario_q),
     "P": ("paid: real bounty, claim, settle", scenario_p),
 }

@@ -5,3 +5,5 @@
 /dist-live
 /.codegraph
 .wrangler/
+scripts/e2e-cua/.venv/
+scripts/e2e-cua/__pycache__/
