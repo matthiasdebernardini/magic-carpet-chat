@@ -98,6 +98,7 @@ async fn add_account(handle: &mut NostrHandle, name: &'static str) -> Account {
             secret: Secret::new(nsec),
             name: Some(name.into()),
             open_wallet: true,
+            generated: true,
         })
         .unwrap();
 

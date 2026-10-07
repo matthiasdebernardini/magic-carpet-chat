@@ -90,6 +90,12 @@ pub struct StoredAccount {
     pub pubkey: String,
     /// Private: the runtime gets signing keys through [`keys`], never the text.
     nsec: Secret,
+    /// The key was generated inside the app, not pasted: it was never used
+    /// anywhere else, so no kind-3 on the relays means "fresh key", not "the
+    /// relays lost my follow list" — the destructive first write needs no
+    /// confirmation. Set only at insert; re-adding the key must not flip it.
+    #[serde(default)]
+    pub created_in_app: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coinos: Option<coinos::Login>,
 }
@@ -196,7 +202,10 @@ fn missing(pubkey: &str) -> SecretError {
 
 /// Parse, dedupe by pubkey, make it the active account, save. The nsec is
 /// stored as bech32 whatever was pasted, so the file has one shape.
-pub fn add_account(nsec: &Secret) -> Result<AccountRecord, SecretError> {
+/// `generated` marks keys the app itself just minted (`created_in_app`);
+/// a re-add of an existing pubkey is a no-op on the list, so re-adding a
+/// pasted key by hand can never flip the flag.
+pub fn add_account(nsec: &Secret, generated: bool) -> Result<AccountRecord, SecretError> {
     let keys = parse_secret(nsec)?;
     let pubkey = keys.public_key().to_hex();
     let npub = keys
@@ -213,6 +222,7 @@ pub fn add_account(nsec: &Secret) -> Result<AccountRecord, SecretError> {
             store.accounts.push(StoredAccount {
                 pubkey: pubkey.clone(),
                 nsec,
+                created_in_app: generated,
                 coinos: None,
             });
         }
@@ -297,6 +307,17 @@ pub fn parse_secret(secret: &Secret) -> Result<Keys, SecretError> {
     Keys::parse(&lower).map_err(|_| SecretError::NotAKey)
 }
 
+/// Was this key generated inside the app? `false` for pasted keys, keys
+/// stored before the flag existed, and unknown pubkeys.
+pub fn created_in_app(pubkey: &str) -> Result<bool, SecretError> {
+    Ok(load()?
+        .accounts
+        .iter()
+        .find(|a| a.pubkey == pubkey)
+        .map(|a| a.created_in_app)
+        .unwrap_or(false))
+}
+
 /// The stored key as signing keys. `Ok(None)` means no such account.
 pub fn keys(pubkey: &str) -> Result<Option<Keys>, SecretError> {
     let store = load()?;
@@ -345,7 +366,7 @@ pub fn import_from_env() -> Result<Vec<String>, SecretError> {
             );
             continue;
         }
-        npubs.push(add_account(&secret)?.npub);
+        npubs.push(add_account(&secret, false)?.npub);
     }
     Ok(npubs)
 }
@@ -394,11 +415,16 @@ mod tests {
 
         let a = Keys::generate();
         let b = Keys::generate();
-        let ra = add_account(&Secret::new(a.secret_key().to_bech32().unwrap())).unwrap();
-        let rb = add_account(&Secret::new(b.secret_key().to_secret_hex())).unwrap();
+        let ra = add_account(&Secret::new(a.secret_key().to_bech32().unwrap()), true).unwrap();
+        let rb = add_account(&Secret::new(b.secret_key().to_secret_hex()), false).unwrap();
+        // The flag was set at insert: the generated key is marked, the pasted
+        // one is not — and re-adding either never flips it.
+        assert!(created_in_app(&ra.pubkey).unwrap());
+        assert!(!created_in_app(&rb.pubkey).unwrap());
         // The same key again is a no-op on the list, and makes it active.
-        let again = add_account(&Secret::new(a.secret_key().to_bech32().unwrap())).unwrap();
+        let again = add_account(&Secret::new(a.secret_key().to_bech32().unwrap()), false).unwrap();
         assert_eq!(again, ra);
+        assert!(created_in_app(&ra.pubkey).unwrap(), "a re-add must not flip the flag");
         let store = load().unwrap();
         assert_eq!(store.accounts.len(), 2);
         assert_eq!(store.accounts[0].pubkey, ra.pubkey);
@@ -448,12 +474,24 @@ mod tests {
 
         let keys = Keys::generate();
         // Stored from hex, handed back as bech32.
-        let record = add_account(&Secret::new(keys.secret_key().to_secret_hex())).unwrap();
+        let record = add_account(&Secret::new(keys.secret_key().to_secret_hex()), false).unwrap();
         let stored = nsec(&record.pubkey).unwrap().unwrap();
         assert_eq!(stored.expose(), keys.secret_key().to_bech32().unwrap());
         assert!(nsec(&"cc".repeat(32)).unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stored_account_defaults_to_not_created_in_app() {
+        // Stores written before the flag existed carry no `created_in_app`
+        // field — they must read as pasted keys (the safe default: a pasted
+        // key's missing follow list needs the confirmation prompt).
+        let json = r#"{"pubkey":""#.to_string()
+            + &"aa".repeat(32)
+            + r#"","nsec":"nsec1xx"}"#;
+        let account: StoredAccount = serde_json::from_str(&json).unwrap();
+        assert!(!account.created_in_app);
     }
 
     #[test]
