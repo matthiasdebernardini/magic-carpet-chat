@@ -24,6 +24,7 @@ use magic_carpet_chat::nostr;
 use magic_carpet_chat::secrets::Secret;
 use magic_carpet_chat::trust::{self, Assertion, BrainstormKey, Designation};
 
+use crate::community;
 use crate::dashboard::{MONO, muted};
 use crate::palette::*;
 use crate::shell::{AccountView, Screen, Shell, display_name, short_id, short_npub};
@@ -287,7 +288,6 @@ fn raw_toggle(
 /// gpui has no inline links in running text.
 fn missing_map_note(cx: &mut Context<Shell>) -> impl IntoElement {
     h_flex()
-        .mt(px(14.))
         .gap(px(10.))
         .items_start()
         .bg(rgba(0xe5646c14))
@@ -1279,7 +1279,21 @@ fn map_card(
                             timefmt::month_day_year(*at)
                         )),
                 )
-                .child(missing_map_note(cx))
+                .child(
+                    v_flex()
+                        .mt(px(14.))
+                        .gap(px(14.))
+                        .child(missing_map_note(cx))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("Good news: you can do the three needed steps right here."),
+                        )
+                        // The Trusted Community steps live inside the "Not
+                        // located" card — the fix happens right here.
+                        .child(community::steps(shell, pubkey, cx)),
+                )
                 .child(raw_toggle(
                     "map",
                     "raw event",
@@ -1289,7 +1303,19 @@ fn map_card(
                 ));
         }
         Some(Designation::None) => {
-            body = body.child(missing_map_note(cx));
+            body = body.child(
+                v_flex()
+                    .mt(px(14.))
+                    .gap(px(14.))
+                    .child(missing_map_note(cx))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("Good news: you can do the three needed steps right here."),
+                    )
+                    .child(community::steps(shell, pubkey, cx)),
+            );
         }
         None if failed_message.is_none() => {
             body = body.child(

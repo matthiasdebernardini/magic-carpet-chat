@@ -29,6 +29,7 @@ use crate::account::{self, AccountPage, Tab};
 use crate::account_setup::{self, AccountSetup, Path as SetupPath, ReadySummary};
 use crate::bounties;
 use crate::chat::Chat;
+use crate::community::CommunityState;
 use crate::dashboard::{self, MONO, avatar};
 use crate::icons::icon;
 use crate::palette::*;
@@ -609,7 +610,7 @@ pub struct Shell {
     /// the list containing it arrives.
     pub(crate) bounty_list_scroll: ScrollHandle,
     scroll_to: Option<String>,
-    commands: mpsc::UnboundedSender<Command>,
+    pub(crate) commands: mpsc::UnboundedSender<Command>,
     chat: Entity<Chat>,
     search: Entity<InputState>,
     /// Keeps key dispatch anchored inside the shell on screens with no input
@@ -638,6 +639,17 @@ pub struct Shell {
     /// Per-account NIP-85 state (Treasure Map, assertions, follows), keyed by
     /// pubkey. Each entry carries the fetch generation it answers to.
     pub(crate) trust: HashMap<String, TrustState>,
+    /// Per-account "Your Trusted Community" panel state, keyed by pubkey.
+    /// An entry is created when a surface first renders the panel and dies
+    /// with the account; the generation stamps every command so a stale
+    /// reply (older fetch, account removed and re-added) is dropped.
+    pub(crate) community: HashMap<String, CommunityState>,
+    /// The next generation a community panel gets.
+    pub(crate) community_generation: u32,
+    /// The instance owner once `Update::Owner` lands: (hex, npub, name).
+    pub(crate) owner: Option<(String, String, Option<String>)>,
+    /// `FetchOwner` goes out once per app run — the answer never expires.
+    pub(crate) owner_requested: bool,
     /// The Account page's own state — which account, which tab — while
     /// `screen` is `Screen::Account`.
     pub(crate) account_page: Option<AccountPage>,
@@ -752,6 +764,10 @@ impl Shell {
             bounties_seq: 0,
             send_inputs,
             trust: HashMap::new(),
+            community: HashMap::new(),
+            community_generation: 0,
+            owner: None,
+            owner_requested: false,
             account_page: None,
             _activation: activation,
         }
@@ -817,7 +833,7 @@ impl Shell {
         }
     }
 
-    fn push_activity(&mut self, dot: u32, text: String, at: u64) {
+    pub(crate) fn push_activity(&mut self, dot: u32, text: String, at: u64) {
         self.activity.insert(0, ActivityItem { dot, text, at });
         self.activity.truncate(200);
     }
@@ -906,6 +922,7 @@ impl Shell {
                 // Trust state follows the account set: removed accounts lose
                 // their entries, and everyone gets a fresh read.
                 self.trust.retain(|p, _| pubkeys.contains(p));
+                self.community.retain(|p, _| pubkeys.contains(p));
                 // Disarm only when the armed account is gone. Trust parts
                 // land mid-confirm and must not reset the second click.
                 if self
@@ -984,8 +1001,10 @@ impl Shell {
                         ProfileRead::Failed
                     };
                 }
-                // A new account's trust read starts the moment it lands.
+                // A new account's trust read starts the moment it lands,
+                // and the community panel answers the setup card.
                 self.fetch_trust(&pubkey);
+                self.ensure_community(&pubkey, window, cx);
                 // Read-only mode ends with the first account.
                 if self.active.is_none() {
                     self.active = Some(pubkey.clone());
@@ -1344,6 +1363,20 @@ impl Shell {
                     state.apply(part, now);
                 }
             }
+            Update::Owner {
+                pubkey_hex,
+                npub,
+                name,
+            } => {
+                self.owner = Some((pubkey_hex, npub, name));
+            }
+            Update::Community {
+                pubkey,
+                generation,
+                part,
+            } => {
+                self.apply_community(pubkey, generation, part, window, cx);
+            }
         }
         self.finish_apply(cx);
     }
@@ -1480,6 +1513,8 @@ impl Shell {
         if stale {
             self.fetch_trust(pubkey);
         }
+        // The Trust tab's "Not located" card hosts the community panel.
+        self.ensure_community(pubkey, window, cx);
         self.account_page = Some(AccountPage::new(pubkey, tab));
         self.go(Screen::Account, window, cx);
     }
@@ -1574,6 +1609,7 @@ impl Shell {
             secret: Secret::new(nsec),
             name: Some(name).filter(|n| !n.is_empty()),
             open_wallet: true,
+            generated: true,
         });
         cx.notify();
     }
@@ -1598,6 +1634,7 @@ impl Shell {
             secret,
             name: None,
             open_wallet: false,
+            generated: false,
         });
         cx.notify();
     }
@@ -3062,7 +3099,31 @@ mod tests {
         form_locked, next_bounties_read, on_outcome_unknown, pick_active, relay_address_gap,
         remove_click, still_checking_list,
     };
+    use std::collections::HashMap;
+
     use magic_carpet_chat::nostr::{Command, Update};
+
+    /// The community stale-reply guard, exercised the way
+    /// `apply_community` uses it: look the panel up by pubkey, hand its
+    /// generation in. A reply for A never reaches B's panel because the
+    /// map lookup yields B's generation.
+    #[test]
+    fn community_replies_need_a_live_panel_at_their_generation() {
+        let panels: HashMap<String, u32> = [("a".to_string(), 2), ("b".to_string(), 1)]
+            .into_iter()
+            .collect();
+        let accepts_for = |pubkey: &str, generation: u32| {
+            crate::community::accepts(panels.get(pubkey).copied(), generation)
+        };
+        assert!(accepts_for("a", 2));
+        assert!(accepts_for("a", 3), "a newer generation is still current");
+        assert!(!accepts_for("a", 1), "a stale reply is dropped");
+        // A reply stamped for A's older life, aimed at B's panel, never fits.
+        assert!(!accepts_for("b", 0));
+        assert!(accepts_for("b", 1));
+        // A removed account has no panel at all.
+        assert!(!accepts_for("gone", 5));
+    }
 
     #[test]
     fn an_auto_pay_claim_gets_a_short_toast_and_the_rank_note_behind_a_click() {

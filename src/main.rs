@@ -14,6 +14,7 @@ mod account;
 mod account_setup;
 mod bounties;
 mod chat;
+mod community;
 mod dashboard;
 mod icons;
 mod palette;

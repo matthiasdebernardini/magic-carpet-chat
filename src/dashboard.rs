@@ -18,7 +18,11 @@ use crate::timefmt;
 use crate::trust_state::MapVerdict;
 
 /// The mock's monospace face, used for every sats figure and every npub.
+/// Menlo is the bundled macOS face; Linux resolves the generic family.
+#[cfg(target_os = "macos")]
 pub const MONO: &str = "Menlo";
+#[cfg(not(target_os = "macos"))]
+pub const MONO: &str = "monospace";
 
 /// One line of small secondary text in `color`.
 pub(crate) fn muted(text: impl Into<SharedString>, color: u32) -> AnyElement {
