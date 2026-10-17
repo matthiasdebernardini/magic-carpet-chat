@@ -395,7 +395,7 @@ pub fn panel(
                         .items_start()
                         .child(muted(
                             format!(
-                                "Coinos username {} — only needed on coinos.io itself.",
+                                "Coinos username: {}. Only needed on coinos.io.",
                                 created.username
                             ),
                             TEXT_MUTED,
@@ -421,7 +421,7 @@ pub fn panel(
                 )
                 .when_some(other.clone(), |this, other| {
                     this.child(muted(
-                        format!("Your profile pays {other}; this wallet is not on it."),
+                        format!("Your profile pays {other}, not this wallet. This app does not replace it."),
                         AMBER,
                     ))
                 })
@@ -430,8 +430,8 @@ pub fn panel(
                     |this, error| {
                         let for_retry = pubkey.clone();
                         this.child(muted(
-                            "The wallet exists, but the address is not on your profile yet — \
-                             claims will not be paid until it is.",
+                            "The wallet exists, but the address is not on your profile yet. \
+                             Claims will not be paid until it is.",
                             AMBER,
                         ))
                         .child(
@@ -453,12 +453,15 @@ pub fn panel(
             TEXT_MUTED,
         ))
     } else if view.profile == ProfileRead::Checking {
-        v_flex().child(muted("Checking the profile…", TEXT_MUTED))
+        v_flex().child(muted("Checking your profile…", TEXT_MUTED))
     } else if view.profile == ProfileRead::Failed {
         // Unknown is not "none": offer no wallet until the read succeeds.
         v_flex()
             .gap(px(10.))
-            .child(muted("Couldn't read this profile.", AMBER))
+            .child(muted(
+                "Couldn't read this profile. Check your connection.",
+                AMBER,
+            ))
             .child(
                 button("wallet-profile-retry", "Try again", false)
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),

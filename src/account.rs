@@ -503,7 +503,7 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
 
 /// The Account screen: the mock's `isAccountDetail` block — back link,
 /// header, tab strip, and the tab's body. Identity & keys and Trust are
-/// built; the other three tabs say "Not built yet."
+/// built; the other three tabs say "Coming soon."
 pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let Some(page) = &shell.account_page else {
         return muted("No account selected.", TEXT_MUTED);
@@ -651,7 +651,7 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
         .child(match tab {
             Tab::Identity => render_identity(shell, &pubkey, &npub, cx),
             Tab::Trust => render_trust(shell, &pubkey, cx),
-            _ => muted("Not built yet.", TEXT_MUTED),
+            _ => muted("Coming soon.", TEXT_MUTED),
         })
         .into_any_element()
 }
@@ -973,15 +973,19 @@ fn assertion_facts(
     cx: &mut Context<Shell>,
 ) -> AnyElement {
     let hops_line = match assertion.hops {
-        Some(hops) => format!("hops {hops}"),
-        None => "no follow path".to_string(),
+        Some(hops) => {
+            let steps = if hops == 1 { "step" } else { "steps" };
+            let from = if own_pov { "you" } else { "the issuer" };
+            format!("{hops} {steps} from {from}")
+        }
+        None => "not linked by follows".to_string(),
     };
     v_flex()
         .mt(px(12.))
         .gap(px(9.))
         .child(fact(
             "Located",
-            div().child(format!("1 current score event from {prefix}")),
+            div().child(format!("1 current score from {prefix}")),
         ))
         .child(fact(
             "Most recent",
@@ -1020,7 +1024,7 @@ fn assertion_facts(
                 div()
                     .text_size(px(11.5))
                     .text_color(rgb(TEXT_DIM))
-                    .child("This is your own point of view: your provider scores you as its observer."),
+                    .child("This is your own point of view. Your score provider scores everyone from your view, you included."),
             )
         })
         .child(raw_toggle(
@@ -1155,7 +1159,10 @@ fn map_card(
                 .collect::<Vec<_>>()
                 .join(" · ");
             let entries: AnyElement = if types.is_empty() {
-                div().text_color(rgb(AMBER)).child("no rank row").into_any_element()
+                div()
+                    .text_color(rgb(AMBER))
+                    .child("no rank entry")
+                    .into_any_element()
             } else {
                 h_flex()
                     .items_baseline()
@@ -1169,7 +1176,7 @@ fn map_card(
                             .child(SharedString::from(types)),
                     )
                     .when(rank_row.is_none(), |this| {
-                        this.child(div().text_color(rgb(AMBER)).child("· no rank row"))
+                        this.child(div().text_color(rgb(AMBER)).child("· no rank entry"))
                     })
                     .into_any_element()
             };
@@ -1206,7 +1213,7 @@ fn map_card(
                         }
                     }
                     Some(BrainstormKey::NoAccount) => {
-                        "no Brainstorm account for this npub".to_string()
+                        "no Brainstorm account for this key".to_string()
                     }
                     // Still in flight reads as "checking", not as a failure.
                     None => match &state.brainstorm.status {
@@ -1323,7 +1330,7 @@ fn map_card(
                     .mt(px(14.))
                     .text_size(px(12.5))
                     .text_color(rgb(TEXT_MUTED))
-                    .child("Checking the relays…"),
+                    .child("Checking Nostr servers…"),
             );
         }
         None => {}
@@ -1416,11 +1423,11 @@ fn assertions_card(
         .is_some();
     if has_rank_row {
         body = body
-            .child(group_label("From your rank provider"))
+            .child(group_label("From your score provider"))
             .child(assertion_group_body(
                 pubkey,
                 &state.own,
-                "your rank provider",
+                "your score provider",
                 true,
                 "own",
                 "check-again-own",
@@ -1433,17 +1440,17 @@ fn assertions_card(
     // The instance issuer's provider — always shown.
     let provider_line = match &state.instance_provider {
         Some((key, relay)) => format!(
-            "Scores as seen by {}, the issuer this instance pays for. Provider {} at {relay}.",
+            "Scores seen by {}, the issuer account this server pays for. Provider {} at {relay}.",
             issuer_short_npub(),
             short_id(key)
         ),
         None => format!(
-            "Scores as seen by {}, the issuer this instance pays for.",
+            "Scores seen by {}, the issuer account this server pays for.",
             issuer_short_npub()
         ),
     };
     body = body
-        .child(group_label("From this instance's issuer"))
+        .child(group_label("From the issuer's score provider"))
         .child(
             div()
                 .mt(px(6.))
@@ -1454,7 +1461,7 @@ fn assertions_card(
         .child(assertion_group_body(
             pubkey,
             &state.instance,
-            "the instance's rank provider",
+            "the server's score provider",
             false,
             "instance",
             "check-again-instance",
@@ -1637,7 +1644,7 @@ fn determination_card(shell: &Shell, pubkey: &str) -> AnyElement {
                 .mt(px(10.))
                 .text_size(px(11.5))
                 .text_color(rgb(TEXT_DIM))
-                .child("Not changeable in this version. The instance scores every claim from the issuer's point of view."),
+                .child("You can't change this yet. The server scores every claim from the issuer's point of view."),
         )
         .into_any_element()
 }
@@ -1647,7 +1654,7 @@ fn determination_card(shell: &Shell, pubkey: &str) -> AnyElement {
 fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) -> AnyElement {
     let (following, following_note) = match &state.follows.last {
         Some(Some(n)) => (n.to_string(), None),
-        Some(None) => ("—".to_string(), Some("no contact list found")),
+        Some(None) => ("—".to_string(), Some("no follow list found")),
         None => match state.follows.status {
             Status::Failed(_) => ("—".to_string(), Some("couldn't read")),
             _ => ("—".to_string(), None),
@@ -1656,9 +1663,9 @@ fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) 
     let (followers, followers_note) = match &state.instance.last {
         Some(Some(assertion)) => match assertion.followers {
             Some(n) => (n.to_string(), None),
-            None => ("—".to_string(), Some("no assertion")),
+            None => ("—".to_string(), Some("followers count unavailable")),
         },
-        Some(None) => ("—".to_string(), Some("no assertion")),
+        Some(None) => ("—".to_string(), Some("no score yet")),
         None => match state.instance.status {
             Status::Failed(_) => ("—".to_string(), Some("couldn't read")),
             _ => ("—".to_string(), None),

@@ -28,10 +28,8 @@ const MODEL: &str = "claude-sonnet-5";
 const MAX_TOKENS: u32 = 64_000;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
-const NO_KEY: &str = "**No API key.** Put it in `~/.config/anthropic/key` or set `ANTHROPIC_API_KEY` in the shell that \
-    launches this app, then start it again.";
-const NO_KEY_CAUSE: &str = "No API key: ~/.config/anthropic/key is missing and \
-    ANTHROPIC_API_KEY is not set. Fix one, then start the app again.";
+const NO_KEY: &str = "**No API key.** Save it in `~/.config/anthropic/key` and send again, or set `ANTHROPIC_API_KEY` and restart the app.";
+const NO_KEY_CAUSE: &str = "No API key found. Save it in ~/.config/anthropic/key and send again, or set ANTHROPIC_API_KEY and restart the app.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -171,7 +169,8 @@ impl Chat {
             match result {
                 Err(cause) => message.text = format!("**Something went wrong.** {cause}"),
                 Ok(()) if message.text.is_empty() => {
-                    message.text = "**The model sent an empty reply.**".to_string()
+                    message.text =
+                        "**Claude sent an empty reply.** Send your message again.".to_string()
                 }
                 Ok(()) => {}
             }
@@ -263,7 +262,7 @@ impl Render for Chat {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(TEXT_DIM))
-                            .child("Enter to send · Shift+Enter for a new line"),
+                            .child("Enter sends. Shift+Enter adds a line."),
                     ),
             )
     }
@@ -305,12 +304,11 @@ async fn stream_reply(
         .header("anthropic-version", "2023-06-01")
         .header("x-api-key", api_key.expose())
         .body(AsyncBody::from(payload))
-        .map_err(|error| format!("The request would not build: {error}"))?;
+        .map_err(|error| format!("Couldn't build the request: {error}."))?;
 
-    let mut response = http
-        .send(request)
-        .await
-        .map_err(|error| format!("Could not reach api.anthropic.com: {error}"))?;
+    let mut response = http.send(request).await.map_err(|error| {
+        format!("Couldn't reach Claude: {error}. Check your connection and try again.")
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -321,7 +319,8 @@ async fn stream_reply(
 
     let mut lines = futures::io::BufReader::new(response.into_body()).lines();
     while let Some(line) = lines.next().await {
-        let line = line.map_err(|error| format!("The stream broke: {error}"))?;
+        let line = line
+            .map_err(|error| format!("The reply was cut off: {error}. Send your message again."))?;
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
         };
@@ -345,7 +344,7 @@ async fn stream_reply(
             Some("error") => {
                 return Err(event["error"]["message"]
                     .as_str()
-                    .unwrap_or("The API reported an error mid-stream.")
+                    .unwrap_or("Claude reported an error. Send your message again.")
                     .to_string());
             }
             _ => {}
@@ -366,11 +365,18 @@ fn explain(status: StatusCode, body: &str) -> String {
         detail = detail.chars().take(300).chain(['…']).collect();
     }
 
+    let detail = magic_carpet_chat::api::sentence(&detail);
+
     match status {
         StatusCode::UNAUTHORIZED => {
-            format!("The API rejected the key in ANTHROPIC_API_KEY: {detail}")
+            format!("Claude rejected your API key: {detail} Check the key, then send again.")
         }
-        StatusCode::TOO_MANY_REQUESTS => format!("Rate limited: {detail}"),
-        _ => format!("The API answered {}: {detail}", status.as_u16()),
+        StatusCode::TOO_MANY_REQUESTS => {
+            format!("Too many requests: {detail} Wait a minute, then try again.")
+        }
+        _ => format!(
+            "Claude returned error {}: {detail} Try again in a moment.",
+            status.as_u16()
+        ),
     }
 }

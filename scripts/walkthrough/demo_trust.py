@@ -39,10 +39,10 @@ SCROLL_DOWN = Cand(
     "Scroll the Account page down to its end so the Web of trust card is on screen.",
     [FOCUS, ("scroll", "down")],
 )
-IDENTITY_TAB = Cand(
-    "open-identity-tab",
-    "Click the 'Identity & keys' tab in the tab strip.",
-    [FOCUS, ("scroll", "up"), ("click_text", "Identity")],
+PROGRESS_TAB = Cand(
+    "open-progress-tab",
+    "Click the 'Progress' tab in the tab strip.",
+    [FOCUS, ("scroll", "up"), ("click_text", "Progress")],
 )
 DASHBOARD = Cand(
     "back-to-dashboard",
@@ -102,10 +102,10 @@ STEPS = [
     ),
     Step(
         "Show that the other tabs exist but are not built yet.",
-        [IDENTITY_TAB],
-        "The 'Identity & keys' tab is selected and the page body reads 'Not built yet.'",
+        [PROGRESS_TAB],
+        "The 'Progress' tab is selected and the page body reads 'Coming soon.'",
         settle=3,
-        cues=("Identity & keys", "Not built yet"),
+        cues=("Progress", "Coming soon"),
     ),
     Step(
         "Return to the Dashboard.",

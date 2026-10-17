@@ -74,8 +74,8 @@ Every scenario starts from a clean state: a fresh `MC_STORE_DIR`, the app relaun
 
 | ID | Checks |
 |---|---|
-| A | A create hangs. Switching account, opening account setup (`+`) and removing the active account are refused with the amber "A submit is in flight; wait for it to finish" line. Esc keeps the form open. After the 20 s client timeout the form unlocks. One create request, both accounts still stored. |
-| B | A 502 on create shows the "may have created" hint, and the fake server logs a `GET /api/bounties` refetch after it. |
+| A | A create hangs. Switching account, opening account setup (`+`) and removing the active account are refused with the amber "Still sending. Wait for it to finish." line. Esc keeps the form open. After the 20 s client timeout the form unlocks. One create request, both accounts still stored. |
+| B | A 502 on create shows the "may exist already" hint, and the fake server logs a `GET /api/bounties` refetch after it. |
 | C | A 400 on create shows the refusal with no hint and no refetch. |
 | D | A second open bounty for the same list is refused in the form; no publish and no create request reach the server. |
 | E | 401 then 2xx: one re-login, then the create succeeds. 401 twice: one re-login, two creates, then a clean error in the open form. |
@@ -84,10 +84,10 @@ Every scenario starts from a clean state: a fresh `MC_STORE_DIR`, the app relaun
 | H | The first remove click arms "Click again to remove" in the sidebar and on the Identity card; navigating away disarms both; nothing is removed. For the claimant (Coinos wallet, store seeded from `/root/mc-store`) the armed state warns about the sats left. |
 | L | Fresh account, no kind-3: the recommended owner row's Follow shows the "Start a new follow list" confirmation; approving it publishes a kind-3 with the owner's `p` tag; Calculate then Publish lands a kind-10040 whose tags equal the fake `/setup` rows verbatim; the Trust card reads "Located". |
 | M | A seeded kind-3 (three follows, content "e2e old content"): Follow needs no confirmation; the newest kind-3 has four `p` tags and unchanged content. |
-| N | `MC_TRUST_RELAYS` = local relay + a dead one: Follow shows "Couldn't confirm your current follow list" and no kind-3 is published. |
+| N | `MC_TRUST_RELAYS` = local relay + a dead one: Follow shows "Couldn't check your follow list" and no kind-3 is published. |
 | O | graperank answers 429, 403, 503: each shows its wording ("Please wait a few minutes before recalculating…" twice, then "The Brainstorm server is temporarily unavailable…"), Calculate stays clickable each time (three graperank requests), and `followList` is posted at most once. |
-| Q | graperank ok but `/setup` 404: "Publish my Treasure Map" stays disabled — clicking it sends nothing, no kind-10040 lands — and the "Brainstorm has no Treasure Map data" line shows. |
-| P | Paid, against the real tapestry instance. The house creates a 100-sat bounty with cap 100 (closed after its one payout) on a list named `e2e-<run>`; the claimant claims it; the card must show "Payment settled" and "Zap receipt". The claim form must name this run's list before Enter, so no other bounty gets paid. The create and the claim run once each, never retried. |
+| Q | graperank ok but `/setup` 404: "Publish my Treasure Map" stays disabled — clicking it sends nothing, no kind-10040 lands — and the "Brainstorm has no data for this account" line shows. |
+| P | Paid, against the real tapestry instance. The house creates a 100-sat bounty with cap 100 (closed after its one payout) on a list named `e2e-<run>`; the claimant claims it; the card must show "Payment settled" and "Payment receipt". The claim form must name this run's list before Enter, so no other bounty gets paid. The create and the claim run once each, never retried. |
 
 A scenario passes when every Jev postcondition is met and every hard check passes (literal OCR phrases, fake-server log lines, the clipboard, the float).
 

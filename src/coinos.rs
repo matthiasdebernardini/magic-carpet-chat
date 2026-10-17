@@ -47,23 +47,23 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 #[derive(thiserror::Error, Debug)]
 pub enum CoinosError {
-    #[error("could not reach coinos.io: {0}")]
+    #[error("Coinos request failed: {0}.")]
     Http(String),
     /// Coinos answers registration failures with plain text, not JSON, so the
     /// body is passed through as-is. Also a 401 on the balance read, and a
     /// payment coinos would not make ("Insufficient funds").
-    #[error("coinos refused: {0}")]
+    #[error("Coinos said no{}.", crate::api::detail(.0))]
     Refused(String),
     /// The recipient's side of a send: its LNURL server was unreachable,
     /// answered something other than a pay request, or said no. Named after
     /// the recipient's domain, because coinos had no part in it.
-    #[error("{0}")]
+    #[error("{0}.")]
     Recipient(String),
     /// `POST /api/payments` went out and no answer came back (timeout,
     /// dropped connection). Coinos may have paid: a retry with a fresh
     /// invoice would pay twice, so the caller must re-read the balance and
     /// let the person decide.
-    #[error("Payment outcome unknown; check the balance before sending again")]
+    #[error("Payment status unknown. Check your balance before sending again.")]
     OutcomeUnknown,
 }
 
@@ -281,13 +281,16 @@ async fn lnurl_get(domain: &str, url: String) -> Result<serde_json::Value, Coino
         .get(url)
         .send()
         .await
-        .map_err(|e| CoinosError::Recipient(format!("{domain} could not be reached: {e}")))?;
+        .map_err(|e| CoinosError::Recipient(format!("{domain} couldn't be reached: {e}")))?;
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.map_err(|_| {
         CoinosError::Recipient(format!("{domain} answered {status} with no LNURL response"))
     })?;
     if let Some(reason) = lnurl_error(&body) {
-        return Err(CoinosError::Recipient(format!("{domain} refused: {reason}")));
+        return Err(CoinosError::Recipient(format!(
+            "{domain} refused: {}",
+            reason.trim_end_matches('.')
+        )));
     }
     if !status.is_success() {
         return Err(CoinosError::Recipient(format!("{domain} answered {status}")));
@@ -345,7 +348,7 @@ pub async fn lnurl_invoice(lightning_address: &str, sats: u64) -> Result<String,
 /// coinos ever sees it.
 fn invoice_for(bolt11: &str, sats: u64) -> Result<Bolt11Invoice, CoinosError> {
     let invoice = Bolt11Invoice::from_str(bolt11.trim())
-        .map_err(|e| CoinosError::Refused(format!("the invoice could not be read: {e}")))?;
+        .map_err(|e| CoinosError::Refused(format!("the invoice couldn't be read: {e}")))?;
     match invoice.amount_milli_satoshis() {
         Some(msat) if msat == sats.saturating_mul(1000) => Ok(invoice),
         Some(msat) => Err(CoinosError::Refused(format!(

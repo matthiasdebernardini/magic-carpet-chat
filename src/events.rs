@@ -30,7 +30,7 @@ pub const RECEIPT_KIND: u16 = 9735;
 pub enum EventError {
     #[error("{0}")]
     Invalid(String),
-    #[error("could not sign the event: {0}")]
+    #[error("Couldn't sign: {0}.")]
     Sign(String),
 }
 
@@ -96,12 +96,14 @@ pub fn dlist_header(
 ) -> Result<Event, EventError> {
     let singular = singular.trim();
     if singular.is_empty() {
-        return Err(EventError::Invalid("a list needs a singular name".into()));
+        return Err(EventError::Invalid(
+            "Enter a singular item name for the list.".into(),
+        ));
     }
     let dtag = header_dtag(singular);
     if dtag.is_empty() {
         return Err(EventError::Invalid(format!(
-            "\"{singular}\" slugs to an empty d-tag"
+            "\"{singular}\" needs at least one English letter or digit. Use a different name."
         )));
     }
     // NewDList.jsx: `['names', singular, plural || singular]`.
@@ -135,16 +137,20 @@ pub fn dlist_header(
 pub fn claim(keys: &Keys, name: &str, list_coordinate: &str) -> Result<Event, EventError> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(EventError::Invalid("a claim needs an item name".into()));
+        return Err(EventError::Invalid(
+            "Enter an item name for the claim.".into(),
+        ));
     }
     let list_coordinate = list_coordinate.trim();
     if list_coordinate.is_empty() {
-        return Err(EventError::Invalid("a claim needs a list coordinate".into()));
+        return Err(EventError::Invalid(
+            "Pick a bounty first. A claim needs its list.".into(),
+        ));
     }
     let dtag = child_dtag(name, list_coordinate);
     if dtag.starts_with('-') {
         return Err(EventError::Invalid(format!(
-            "\"{name}\" slugs to an empty d-tag"
+            "\"{name}\" needs at least one English letter or digit. Use a different name."
         )));
     }
     EventBuilder::new(Kind::Custom(CLAIM_KIND), name)

@@ -31,20 +31,20 @@ pub fn base_url() -> String {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ApiError {
-    #[error("http client could not be built: {0}")]
+    #[error("Couldn't start the network client: {0}.")]
     Client(String),
-    #[error("http error: {0}")]
+    #[error("Couldn't reach the Magic Carpet server: {0}.")]
     Http(String),
-    #[error("api returned {status}: {message}")]
+    #[error("The Magic Carpet server returned error {status}{}.", detail(.message))]
     Status { status: u16, message: String },
-    #[error("login denied: {0}")]
+    #[error("The Magic Carpet server refused the login{}.", detail(.0))]
     Denied(String),
-    #[error("could not sign: {0}")]
+    #[error("Couldn't sign the request: {0}.")]
     Sign(String),
-    #[error("could not read api response: {0}")]
+    #[error("Couldn't read the server reply: {0}.")]
     Decode(String),
     /// HTTP 200 with `success: false` — the server's way of refusing.
-    #[error("{0}")]
+    #[error("{}", sentence(.0))]
     Rejected(String),
 }
 
@@ -70,6 +70,31 @@ pub struct CreateBounty {
     pub auto_pay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_pay_min_rank: Option<u64>,
+}
+
+/// Server-supplied text for an error sentence: " (text)", or nothing when the
+/// server sent an empty body, so the message never shows "()".
+pub(crate) fn detail(text: &str) -> String {
+    let text = text.trim().trim_end_matches('.');
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(" ({text})")
+    }
+}
+
+/// Server-supplied text as a full sentence: trimmed, with a final period
+/// unless it already ends in one of . ! ? or an ellipsis. Empty text, which a
+/// server can send as `"error": ""`, becomes a fixed sentence instead of ".".
+pub fn sentence(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        "No reason was given.".to_string()
+    } else if text.ends_with(['.', '!', '?', '…']) {
+        text.to_string()
+    } else {
+        format!("{text}.")
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -280,9 +305,9 @@ pub(crate) fn parse_detail(json: &str) -> Result<BountyDetail, ApiError> {
     let resp: BountyDetailResponse =
         serde_json::from_str(json).map_err(|e| ApiError::Decode(e.to_string()))?;
     if !resp.success {
-        return Err(ApiError::Rejected(
-            resp.error.unwrap_or_else(|| "bounty lookup failed".into()),
-        ));
+        return Err(ApiError::Rejected(resp.error.unwrap_or_else(|| {
+            "The Magic Carpet server gave no reason.".into()
+        })));
     }
     let bounty = resp
         .bounty
@@ -309,9 +334,9 @@ pub(crate) fn parse_bounty_list(json: &str) -> Result<Vec<Bounty>, ApiError> {
     let resp: BountyListResponse =
         serde_json::from_str(json).map_err(|e| ApiError::Decode(e.to_string()))?;
     if !resp.success {
-        return Err(ApiError::Rejected(
-            resp.error.unwrap_or_else(|| "bounty list failed".into()),
-        ));
+        return Err(ApiError::Rejected(resp.error.unwrap_or_else(|| {
+            "The Magic Carpet server gave no reason.".into()
+        })));
     }
     Ok(resp.bounties)
 }
@@ -457,7 +482,7 @@ impl Api {
             .await?;
         if !login.success {
             return Err(ApiError::Denied(
-                login.message.unwrap_or_else(|| "login failed".into()),
+                login.message.unwrap_or_else(|| "no reason given".into()),
             ));
         }
         Ok(())
@@ -467,9 +492,9 @@ impl Api {
     pub async fn create_bounty(&self, req: &CreateBounty) -> Result<Bounty, ApiError> {
         let resp: CreateBountyResponse = self.post_json("/api/bounties", req).await?;
         if !resp.success {
-            return Err(ApiError::Rejected(
-                resp.error.unwrap_or_else(|| "bounty creation refused".into()),
-            ));
+            return Err(ApiError::Rejected(resp.error.unwrap_or_else(|| {
+                "The Magic Carpet server didn't create the bounty.".into()
+            })));
         }
         resp.bounty
             .ok_or_else(|| ApiError::Decode("create-bounty response held no bounty".into()))
@@ -532,9 +557,9 @@ impl Api {
             )
             .await?;
         if !resp.success {
-            return Err(ApiError::Rejected(
-                resp.error.unwrap_or_else(|| "strfry publish failed".into()),
-            ));
+            return Err(ApiError::Rejected(resp.error.unwrap_or_else(|| {
+                "The Magic Carpet server didn't accept it.".into()
+            })));
         }
         Ok(())
     }
@@ -550,9 +575,9 @@ impl Api {
             .map_err(|e| ApiError::Http(e.to_string()))?;
         let resp: ScanResponse = Self::read(response).await?;
         if !resp.success {
-            return Err(ApiError::Rejected(
-                resp.error.unwrap_or_else(|| "strfry scan failed".into()),
-            ));
+            return Err(ApiError::Rejected(resp.error.unwrap_or_else(|| {
+                "The Magic Carpet server didn't return results.".into()
+            })));
         }
         Ok(resp.events)
     }
@@ -563,6 +588,20 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/bounty-5f44688e.json");
+
+    #[test]
+    fn server_text_always_reads_as_one_sentence() {
+        assert_eq!(sentence("nope"), "nope.");
+        assert_eq!(sentence(" Invalid key. "), "Invalid key.");
+        assert_eq!(sentence("cut off…"), "cut off…");
+        assert_eq!(sentence("  "), "No reason was given.");
+        assert_eq!(detail(""), "");
+        assert_eq!(detail("boom"), " (boom)");
+        assert_eq!(detail("Invalid amount."), " (Invalid amount)");
+        let status = ApiError::Status { status: 502, message: String::new() };
+        assert_eq!(status.to_string(), "The Magic Carpet server returned error 502.");
+        assert_eq!(ApiError::Rejected(String::new()).to_string(), "No reason was given.");
+    }
 
     #[test]
     fn the_live_fixture_parses_through_the_real_path() {

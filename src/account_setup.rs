@@ -218,8 +218,8 @@ fn choice_card(cx: &mut Context<Shell>) -> AnyElement {
         .border_color(rgb(BORDER_3))
         .child(card_title("Your Nostr account"))
         .child(muted(
-            "An account is a Nostr key. It stays on this Mac — the app only \
-             ever shares your public identity.",
+            "Your secret key stays on this computer. Your name and payment \
+             address are public.",
             TEXT_MUTED,
         ))
         .child(
@@ -256,8 +256,8 @@ fn create_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
         // button, which the paste path already is — use that instead.
         .child(dot_row(
             GREEN,
-            "A Coinos Lightning wallet opens for this account, so claims can \
-             pay you. Coinos holds the sats — keep the balance small.",
+            "A Coinos wallet opens with this account so claims can pay you. \
+             Coinos holds your sats, so keep the balance small.",
             TEXT_MUTED,
         ))
         .children(error_line(setup.error.clone()))
@@ -274,8 +274,8 @@ fn paste_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
         .border_color(rgb(BORDER_3))
         .child(card_title("Use your Nostr key"))
         .child(muted(
-            "It starts with nsec1 — copy it from your Nostr app \
-             (Settings > Keys in Primal or Damus).",
+            "Paste your secret key. It starts with nsec1. Find it in your \
+             Nostr app under Settings > Keys.",
             TEXT_MUTED,
         ))
         .child(div().text_size(px(12.5)).child(Input::new(&setup.key)))
@@ -393,7 +393,7 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
                 .ml(px(42.))
                 .child(dot_row(
                     AMBER,
-                    "No profile found for this key — double-check you pasted the \
+                    "No profile found for this key. Check that you pasted the \
                      right one.",
                     AMBER,
                 )),
@@ -438,7 +438,7 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
                 .when(!summary.profile_checked, |this| {
                     this.child(dot_row(
                         TEXT_DIM,
-                        "Could not check the profile right now. You can still continue.",
+                        "Couldn't check your profile. You can still continue.",
                         TEXT_MUTED,
                     ))
                 })
@@ -479,7 +479,7 @@ fn browse_card(cx: &mut Context<Shell>) -> AnyElement {
     card()
         .child(card_title("Just look around"))
         .child(muted(
-            "Browse the bounties read-only. The + in the rail adds an account later.",
+            "Browse bounties without an account. Click the + button in the left bar to add one later.",
             TEXT_MUTED,
         ))
         .child(
@@ -556,9 +556,12 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                                 .font_weight(FontWeight::BOLD)
                                 .child("Magic Carpet"),
                         )
-                        .child(div().text_size(px(13.)).text_color(rgb(TEXT_MUTED)).child(
-                            "Claim items on live bounties and get paid in sats, automatically.",
-                        )),
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("Claim bounties. Get paid in sats, automatically."),
+                        ),
                 )
                 .child(
                     v_flex()

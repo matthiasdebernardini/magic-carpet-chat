@@ -96,16 +96,16 @@ async def scenario_a(sc):
     # After the timeout the form reads "Checking the list…" until the
     # refetch lands (7b1dad9), then unlocks with the hint.
     await sc.step(Step("Wait for the create request to time out and the list check after it.", [Cand("wait", "Wait 5 seconds.", [("wait", 5)])],
-                       "The bounty form is still open, 'Publishing…' is gone, and an error line says the server may have created this bounty.",
-                       tries=3, settle=1, cues=("Publishing", "Checking the list", "may have created")), label="timeout unlocks")
-    await sc.wait_for(["may have created"], timeout=20, label="list check done")
-    sc.check_screen("form unlocked after the client timeout and the list check", ["Cancel (esc)", "may have created"],
+                       "The bounty form is still open, 'Publishing…' is gone, and an error line says the bounty may exist already.",
+                       tries=3, settle=1, cues=("Publishing", "Checking the list", "may exist already")), label="timeout unlocks")
+    await sc.wait_for(["may exist already"], timeout=20, label="list check done")
+    sc.check_screen("form unlocked after the client timeout and the list check", ["Cancel (esc)", "may exist already"],
                     ["Publishing", "Checking the list"])
     await sc.step(Step("Open the Dashboard to read the Recent activity feed.", [DASHBOARD],
-                       "The Recent activity panel lists 'A submit is in flight; wait for it to finish' at least once.",
-                       settle=2, cues=("A submit is in flight", "Recent activity")), label="activity feed")
-    n = sc.count("submit is in flight")
-    sc.check("amber 'A submit is in flight' line for switch, setup and remove (3x)", n >= 3, f"seen {n}x")
+                       "The Recent activity panel lists 'Still sending. Wait for it to finish.' at least once.",
+                       settle=2, cues=("Still sending", "Recent activity")), label="activity feed")
+    n = sc.count("Still sending")
+    sc.check("amber 'Still sending' line for switch, setup and remove (3x)", n >= 3, f"seen {n}x")
     posts = [l for l in sc.log_after("A submit") if l.startswith("POST /api/bounties")]
     sc.check("exactly one create request went out", len(posts) == 1, posts)
     sc.check("the active account was not removed", sc.box.accounts_in_store(sc.store) == 2, f"{sc.box.accounts_in_store(sc.store)} accounts in store")
@@ -118,11 +118,11 @@ async def scenario_b(sc):
     if not await open_house_form(sc):
         return
     sc.box.mark("B submit")
-    await submit_form(sc, "gateway-city", "The form shows an error saying the server may have created this bounty and to check the list before retrying.",
-                      ("may have created", "check the list"))
+    await submit_form(sc, "gateway-city", "The form shows an error saying the bounty may exist already and to check the list before retrying.",
+                      ("may exist already", "Check the bounty list"))
     # "Checking the list…" first, then the hint once the refetch lands.
-    await sc.wait_for(["may have created"], timeout=20, label="after 502")
-    sc.check_screen("'may have created' hint shown, form unlocked", ["may have created"], ["Checking the list", "Publishing"])
+    await sc.wait_for(["may exist already"], timeout=20, label="after 502")
+    sc.check_screen("'may exist already' hint shown, form unlocked", ["may exist already"], ["Checking the list", "Publishing"])
     lines = sc.log_after("B submit")
     post = next((i for i, l in enumerate(lines) if l.startswith("POST /api/bounties")), None)
     refetch = post is not None and any(l.startswith("GET /api/bounties issuer") for l in lines[post + 1:])
@@ -135,10 +135,10 @@ async def scenario_c(sc):
     if not await open_house_form(sc):
         return
     sc.box.mark("C submit")
-    await submit_form(sc, "refused-city", "The form shows an error about amountSats and no 'may have created' hint.", ("amountSats", "may have created"))
+    await submit_form(sc, "refused-city", "The form shows an error about amountSats and no 'may exist already' hint.", ("amountSats", "may exist already"))
     await asyncio.sleep(5)
     await sc.see("after 400")
-    sc.check_screen("400 shows the refusal, no hint", ["amountSats"], ["may have created"])
+    sc.check_screen("400 shows the refusal, no hint", ["amountSats"], ["may exist already"])
     lines = sc.log_after("C submit")
     post = next((i for i, l in enumerate(lines) if l.startswith("POST /api/bounties")), None)
     sc.check("the create went out", post is not None, lines[-6:])
@@ -153,11 +153,11 @@ async def scenario_d(sc):
     if not await open_house_form(sc):
         return
     sc.box.mark("D submit")
-    await submit_form(sc, "dup-city", "The form shows 'An open bounty for this list already exists. Pick it from the list instead.'",
-                      ("already exists", "Publishing"))
+    await submit_form(sc, "dup-city", "The form shows 'This list already has an open bounty. Pick it from the list instead.'",
+                      ("already has an open bounty", "Publishing"))
     await asyncio.sleep(2)
     await sc.see("after dup submit")
-    sc.check_screen("duplicate refused in the form", ["already exists"])
+    sc.check_screen("duplicate refused in the form", ["already has an open bounty"])
     sent = [l for l in sc.log_after("D submit") if l.startswith(("POST /api/bounties", "POST strfry/publish"))]
     sc.check("no request sent for the duplicate", not sent, sent)
 
@@ -214,7 +214,7 @@ async def scenario_f(sc):
     await sc.step(Step("The profile scan is healthy again; press the 'Try again' button on the Wallet screen. Do not create a wallet.",
                        [Cand("try-again", "Click the 'Try again' button under 'Couldn't read this profile'.", [FOCUS, ("click_text", "Try again"), ("wait", 1), PARK])],
                        "'Couldn't read this profile' is gone and the wallet panel offers 'Create a Coinos wallet for this account'.",
-                       tries=2, settle=4, cues=("read this profile", "Create a Coinos wallet", "Checking the profile")), must_act=True, label="try again")
+                       tries=2, settle=4, cues=("read this profile", "Create a Coinos wallet", "Checking your profile")), must_act=True, label="try again")
     sc.check_screen("retry reaches the Read state", ["Create a Coinos wallet"], ["read this profile"])
     ok = [l for l in sc.log_after("F retry") if l.startswith("GET /api/strfry/scan") and l.endswith("200 []")]
     sc.check("the retry re-read the profile scan", bool(ok), sc.log_after("F retry")[-4:])
@@ -269,9 +269,9 @@ async def remove_armed_flow(sc, who, expect_sats=False):
     sc.check_screen(f"{who}: sidebar arms 'Click again to remove'", ["Click again to remove"])
     if expect_sats:
         # Arming re-reads the balance: "Checking balance…", then the warning.
-        screen = await sc.wait_for(["still holds"], ["could not be read"], timeout=25, every=2, label=f"{who} balance")
+        screen = await sc.wait_for(["still holds"], ["Couldn't read the balance"], timeout=25, every=2, label=f"{who} balance")
         sc.check(f"{who} (Coinos wallet): armed remove warns about sats left", has(screen, "still holds"),
-                 "balance could not be read" if has(screen, "could not be read") else "no 'This wallet still holds N sats' line while armed")
+                 "balance not readable" if has(screen, "Couldn't read the balance") else "no 'This wallet still holds N sats' line while armed")
     await sc.step(Step("Navigate away: press super+1 for the Dashboard.", [DASHBOARD],
                        "The Dashboard is shown and the sidebar reads 'Remove this account' again, not 'Click again to remove'.",
                        settle=2, cues=("Click again to remove", "Remove this account", "Dashboard")), must_act=True, label=f"{who} leave (sidebar)")
@@ -368,12 +368,12 @@ async def paid_flow(sc, name, demo_bounty, demo_claim, demo_settled):
     if not await sc.step(once(c[2]), must_act=True, label="submit claim"):
         return
     await sc.step(dataclasses.replace(c[3], tries=6), label="wait for settlement")
-    screen = await sc.wait_for(["Payment settled", "Zap receipt"], ["Auto-pay failed"], timeout=150, every=10, label="settle poll")
+    screen = await sc.wait_for(["Payment settled", "Payment receipt"], ["Auto-pay failed"], timeout=150, every=10, label="settle poll")
     if has_failed(screen):
         sc.notes.append("Auto-pay failed on the claim card; not retried, not reset")
     await sc.step(demo_settled.STEPS[0], label="settled after refresh")
     both = sc.screen + "\n" + screen
-    sc.check_screen("Payment settled and Zap receipt on the claim card", ["Payment settled", "Zap receipt"], ["Auto-pay failed"], screen=both)
+    sc.check_screen("Payment settled and Payment receipt on the claim card", ["Payment settled", "Payment receipt"], ["Auto-pay failed"], screen=both)
     await sc.step(demo_settled.STEPS[1], label="claimant wallet")
 
 
@@ -460,18 +460,18 @@ async def open_trust(sc):
 
 async def follow_owner(sc, expect_confirm):
     """Click Follow on the recommended owner row; if the first-list amber box
-    shows, approve it. Returns True once '✓ Following' / 'Saved to' shows."""
+    shows, approve it. Returns True once '✓ Following' / 'Saved on' shows."""
     ok = await sc.step(Step(
         "Click 'Follow' on the recommended row ('RECOMMENDED — YOUR OWNER NPUB') in the 'Your Trusted Community' steps.",
         [Cand("follow-owner", "Click the 'Follow' button on the recommended owner row.",
               [FOCUS, ("click_pill", "RECOMMENDED"), ("wait", 1), PARK])],
-        "After the click, either a confirmation box offers the buttons 'Start a new follow list' and 'Cancel', or the row already reads '✓ Following' or 'Saved to'.",
+        "After the click, either a confirmation box offers the buttons 'Start a new follow list' and 'Cancel', or the row already reads '✓ Following' or 'Saved on'.",
         tries=4, settle=6,
-        cues=("Start a new follow list", "Following", "Saved to", "Couldn't confirm", "RECOMMENDED")),
+        cues=("Start a new follow list", "Following", "Saved on", "Couldn't check", "RECOMMENDED")),
         must_act=True, label="follow owner")
     if not ok:
         return False
-    if has(sc.screen, "existing follow list"):
+    if has(sc.screen, "Start a new follow list"):
         if not expect_confirm:
             sc.notes.append("unexpected first-list confirmation for an account that has a kind-3")
             return False
@@ -479,8 +479,8 @@ async def follow_owner(sc, expect_confirm):
             "Approve the first follow list: click 'Start a new follow list' in the confirmation box.",
             [Cand("confirm-first-list", "Click the 'Start a new follow list' button beside 'Cancel' in the confirmation box.",
                   [FOCUS, ("click_pill", "cancel"), ("wait", 1), PARK])],
-            "The recommended row reads '✓ Following' and a 'Saved to N of M relays' line is shown.",
-            tries=4, settle=8, cues=("Following", "Saved to", "existing follow list")),
+            "The recommended row reads '✓ Following' and a 'Saved on N of M Nostr servers' line is shown.",
+            tries=4, settle=8, cues=("Following", "Saved on", "Start a new follow list")),
             must_act=True, label="confirm first list")
     return True
 
@@ -543,7 +543,7 @@ async def scenario_l(sc):
         return
     if not await follow_owner(sc, expect_confirm=True):
         return
-    sc.check_screen("owner followed: '✓ Following' and a 'Saved to' line", ["Following", "Saved to"])
+    sc.check_screen("owner followed: '✓ Following' and a 'Saved on' line", ["Following", "Saved on"])
     if not await calculate(sc):
         return
     if not await publish_map(sc):
@@ -602,13 +602,13 @@ async def scenario_n(sc):
         "Click 'Follow' on the recommended row; the relay answer must come back inconclusive.",
         [Cand("follow-owner", "Click the 'Follow' button on the recommended owner row.",
               [FOCUS, ("click_pill", "RECOMMENDED"), ("wait", 1), PARK])],
-        "An error line 'Couldn't confirm your current follow list' is shown.",
+        "An error line 'Couldn't check your follow list' is shown.",
         tries=4, settle=8,
-        cues=("Couldn't confirm your current follow list", "Start a new follow list", "Following")),
+        cues=("Couldn't check your follow list", "Start a new follow list", "Following")),
         must_act=True, label="follow inconclusive")
-    screen = await sc.wait_for(["Couldn't confirm your current follow list"],
+    screen = await sc.wait_for(["Couldn't check your follow list"],
                                ["Following"], timeout=30, every=3, label="inconclusive")
-    sc.check_screen("the inconclusive error line shows", ["Couldn't confirm your current follow list"],
+    sc.check_screen("the inconclusive error line shows", ["Couldn't check your follow list"],
                     ["Following"], screen=screen)
     await asyncio.sleep(2)
     sc.check("no kind-3 was published to the local relay", not nak_req(3, acct["pub"]))
@@ -675,9 +675,9 @@ async def scenario_q(sc):
         return
     if not await calculate(sc):
         return
-    screen = await sc.wait_for(["Brainstorm has no Treasure Map data"], timeout=30, every=3,
+    screen = await sc.wait_for(["Brainstorm has no data for this account"], timeout=30, every=3,
                                label="setup missing")
-    sc.check_screen("Brainstorm has no data wording", ["Brainstorm has no Treasure Map data"],
+    sc.check_screen("Brainstorm has no data wording", ["Brainstorm has no data for this account"],
                     screen=screen)
     sc.box.mark("Q publish attempt")
     # The button renders disabled: a click must send nothing anywhere.

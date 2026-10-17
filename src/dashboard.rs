@@ -168,8 +168,8 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         rows.push(Attention::new(
             TEXT_DIM,
             "Read-only — add an account to claim".into(),
-            "Press + in the rail to create an account or paste your \
-                 nsec. It stays in this Mac's accounts file."
+            "Click the + button in the left bar to create an account or paste a \
+                 secret key. Keys stay on this computer."
                 .into(),
         ));
     }
@@ -177,7 +177,10 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         rows.push(Attention::new(
             AMBER,
             "Relay disconnected".into(),
-            format!("Reconnecting to {}", nostr::relay_url()),
+            format!(
+                "Reconnecting to {}. If it stays down, restart the app.",
+                nostr::relay_url()
+            ),
         ));
     }
     if let Load::Failed(message) = &shell.bounties {
@@ -199,10 +202,10 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
                     "No kind-10040 event found — other apps can’t locate your rank provider."
                 }
                 MapVerdict::Deactivated => {
-                    "Your Treasure Map is empty — other apps can’t locate your rank provider."
+                    "Your Treasure Map is empty, so other apps can’t find your score provider. Click Fix to republish it."
                 }
                 MapVerdict::NoRankRow => {
-                    "Your Treasure Map names no rank provider — other apps can’t look up your rank."
+                    "Your Treasure Map has no rank entry, so apps can’t look up your rank. Click Fix to see what is missing."
                 }
             };
             rows.push(
@@ -226,7 +229,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
                 Attention::new(
                     AMBER,
                     "Follow someone".into(),
-                    "Trust scores can’t be calculated for an empty contact list.".into(),
+                    "Trust scores can’t be calculated for an empty follow list.".into(),
                 )
                 .action(Action::OpenTrust(pubkey()))
                 .for_account(view, ix),
@@ -351,7 +354,7 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
 
 fn all_clear(shell: &Shell) -> AnyElement {
     let (dot, text): (u32, &str) = if matches!(shell.bounties, Load::Loading) {
-        (TEXT_DIM, "Loading the bounty list…")
+        (TEXT_DIM, "Loading bounties…")
     } else {
         (GREEN, "Nothing needs you right now. The carpet flies itself.")
     };
@@ -428,7 +431,7 @@ fn empty_activity() -> AnyElement {
         .border_color(rgb(BORDER))
         .text_size(px(12.5))
         .text_color(rgb(TEXT_DIM))
-        .child("Nothing yet — claims, payments, and receipts appear here live.")
+        .child("Nothing yet. New claims and payments show up here.")
         .into_any_element()
 }
 

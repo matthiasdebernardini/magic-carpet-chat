@@ -109,7 +109,7 @@ pub(crate) fn accepts(panel: Option<u32>, generation: u32) -> bool {
 fn saved_line(done: &FollowOk) -> (String, String, String) {
     if done.already {
         return (
-            "Already following — nothing needed publishing.".to_string(),
+            "Already following. Nothing to save.".to_string(),
             String::new(),
             String::new(),
         );
@@ -118,10 +118,14 @@ fn saved_line(done: &FollowOk) -> (String, String, String) {
     let refused: Vec<String> = done.rejected.iter().map(|url| relay_host(url)).collect();
     (
         format!(
-            "Saved to {} of {} {}",
+            "Saved on {} of {} {}",
             done.accepted.len(),
             done.asked,
-            if done.asked == 1 { "relay" } else { "relays" }
+            if done.asked == 1 {
+                "Nostr server"
+            } else {
+                "Nostr servers"
+            }
         ),
         hosts.join(", "),
         refused.join(", "),
@@ -143,10 +147,12 @@ fn relay_host(url: &str) -> String {
 fn follow_error_text(error: &FollowErr) -> String {
     match error {
         FollowErr::Inconclusive { answered, asked } => format!(
-            "Couldn't confirm your current follow list: {answered} of {asked} relays answered. Nothing was published — try again in a moment."
+            "Couldn't check your follow list: {answered} of {asked} Nostr servers answered. Nothing was saved. Try again in a moment."
         ),
         FollowErr::Rejected { asked } => {
-            format!("No relay accepted your follow list (0 of {asked}). Nothing changed.")
+            format!(
+                "No Nostr server accepted your follow list (0 of {asked}). Nothing changed. Try again."
+            )
         }
         FollowErr::Failed(message) => message.to_string(),
         FollowErr::NeedsConfirmation { .. } => String::new(),
@@ -443,8 +449,7 @@ impl Shell {
                         Err(FollowErr::NeedsConfirmation { .. }) => match pending {
                             Some(parked) => state.confirm_first = Some(parked),
                             None => {
-                                state.follow_error =
-                                    Some("Could not follow right now — try again.".into());
+                                state.follow_error = Some("Couldn't follow. Try again.".into());
                             }
                         },
                         Err(error) => {
@@ -713,7 +718,7 @@ fn step(
 /// card and the Trust tab's "Not located" map card.
 pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElement {
     let Some(state) = shell.community.get(pubkey) else {
-        return muted("Loading the setup steps…", TEXT_MUTED);
+        return muted("Loading setup steps…", TEXT_MUTED);
     };
     let followed_now = !state.follows.is_empty();
     // Step 2 also unlocks when Feature 1's read already counts follows.
@@ -921,14 +926,17 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 .collect();
             if shown.is_empty() && !state.searching {
                 Some(muted(
-                    format!("No profiles match \u{201c}{}\u{201d}.", state.last_query),
+                    format!(
+                        "No profiles match \u{201c}{}\u{201d}. Try another name.",
+                        state.last_query
+                    ),
                     TEXT_MUTED,
                 ))
             } else {
                 Some(v_flex().gap(px(6.)).children(shown).into_any_element())
             }
         }
-        Some(Err(_)) => Some(muted("Search is unavailable right now.", TEXT_MUTED)),
+        Some(Err(_)) => Some(muted("Search is down. Try again in a moment.", TEXT_MUTED)),
         None if state.searching => Some(
             h_flex()
                 .gap(px(9.))
@@ -977,7 +985,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 div()
                     .text_size(px(12.5))
                     .text_color(rgb(0xe8d9b0))
-                    .child("We couldn't find an existing follow list for this key on the relays. If you have never followed anyone with it, start a new list. If you have, cancel — a new list would replace your old one."),
+                    .child("No follow list was found for this key. If you have followed people with it before, cancel: a new list replaces the old one. If not, start a new follow list."),
             )
             .child(
                 h_flex()
@@ -1031,7 +1039,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
             .text_size(px(12.5))
             .text_color(rgb(TEXT_MUTED))
             .child(format!(
-                "You already follow {existing_follows} account{} — you can go straight to step 2.",
+                "You already follow {existing_follows} account{}. Go to step 2.",
                 if existing_follows == 1 { "" } else { "s" }
             ))
             .into_any_element()
@@ -1082,9 +1090,9 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                                     .text_size(px(11.))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(if state.show_relays {
-                                        "· hide relays"
+                                        "· hide servers"
                                     } else {
-                                        "· show relays"
+                                        "· show servers"
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(state) =
@@ -1190,7 +1198,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_DIM))
-                        .child("Unlocks after you follow an account."),
+                        .child("Follow an account first."),
                 );
             }
             column
@@ -1236,7 +1244,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_DIM))
-                        .child("Unlocks after Brainstorm confirms step 2."),
+                        .child("Finish step 2 first."),
                 );
             }
             column = column.child(map_button("community-map", ready, cx, move |this, _, cx| {
@@ -1249,7 +1257,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT_MUTED))
-                                .child("Brainstorm has no Treasure Map data for this account yet — calculation can take up to an hour the first time. Try again later."),
+                                .child("Brainstorm has no data for this account yet. The first calculation can take an hour. Try again later."),
                         )
                         .child(check_setup_link(pubkey, cx));
                 }
@@ -1259,7 +1267,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT_MUTED))
-                                .child("Couldn't read the setup data right now."),
+                                .child("Couldn't read the setup data. Try again."),
                         )
                         .child(check_setup_link(pubkey, cx));
                 }

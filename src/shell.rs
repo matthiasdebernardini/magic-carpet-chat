@@ -268,7 +268,7 @@ pub(crate) fn initials(view: &AccountView) -> String {
 pub(crate) fn relay_address_gap(relay_lud16: Option<&str>) -> Option<String> {
     relay_lud16
         .is_none()
-        .then(|| "The profile on the relays does not carry this address yet".to_string())
+        .then(|| "Your public profile does not list this address yet.".to_string())
 }
 
 /// The two hue pairs from the mock, alternated down the rail by position.
@@ -467,9 +467,9 @@ pub(crate) fn short_id(id: &str) -> String {
 /// The instance hides claims from keys it ranks below 2, so a new key's claim
 /// is on the relay but invisible in the list. Shown in the claim form and in
 /// the published-claim details.
-pub(crate) const RANK_NOTE: &str = "This instance only lists claims from keys the \
-    issuer's web of trust ranks 2 or higher. A new key has no rank yet, so \
-    your claim can be on the relay and still not show here.";
+pub(crate) const RANK_NOTE: &str = "This server only shows claims from accounts the issuer's score provider \
+    ranks 2 or higher. Rank is a trust score. A new account has no rank yet, so a \
+    sent claim may not show.";
 
 /// The toast for a just-published claim: one short line, and the full text
 /// behind a click when there is more to say.
@@ -485,36 +485,42 @@ fn claim_notice(payout: Option<(bool, u64, u64)>) -> ClaimNotice {
     match payout {
         Some((true, min_rank, sats)) => {
             let sats = timefmt::fmt_sats(sats);
+            // 0 means the bounty names no minimum rank: say no number.
+            let lead = if min_rank > 0 {
+                format!("A rank (trust score) of {min_rank} or higher")
+            } else {
+                "A high enough rank (trust score)".to_string()
+            };
             ClaimNotice {
-                title: "Claim published — auto-pay bounty",
+                title: "Claim sent. This bounty auto-pays.",
                 short: format!(
-                    "With rank {min_rank} or higher, {sats} sats arrive within about a \
-                     minute. Click for details."
+                    "{lead} gets {sats} sats in about a minute. \
+                     Click for details."
                 ),
                 full: Some(format!(
-                    "With rank {min_rank} or higher, {sats} sats arrive at your Lightning \
-                     address within about a minute. Below that, the issuer reviews the \
-                     claim by hand. {RANK_NOTE}"
+                    "{lead} gets {sats} sats at your Lightning \
+                     address in about a minute. Lower ranks wait for the issuer to \
+                     review by hand. {RANK_NOTE}"
                 )),
             }
         }
         Some((false, _, sats)) => {
             let sats = timefmt::fmt_sats(sats);
             ClaimNotice {
-                title: "Claim published — manual-pay bounty",
+                title: "Claim sent. The issuer pays by hand.",
                 short: format!(
-                    "The issuer reviews your claim and pays {sats} sats by hand. Click for \
-                     details."
+                    "The issuer reviews your claim, then pays {sats} sats by hand. \
+                     Click for details."
                 ),
                 full: Some(format!(
-                    "This bounty does not auto-pay: the issuer reviews your claim and \
-                     sends the {sats} sats by hand. {RANK_NOTE}"
+                    "This bounty does not auto-pay. The issuer reviews your claim, \
+                     then sends {sats} sats by hand. {RANK_NOTE}"
                 )),
             }
         }
         None => ClaimNotice {
-            title: "Claim published",
-            short: "The issuer's relay has it.".to_string(),
+            title: "Claim sent",
+            short: "The Magic Carpet server has it.".to_string(),
             full: None,
         },
     }
@@ -1044,7 +1050,7 @@ impl Shell {
                 // next to its retry button.
                 let (dot, suffix) = match &created.publish_error {
                     None => (GREEN, String::new()),
-                    Some(error) => (AMBER, format!(" — {error}")),
+                    Some(error) => (AMBER, format!(" · {error}")),
                 };
                 self.push_activity(
                     dot,
@@ -1066,7 +1072,7 @@ impl Shell {
                     view.wallet.error = Some(message.clone());
                 }
                 let who = self.label(&pubkey);
-                self.push_activity(RED, format!("Coinos wallet for {who} failed: {message}"), now);
+                self.push_activity(RED, format!("Coinos wallet problem for {who}: {message}"), now);
                 self.finish_setup_wallet(&pubkey);
             }
             Update::Balance { pubkey, sats, .. } => {
@@ -1146,7 +1152,14 @@ impl Shell {
                 may_have_paid,
             } => {
                 let who = self.label(&pubkey);
-                self.push_activity(RED, format!("Send from {who} failed: {message}"), now);
+                let line = if may_have_paid {
+                    format!(
+                        "Payment status unknown for {who}. Check your balance before sending again."
+                    )
+                } else {
+                    format!("Couldn't send from {who}: {message}")
+                };
+                self.push_activity(RED, line, now);
                 // The sats may be gone: a reflex Enter on the same amount
                 // must not pay twice, so the amount goes, the recipient stays.
                 if may_have_paid && self.active.as_deref() == Some(pubkey.as_str()) {
@@ -1184,7 +1197,7 @@ impl Shell {
                 if !matches!(self.bounties, Load::Ready(_)) {
                     self.bounties = Load::Failed(message.clone());
                 }
-                self.push_activity(RED, format!("Bounty list failed: {message}"), now);
+                self.push_activity(RED, format!("Bounties didn't load: {message}"), now);
             }
             Update::BountyDetail(detail) => {
                 if self.optimistic.as_ref().is_some_and(|b| b.id == detail.bounty.id) {
@@ -1195,7 +1208,7 @@ impl Shell {
             Update::DListPublished { pubkey, coordinate } => {
                 self.push_activity(
                     ACCENT_LIGHT,
-                    format!("Published list {coordinate}"),
+                    format!("List published: {coordinate}"),
                     now,
                 );
                 if let Some(mut req) = self.pending_bounty.take() {
@@ -1211,7 +1224,7 @@ impl Shell {
             Update::BountyCreated { id } => {
                 self.push_activity(
                     ACCENT_LIGHT,
-                    format!("Bounty {} created — watching for claims", short_id(&id)),
+                    format!("Bounty {} created. Watching for claims.", short_id(&id)),
                     now,
                 );
                 self.bounty_form = None;
@@ -1231,11 +1244,7 @@ impl Shell {
                 bounty_id,
                 event_id,
             } => {
-                self.push_activity(
-                    GREEN,
-                    format!("Claim {} submitted", short_id(&event_id)),
-                    now,
-                );
+                self.push_activity(GREEN, format!("Claim {} sent", short_id(&event_id)), now);
                 self.claim_form = None;
                 self.focus.focus(window, cx);
                 // Say how this bounty pays: the claim card alone reads as
@@ -1277,7 +1286,7 @@ impl Shell {
                     "attempting" => (ACCENT, format!("Auto-pay started for \"{name}\"")),
                     "paid" => (
                         AMBER,
-                        format!("Paid \"{name}\" — waiting for the zap receipt"),
+                        format!("Paid \"{name}\". Waiting for the payment receipt."),
                     ),
                     "settled" => (GREEN, format!("Payment for \"{name}\" settled")),
                     "paid_unreceipted" => (
@@ -1285,7 +1294,7 @@ impl Shell {
                         format!("Paid \"{name}\", but no receipt arrived{why}"),
                     ),
                     "failed" => (RED, format!("Auto-pay for \"{name}\" failed{why}")),
-                    other => (TEXT_MUTED, format!("\"{name}\" payment state: {other}{why}")),
+                    other => (TEXT_MUTED, format!("\"{name}\" payment status: {other}{why}")),
                 };
                 self.push_activity(dot, text, if ts > 0 { ts } else { now });
             }
@@ -1298,7 +1307,7 @@ impl Shell {
                 self.push_activity(
                     GREEN,
                     format!(
-                        "Zap receipt {} landed {secs_from_claim} s after the claim",
+                        "Payment receipt {} arrived {secs_from_claim} s after the claim",
                         short_id(&receipt_id)
                     ),
                     // The receipt's own timestamp: a receipt learned late must
@@ -1325,7 +1334,7 @@ impl Shell {
                                     // A timeout or dropped reply says nothing
                                     // about whether the server created it.
                                     form.error = Some(format!(
-                                        "{message} The server may have created this bounty; check the list before retrying."
+                                        "The bounty may exist already. Check the bounty list before you submit again. Details: {message}"
                                     ));
                                     let read = on_outcome_unknown(
                                         &mut form.checking_list,
@@ -1595,7 +1604,7 @@ impl Shell {
         let nsec = match nostr_sdk::prelude::ToBech32::to_bech32(keys.secret_key()) {
             Ok(nsec) => nsec,
             Err(e) => {
-                self.setup.error = Some(format!("Could not create a key: {e}"));
+                self.setup.error = Some(format!("Couldn't create a key ({e}). Try again."));
                 cx.notify();
                 return;
             }
@@ -1622,14 +1631,14 @@ impl Shell {
         // inside `Secret`, which redacts itself everywhere.
         let secret = Secret::new(self.setup.key.read(cx).value().trim().to_string());
         if secret.expose().is_empty() {
-            self.setup.error = Some("Paste a key first.".into());
+            self.setup.error = Some("Paste your secret key first.".into());
             cx.notify();
             return;
         }
         self.setup.error = None;
         self.setup.generated = false;
         self.setup.awaiting_wallet = false;
-        self.setup.working = Some("Checking the key…");
+        self.setup.working = Some("Checking your key…");
         let _ = self.commands.unbounded_send(Command::AddAccount {
             secret,
             name: None,
@@ -1734,10 +1743,10 @@ impl Shell {
                 if coinos::split_address(&to).is_some() {
                     Ok(sats)
                 } else {
-                    Err("Enter a Lightning address like name@domain.com")
+                    Err("Enter a Lightning address, like name@domain.com.")
                 }
             }
-            _ => Err("Enter a whole number of sats"),
+            _ => Err("Enter sats as a whole number."),
         };
         view.wallet.send = Some(match checked {
             Ok(_) => SendState::Sending,
@@ -1759,7 +1768,7 @@ impl Shell {
             Ok(Some(login)) => copy_secret(login.password, cx),
             Ok(None) => self.push_activity(
                 AMBER,
-                "No Coinos login is stored for this account".into(),
+                "No Coinos login saved for this account.".into(),
                 timefmt::now_unix(),
             ),
             Err(e) => self.push_activity(RED, e.to_string(), timefmt::now_unix()),
@@ -1780,7 +1789,7 @@ impl Shell {
             }
             Ok(None) => self.push_activity(
                 AMBER,
-                "No secret key is stored for this account".into(),
+                "No secret key saved for this account.".into(),
                 timefmt::now_unix(),
             ),
             Err(e) => self.push_activity(RED, e.to_string(), timefmt::now_unix()),
@@ -1797,7 +1806,7 @@ impl Shell {
             Ok(None) => {
                 self.push_activity(
                     AMBER,
-                    "No secret key is stored for this account".into(),
+                    "No secret key saved for this account.".into(),
                     timefmt::now_unix(),
                 );
                 cx.notify();
@@ -1870,7 +1879,7 @@ impl Shell {
             BalanceCheck::Checking(_) => return Some("Checking balance…".into()),
             BalanceCheck::Failed => {
                 return Some(
-                    "The balance could not be read. Click again to remove anyway.".into(),
+                    "Couldn't read the balance. Click again to remove anyway.".into(),
                 );
             }
             BalanceCheck::Done => {}
@@ -2048,7 +2057,7 @@ impl Shell {
         if held {
             self.push_activity(
                 AMBER,
-                "A submit is in flight; wait for it to finish".into(),
+                "Still sending. Wait for it to finish.".into(),
                 timefmt::now_unix(),
             );
         }
@@ -2160,15 +2169,15 @@ impl Shell {
         // (message, field to put the caret back on)
         let mut fail: Option<(&str, usize)> = None;
         if singular.is_empty() {
-            fail = Some(("The list needs a singular item name.", F_SINGULAR));
+            fail = Some(("Add an item name (singular).", F_SINGULAR));
         } else if criteria.is_empty() {
-            fail = Some(("The bounty needs criteria.", F_CRITERIA));
+            fail = Some(("Add bounty criteria.", F_CRITERIA));
         }
         let amount = match parse_sats(&value(F_AMOUNT)) {
             Some(amount) if amount >= 1 => Some(amount),
             _ => {
                 fail = fail.or(Some((
-                    "Reward per item must be a positive whole number of sats.",
+                    "Reward per item must be a whole number of sats, 1 or more.",
                     F_AMOUNT,
                 )));
                 None
@@ -2183,7 +2192,7 @@ impl Shell {
                 Some(cap) if cap >= 1 => Some(cap),
                 _ => {
                     fail = fail.or(Some((
-                        "Bounty cap must be a positive whole number of sats.",
+                        "Bounty cap must be a whole number of sats, 1 or more.",
                         F_CAP,
                     )));
                     None
@@ -2193,7 +2202,7 @@ impl Shell {
         if let (Some(amount), Some(cap)) = (amount, cap)
             && cap < amount {
                 fail = fail.or(Some((
-                    "The bounty cap must be at least the reward per item.",
+                    "Bounty cap must be at least the reward per item.",
                     F_CAP,
                 )));
             }
@@ -2205,7 +2214,7 @@ impl Shell {
                 Some(rank) if rank >= 1 => Some(rank),
                 _ => {
                     fail = fail.or(Some((
-                        "Minimum rank must be a positive whole number.",
+                        "Minimum rank must be a whole number, 1 or more.",
                         F_RANK,
                     )));
                     None
@@ -2228,7 +2237,7 @@ impl Shell {
             })
         {
             fail = fail.or(Some((
-                "An open bounty for this list already exists. Pick it from the list instead.",
+                "This list already has an open bounty. Pick it from the list instead.",
                 F_SINGULAR,
             )));
         }
@@ -2319,7 +2328,7 @@ impl Shell {
         };
         if name.is_empty() {
             if let Some(form) = &mut self.claim_form {
-                form.error = Some("The claim needs an item name.".into());
+                form.error = Some("Add an item name.".into());
             }
             cx.notify();
             return;
@@ -2526,13 +2535,13 @@ impl Shell {
         let view = self.active_view();
         let name: SharedString = view
             .map(display_name)
-            .unwrap_or_else(|| "Read-only".to_string())
+            .unwrap_or_else(|| "View only".to_string())
             .into();
         let identity: SharedString = match view {
             Some(view) => short_npub(&view.npub).into(),
             // Quiet, not alarming: browsing works without an account. The
             // "+" in the rail is the fix path.
-            None => "no account — + adds one".into(),
+            None => "Add one with the + button".into(),
         };
         // The address payouts go to, as the relays have it (or the Coinos
         // wallet this app opened). Claimants asked where their sats land.
@@ -2584,7 +2593,7 @@ impl Shell {
                 "—".into(),
                 "—".into(),
                 "—".into(),
-                Some("list unavailable".into()),
+                Some("can't load list".into()),
             ),
         };
 
@@ -2747,20 +2756,20 @@ impl Shell {
                 note,
             ))
             .child(Self::stat_card(
-                "COMMITTED",
+                "PROMISED",
                 committed,
                 Some("sats"),
                 AMBER,
                 AMBER_DIM,
-                Some("open reward slots".into()),
+                Some("in open bounties".into()),
             ))
             .child(Self::stat_card(
-                "SETTLED TO DATE",
+                "PAID SO FAR",
                 settled,
                 Some("sats"),
                 GREEN,
                 GREEN_DIM,
-                Some("receipted auto-pay".into()),
+                Some("auto-paid, receipt seen".into()),
             ))
     }
 
@@ -2840,7 +2849,7 @@ impl Shell {
                 div()
                     .text_size(px(12.5))
                     .text_color(rgb(TEXT_MUTED))
-                    .child("This screen is not built yet."),
+                    .child("Coming soon."),
             )
     }
 
@@ -2889,7 +2898,7 @@ impl Shell {
                 .into_any_element(),
             Screen::Wallet => {
                 let title = match self.active_view() {
-                    Some(view) => format!("Wallet — {}", display_name(view)),
+                    Some(view) => format!("Wallet: {}", display_name(view)),
                     None => "Wallet".to_string(),
                 };
                 let panel = match self.active_view() {
@@ -3128,10 +3137,10 @@ mod tests {
     #[test]
     fn an_auto_pay_claim_gets_a_short_toast_and_the_rank_note_behind_a_click() {
         let notice = claim_notice(Some((true, 2, 21_000)));
-        assert_eq!(notice.title, "Claim published — auto-pay bounty");
+        assert_eq!(notice.title, "Claim sent. This bounty auto-pays.");
         assert_eq!(
             notice.short,
-            "With rank 2 or higher, 21,000 sats arrive within about a minute. Click for details."
+            "A rank (trust score) of 2 or higher gets 21,000 sats in about a minute. Click for details."
         );
         let full = notice.full.expect("auto-pay has details");
         assert!(full.contains(RANK_NOTE), "the rank note moved out of the toast");

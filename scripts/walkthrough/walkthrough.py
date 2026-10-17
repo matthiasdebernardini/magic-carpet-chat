@@ -321,7 +321,7 @@ try:
           "Magic Carpet Dashboard with a Needs attention panel listing rows "
           "titled 'Publish your Treasure Map' and 'Follow someone', each with "
           "a 'Fix →' button, and a Recent activity panel",
-          ["This screen is not built yet", "Couldn’t check your Treasure Map"])
+          ["Coming soon", "Couldn’t check your Treasure Map"])
 
     # --- Step 2: first "Publish your Treasure Map" row's Fix --------------
     row_hits = find_texts(LAST_FRAME, "Publish your Treasure Map")
@@ -346,7 +346,7 @@ try:
           "'Open Brainstorm' link and a 'Check again' button; a 'Trusted "
           "Assertions' card; 'Minimum rank' with the value 2; 'Trust "
           "Determination'; 'Web of trust'",
-          ["matches your assigned key", "Not built yet"])
+          ["matches your assigned key", "Coming soon"])
 
     # --- Step 3: Check again ----------------------------------------------
     click_text("Check again")
@@ -370,7 +370,7 @@ try:
           "An 'Accounts' screen with three account cards, each with a name, "
           "an npub, a sats balance, and 'Manage' buttons; one card has an "
           "'active' pill and the others also have 'Switch' buttons",
-          ["not built yet"])
+          ["Coming soon"])
 
     # --- Step 6: the house issuer's card -> Trust tab ----------------------
     issuer = find_text("npub1s5a") or find_text("s5a654")
@@ -392,8 +392,8 @@ try:
           "'Rank provider' hex starting c63c30b4, 'Provider relay' "
           "wss://scores.brainstorm.world, 'Brainstorm key' 'matches your "
           "assigned key', and a 'View raw event' toggle; Trusted Assertions "
-          "with groups 'From your rank provider' and 'From this instance's "
-          "issuer' showing rank pills",
+          "with groups 'From your score provider' and 'From the issuer's "
+          "score provider' showing rank pills",
           ["Not located", "Couldn"])
 
     # --- Step 7: raw event --------------------------------------------------
@@ -422,10 +422,10 @@ try:
         if "identity" in ocr(LAST_FRAME).lower():
             break
     linger(1)
-    click_text("Identity")
+    click_text("Progress")
     linger(2)
     judge("other_tab",
-          "The Identity & keys tab selected, showing the text 'Not built yet.'",
+          "The Progress tab selected, showing the text 'Coming soon.'",
           [])
     click_text("Trust")
     linger(1)

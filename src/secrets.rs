@@ -30,17 +30,16 @@ pub enum SecretError {
     Store(String),
     /// Deliberately does not carry the parser's error: a bech32 error can echo
     /// pieces of its input, and this message may end up in a log.
-    #[error("{0} is not an nsec or 64-char hex secret key")]
+    #[error("{0} is not a valid secret key. Use an nsec1 key or 64 hex characters.")]
     InvalidKey(&'static str),
     /// The pasted-key path. Same rule as `InvalidKey`: no parser detail, no
     /// echo of the input — this string is shown on screen and may be logged.
-    #[error("That doesn't look like a key — paste an nsec1… string or 64 hex characters")]
+    #[error("That is not a secret key. Paste a key that starts with nsec1, or 64 hex characters.")]
     NotAKey,
     /// An npub — the half every client shows on the profile page. Right key
     /// family, wrong half: say so, and say where the right one lives.
     #[error(
-        "That's your public key — the app needs your secret key, which starts \
-         with nsec1. Find it in your Nostr app under Settings > Keys."
+        "That is your public key. Paste your secret key instead. It starts with nsec1 and is under Settings > Keys in your Nostr app."
     )]
     PublicKeyPasted,
 }
@@ -145,12 +144,11 @@ pub fn store_path() -> Result<PathBuf, SecretError> {
 pub fn load() -> Result<Store, SecretError> {
     let path = store_path()?;
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-            SecretError::Store(format!("Could not read {}: {e}", path.display()))
-        }),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| SecretError::Store(format!("Couldn't read {}: {e}.", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
         Err(e) => Err(SecretError::Store(format!(
-            "Could not read {}: {e}",
+            "Couldn't read {}: {e}.",
             path.display()
         ))),
     }
@@ -164,7 +162,7 @@ fn save(store: &Store) -> Result<(), SecretError> {
 
     let path = store_path()?;
     let fail = |e: &dyn std::fmt::Display| {
-        SecretError::Store(format!("Could not save to {}: {e}", path.display()))
+        SecretError::Store(format!("Couldn't save to {}: {e}.", path.display()))
     };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
@@ -400,7 +398,7 @@ mod tests {
         let err = SecretError::InvalidKey("MC_NSECS");
         assert_eq!(
             err.to_string(),
-            "MC_NSECS is not an nsec or 64-char hex secret key"
+            "MC_NSECS is not a valid secret key. Use an nsec1 key or 64 hex characters."
         );
     }
 
@@ -537,7 +535,7 @@ mod tests {
             let message = err.to_string();
             assert_eq!(
                 message,
-                "That doesn't look like a key — paste an nsec1… string or 64 hex characters"
+                "That is not a secret key. Paste a key that starts with nsec1, or 64 hex characters."
             );
             if !bad.is_empty() {
                 assert!(!message.contains(bad), "echoed input: {message}");
