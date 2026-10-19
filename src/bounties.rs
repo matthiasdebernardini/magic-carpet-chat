@@ -180,7 +180,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                     div()
                         .text_size(px(12.5))
                         .text_color(rgb(RED))
-                        .child(SharedString::from(format!("Could not load: {message}"))),
+                        .child(SharedString::from(format!("Bounties didn't load: {message} Click Retry."))),
                 )
                 .child(
                     div()
@@ -256,7 +256,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
     {
         rows.push(timeline_row(
             AMBER,
-            format!("Auto-pay blocked: {reason}"),
+            format!("Auto-pay stopped: {reason}"),
             None,
         ));
     }
@@ -306,7 +306,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
                 "settled" => (GREEN, "Payment settled".to_string()),
                 "paid_unreceipted" => (AMBER, format!("Paid, no receipt{why}")),
                 "failed" => (RED, format!("Auto-pay failed{why}")),
-                other => (TEXT_MUTED, format!("Payment state: {other}{why}")),
+                other => (TEXT_MUTED, format!("Payment status: {other}{why}")),
             };
             rows.push(timeline_row(dot, text, meta));
         }
@@ -325,7 +325,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
             .unwrap_or_default();
         rows.push(timeline_row(
             GREEN,
-            format!("Zap receipt {}", short_id(&receipt.receipt_id)),
+            format!("Payment receipt {}", short_id(&receipt.receipt_id)),
             Some(format!("{amount}{secs} s after the claim")),
         ));
     }
@@ -453,8 +453,7 @@ fn detail_pane(shell: &Shell) -> AnyElement {
                 .text_size(px(12.))
                 .text_color(rgb(TEXT_DIM))
                 .child(
-                    "No claims yet. Claims from keys the issuer's web of trust ranks \
-                     below 2 stay on the relay but are not listed here.",
+                    "No claims to show. Claims from accounts the issuer's score provider ranks below 2, or not at all, are hidden.",
                 )
                 .into_any_element(),
         ],
@@ -626,7 +625,7 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             } else {
                 form.submitting.then_some("Publishing…")
             },
-            "Enter advances · Enter on the last field publishes the 39998 list, then creates the auto-pay bounty · esc cancels",
+            "Enter moves to the next field. Enter on the last field publishes the list and creates the auto-pay bounty, which commits sats. esc cancels.",
             cx,
         ));
     }
@@ -648,9 +647,13 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             .map(|b| {
                 let sats = timefmt::fmt_sats(b.amount_sats);
                 if b.auto_pay_on() {
-                    format!("Auto-pay: {sats} sats within about a minute. ")
+                    format!(
+                        "Auto-pay: {sats} sats, usually within about a minute of a valid claim. "
+                    )
                 } else {
-                    format!("Manual pay: the issuer reviews the claim and sends {sats} sats by hand. ")
+                    format!(
+                        "Manual pay: the issuer checks your claim, then sends {sats} sats by hand. "
+                    )
                 }
             })
             .unwrap_or_default();
@@ -663,7 +666,7 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             rows,
             form.error.clone(),
             form.submitting.then_some("Publishing…"),
-            "Enter publishes the kind-39999 claim through the instance · esc cancels",
+            "Enter sends your claim. esc cancels.",
             cx,
         ));
     }

@@ -98,6 +98,7 @@ async fn add_account(handle: &mut NostrHandle, name: &'static str) -> Account {
             secret: Secret::new(nsec),
             name: Some(name.into()),
             open_wallet: true,
+            generated: true,
         })
         .unwrap();
 
@@ -386,7 +387,7 @@ async fn two_new_users_open_wallets_and_pay_each_other() {
         Err(message) => {
             println!("[refused] B -> A {TOO_MANY_SATS} sats: {message}");
             assert!(
-                message.starts_with("coinos refused"),
+                message.starts_with("Coinos said no"),
                 "the refusal must come from coinos, not the recipient or the token: {message}"
             );
         }

@@ -23,9 +23,10 @@ use nostr_sdk::prelude::*;
 /// mirrored from magic-carpet-v2/src/api/bounties.js:306 and :473.
 pub const INSTANCE_MIN_RANK: u64 = 2;
 
-/// The Brainstorm "assign a rank provider" endpoint; the account's hex pubkey
-/// is appended. `404` means the npub has no Brainstorm account at all.
-pub(crate) const BRAINSTORM_SETUP: &str = "https://api.brainstorm.world/setup/";
+/// The Brainstorm "assign a rank provider" endpoint's path under
+/// [`crate::brainstorm::base`]. `404` means the npub has no Brainstorm
+/// account at all.
+pub(crate) const BRAINSTORM_SETUP_PATH: &str = "/setup";
 
 /// One row of a kind-10040: which assertion tag, whose key, on which relay.
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +287,115 @@ pub fn follow_count(event: &Event, pubkey: &str) -> Option<u32> {
     Some(follows.len() as u32)
 }
 
+/// What the relays answered about one replaceable event kind the account
+/// owns (its kind-3 contact list, its kind-10040 map). `Found` carries the
+/// newest signature-verified event authored by the account across all
+/// answering relays. `Absent` is a real fact — a strict majority of the
+/// relays asked answered and none had the event — while `Inconclusive` means
+/// too few answered to tell "none exists" from "nobody answered".
+///
+/// THIS FEEDS A DESTRUCTIVE PATH: a replaceable event replaces the whole
+/// previous one, so `Absent` is the only licence to write from scratch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContactRead {
+    Found(Event),
+    Absent { answered: usize, asked: usize },
+    Inconclusive { answered: usize, asked: usize },
+}
+
+/// The Brainstorm `probeContactList` rule over per-relay reads: newest
+/// verified `kind` authored by `pubkey` wins; failing that, `Absent` only
+/// when `answered * 2 > asked`, else `Inconclusive`. Wrong-author events and
+/// bad signatures are ignored, not counted.
+pub fn classify_replaceable(
+    results: &[(String, Result<Vec<Event>, ()>)],
+    pubkey: &str,
+    kind: Kind,
+) -> ContactRead {
+    let asked = results.len();
+    let mut answered = 0;
+    let mut newest: Option<Event> = None;
+    for (_, result) in results {
+        let Ok(events) = result else { continue };
+        answered += 1;
+        for event in events {
+            if event.kind != kind
+                || event.pubkey.to_hex() != pubkey
+                || event.verify().is_err()
+            {
+                continue;
+            }
+            if newest.as_ref().is_none_or(|n| event.created_at > n.created_at) {
+                newest = Some(event.clone());
+            }
+        }
+    }
+    if let Some(event) = newest {
+        return ContactRead::Found(event);
+    }
+    if answered * 2 > asked {
+        ContactRead::Absent { answered, asked }
+    } else {
+        ContactRead::Inconclusive { answered, asked }
+    }
+}
+
+/// The kind-3 case of [`classify_replaceable`].
+pub fn classify_contacts(results: &[(String, Result<Vec<Event>, ()>)], pubkey: &str) -> ContactRead {
+    classify_replaceable(results, pubkey, Kind::ContactList)
+}
+
+/// The merge base for a follow write: the NEWER of the relay's `Found`
+/// event and the session's cached list. Relays lag right after a publish —
+/// picking an older relay copy over the list we just sent would drop the
+/// follow made seconds ago.
+pub fn merge_base(relay: Option<Event>, cached: Option<Event>) -> Option<Event> {
+    match (relay, cached) {
+        (Some(a), Some(b)) => Some(if b.created_at > a.created_at { b } else { a }),
+        (one, None) | (None, one) => one,
+    }
+}
+
+/// The next kind-3: every tag of `base` kept in order (p, t, anything) and
+/// its content byte-for-byte, plus one appended `["p", target]`. `None` when
+/// `base` already follows `target` — publish nothing, report "already
+/// following". With no base the list starts fresh: one `p` tag, empty
+/// content.
+pub fn merge_follow(base: Option<&Event>, target_hex: &str) -> Option<(Vec<Tag>, String)> {
+    match base {
+        Some(base) => {
+            let already = base.tags.iter().any(|tag| {
+                let parts = tag.as_slice();
+                parts.first().map(String::as_str) == Some("p")
+                    && parts.get(1).map(String::as_str) == Some(target_hex)
+            });
+            if already {
+                return None;
+            }
+            let mut tags: Vec<Tag> = base.tags.iter().cloned().collect();
+            tags.push(Tag::parse(["p", target_hex]).ok()?);
+            Some((tags, base.content.clone()))
+        }
+        None => Some((
+            vec![Tag::parse(["p", target_hex]).ok()?],
+            String::new(),
+        )),
+    }
+}
+
+/// The kind-10040 Treasure Map built from the `/setup` rows: the rows are
+/// the tags, verbatim and in order, and the content is empty.
+pub fn map_event(keys: &Keys, rows: &[Vec<String>]) -> Event {
+    let tags: Vec<Tag> = rows
+        .iter()
+        .map(|row| Tag::parse(row.clone()).expect("setup rows have at least 2 cells"))
+        .collect();
+    EventBuilder::new(Kind::Custom(10040), "")
+        .tags(tags)
+        .finalize(keys)
+        .expect("in-memory keys sign")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +403,8 @@ mod tests {
     const HOUSE_10040: &str = include_str!("../tests/fixtures/trust-10040-house.json");
     const HOUSE_30382: &str = include_str!("../tests/fixtures/trust-30382-self.json");
     const HOUSE_SETUP: &str = include_str!("../tests/fixtures/trust-setup-house.json");
+    /// The live `/setup` body: the five 30382 rows plus the bare `30392`.
+    const HOUSE_SETUP6: &str = include_str!("../tests/fixtures/trust-setup-house-6.json");
 
     const HOUSE_HEX: &str =
         "853baa94b4b12d23931ade03ceb854a2b36cf1e24b5e3a82e68c8ca3a8ced2ba";
@@ -590,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn brainstrorm_setup_round_trips() {
+    fn brainstorm_setup_round_trips() {
         assert_eq!(
             parse_setup(HOUSE_SETUP),
             Some(BrainstormKey::Assigned {
@@ -635,5 +747,143 @@ mod tests {
         assert_eq!(normalize_relay("WSS://Relay.Damus.io/"), "wss://relay.damus.io");
         assert_eq!(normalize_relay("wss://x.y/relay/"), "wss://x.y/relay");
         assert_eq!(normalize_relay("wss://nos.lol"), "wss://nos.lol");
+    }
+
+    fn tag_rows(event: &Event) -> Vec<Vec<String>> {
+        event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn merge_keeps_every_tag_and_the_content_and_appends() {
+        let keys = Keys::generate();
+        let target = hex64(9);
+        let mut tags = vec![
+            Tag::parse(["p", &hex64(1)]).unwrap(),
+            Tag::parse(["p", &hex64(2), "wss://hint", "pet"]).unwrap(),
+            Tag::parse(["p", &hex64(3)]).unwrap(),
+            Tag::parse(["t", "nostr"]).unwrap(),
+        ];
+        let base = EventBuilder::new(Kind::ContactList, "{\"petnames\":true}")
+            .tags(tags.clone())
+            .finalize(&keys)
+            .unwrap();
+        let (merged, content) =
+            merge_follow(Some(&base), &target).expect("a missing target merges");
+        assert_eq!(content, "{\"petnames\":true}", "content is byte-for-byte");
+        tags.push(Tag::parse(["p", &target]).unwrap());
+        assert_eq!(merged, tags);
+    }
+
+    #[test]
+    fn merge_reports_already_following_and_bootstraps_empty() {
+        let keys = Keys::generate();
+        let target = hex64(9);
+        let base = sign_contacts(&keys, &[&target], 100);
+        assert_eq!(merge_follow(Some(&base), &target), None);
+
+        let (tags, content) = merge_follow(None, &target).expect("no base starts a list");
+        assert_eq!(content, "");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].as_slice(), &["p".to_string(), target]);
+    }
+
+    #[test]
+    fn a_majority_of_empty_answers_proves_absent_only() {
+        let keys = Keys::generate();
+        let subject = keys.public_key().to_hex();
+        let empty = || Ok(vec![]);
+        let failed = || Err(());
+        // 2 of 3 answered, none had a list: genuinely absent.
+        assert_eq!(
+            classify_contacts(
+                &[("a".into(), empty()), ("b".into(), empty()), ("c".into(), failed())],
+                &subject,
+            ),
+            ContactRead::Absent { answered: 2, asked: 3 }
+        );
+        // 1 of 2 answered empty: not a majority.
+        assert_eq!(
+            classify_contacts(&[("a".into(), empty()), ("b".into(), failed())], &subject),
+            ContactRead::Inconclusive { answered: 1, asked: 2 }
+        );
+        // Nobody answered.
+        assert_eq!(
+            classify_contacts(&[("a".into(), failed()), ("b".into(), failed())], &subject),
+            ContactRead::Inconclusive { answered: 0, asked: 2 }
+        );
+    }
+
+    #[test]
+    fn the_newest_verified_list_wins_and_junk_is_ignored() {
+        let keys = Keys::generate();
+        let subject = keys.public_key().to_hex();
+        let old = sign_contacts(&keys, &[&hex64(1)], 100);
+        let new = sign_contacts(&keys, &[&hex64(1), &hex64(2)], 200);
+        // Found on 1 of 3 answering relays: still a found list.
+        let read = classify_contacts(
+            &[
+                ("a".into(), Ok(vec![old.clone()])),
+                ("b".into(), Ok(vec![new.clone()])),
+                ("c".into(), Ok(vec![])),
+            ],
+            &subject,
+        );
+        assert_eq!(read, ContactRead::Found(new));
+
+        // Wrong author and a bad signature are ignored, never found.
+        let foreign = sign_contacts(&Keys::generate(), &[&hex64(1)], 300);
+        let mut broken = serde_json::to_value(&old).unwrap();
+        let sig = broken["sig"].as_str().unwrap();
+        let last = sig.len() - 1;
+        let forged_sig = format!(
+            "{}{}",
+            &sig[..last],
+            if &sig[last..] == "0" { "1" } else { "0" },
+        );
+        broken["sig"] = serde_json::Value::String(forged_sig);
+        let forged: Event = serde_json::from_value(broken).unwrap();
+        let read = classify_contacts(
+            &[("a".into(), Ok(vec![foreign, forged])), ("b".into(), Ok(vec![]))],
+            &subject,
+        );
+        assert_eq!(read, ContactRead::Absent { answered: 2, asked: 2 });
+    }
+
+    #[test]
+    fn the_merge_base_is_the_newest_known_list() {
+        let keys = Keys::generate();
+        let relay = sign_contacts(&keys, &[&hex64(1)], 100);
+        let cached = sign_contacts(&keys, &[&hex64(1), &hex64(2)], 200);
+        assert_eq!(
+            merge_base(Some(relay.clone()), Some(cached.clone())),
+            Some(cached.clone()),
+            "the cached list is newer — it wins"
+        );
+        let stale_cache = sign_contacts(&keys, &[], 50);
+        assert_eq!(
+            merge_base(Some(relay.clone()), Some(stale_cache)),
+            Some(relay.clone()),
+            "an older cache loses to a fresher relay copy"
+        );
+        assert_eq!(merge_base(Some(relay.clone()), None), Some(relay));
+        assert_eq!(merge_base(None, Some(cached.clone())), Some(cached));
+        assert_eq!(merge_base(None, None), None);
+    }
+
+    #[test]
+    fn map_event_stamps_the_setup_rows_verbatim() {
+        let rows = crate::brainstorm::setup_rows(HOUSE_SETUP6).expect("fixture parses");
+        assert_eq!(rows.len(), 6);
+        let keys = Keys::generate();
+        let event = map_event(&keys, &rows);
+        assert_eq!(event.kind, Kind::Custom(10040));
+        assert_eq!(event.content, "");
+        assert_eq!(tag_rows(&event), rows);
+        assert_eq!(event.pubkey, keys.public_key());
+        assert!(event.verify().is_ok());
     }
 }

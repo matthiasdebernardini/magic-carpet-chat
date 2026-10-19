@@ -10,6 +10,7 @@
 pub const USER_AGENT: &str = concat!("magic-carpet-chat/", env!("CARGO_PKG_VERSION"));
 
 pub mod api;
+pub mod brainstorm;
 pub mod coinos;
 pub mod events;
 pub mod nostr;

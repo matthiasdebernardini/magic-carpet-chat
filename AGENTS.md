@@ -21,7 +21,7 @@ Those live in the **private** NostrFabrica repo, one directory up.
 | `docs/atlas/`, `docs/SYSTEM.md`, `docs/atlas.html` | this repo, public | architecture atlas; `data.mjs` is the source |
 | `docs/test-cycles/` | this repo, public | the "app test cycles with Cua, Jev, Claude Code and Cap" guide, a static site (`wrangler deploy` there publishes `public/`) |
 | `scripts/walkthrough/` | this repo, public | Feature 1 walkthrough: drives the app with macos-harness and judges each step with Jev |
-| `scripts/e2e-cua/` | this repo, public | the e2e suite for the cua demo box |
+| `scripts/e2e-cua/` | this repo, public | the e2e suite — `--target box` drives the cua demo box, `--target omac` drives a local binary on an Omarchy host |
 | `goals/gpui-kit-migration.md`, `goals/profile-json-fidelity.md` | this repo, public | older goals, already public |
 | `../magic-carpet-chat-context/goals/` | NostrFabrica, **private** | current goals: Feature 1 (`feature-1-treasure-map-goal.md`), the next pages (`treasure-map-and-next-pages.md`), copy gaps per screen (`artifact-gap.md`), the cua demo box runbook (`cua-jev-demo-box.md`) |
 | `../magic-carpet-chat-context/docs/mock/` | NostrFabrica, **private** | David's Claude Design mock: every screen and its copy |

@@ -135,7 +135,7 @@ fn logo() -> impl IntoElement {
         .child(img(crate::icons::icon("logo")).size_full())
 }
 
-fn primary_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+pub(crate) fn primary_button(id: &'static str, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
         .px(px(18.))
@@ -153,7 +153,7 @@ fn primary_button(id: &'static str, label: &'static str) -> Stateful<Div> {
         .child(label)
 }
 
-fn quiet_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+pub(crate) fn quiet_button(id: &'static str, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
         .px(px(14.))
@@ -218,8 +218,8 @@ fn choice_card(cx: &mut Context<Shell>) -> AnyElement {
         .border_color(rgb(BORDER_3))
         .child(card_title("Your Nostr account"))
         .child(muted(
-            "An account is a Nostr key. It stays on this Mac — the app only \
-             ever shares your public identity.",
+            "Your secret key stays on this computer. Your name and payment \
+             address are public.",
             TEXT_MUTED,
         ))
         .child(
@@ -256,8 +256,8 @@ fn create_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
         // button, which the paste path already is — use that instead.
         .child(dot_row(
             GREEN,
-            "A Coinos Lightning wallet opens for this account, so claims can \
-             pay you. Coinos holds the sats — keep the balance small.",
+            "A Coinos wallet opens with this account so claims can pay you. \
+             Coinos holds your sats, so keep the balance small.",
             TEXT_MUTED,
         ))
         .children(error_line(setup.error.clone()))
@@ -274,8 +274,8 @@ fn paste_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
         .border_color(rgb(BORDER_3))
         .child(card_title("Use your Nostr key"))
         .child(muted(
-            "It starts with nsec1 — copy it from your Nostr app \
-             (Settings > Keys in Primal or Damus).",
+            "Paste your secret key. It starts with nsec1. Find it in your \
+             Nostr app under Settings > Keys.",
             TEXT_MUTED,
         ))
         .child(div().text_size(px(12.5)).child(Input::new(&setup.key)))
@@ -303,20 +303,55 @@ fn working_card(text: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-/// The success panel: what the key resolved to, the wallet (address, QR,
-/// the live "waiting for sats" line), and the Start button.
-fn ready_card(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -> AnyElement {
+/// A ready-state step card's head: badge, title, and an optional
+/// right-aligned status tag.
+fn step_head(mark: &'static str, title: &'static str, tag: Option<AnyElement>, active: bool) -> Div {
+    let badge = if active {
+        crate::community::badge(28., mark, ACCENT, BG_RAIL)
+    } else {
+        crate::community::badge(28., mark, 0x4ecb8d22, GREEN)
+    };
+    h_flex()
+        .items_center()
+        .gap(px(14.))
+        .child(badge)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(px(15.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .children(tag)
+}
+
+/// The small right-aligned tag on a done step ("saved on this computer").
+fn status_tag(text: impl Into<SharedString>) -> AnyElement {
+    div()
+        .flex_shrink_0()
+        .px(px(9.))
+        .py(px(3.))
+        .rounded_full()
+        .bg(wash(GREEN_WASH))
+        .border_1()
+        .border_color(rgb(GREEN_EDGE))
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(GREEN))
+        .child(text.into())
+        .into_any_element()
+}
+
+/// The three visible setup steps once the account answers — identity,
+/// wallet, Trusted Community — replacing the single "Account ready" card.
+fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -> Vec<AnyElement> {
     let generated = shell.setup.generated;
     let Some(view) = shell.view(&summary.pubkey) else {
-        return working_card("Loading the account…");
-    };
-    let identity: SharedString = match &view.kind0_name {
-        Some(name) => format!("{name} · {}", short_npub(&summary.npub)).into(),
-        None => short_npub(&summary.npub).into(),
+        return vec![working_card("Loading the account…")];
     };
     let wallet_box = |panel: AnyElement| {
         div()
-            .mt(px(4.))
             .p(px(14.))
             .rounded(px(10.))
             .bg(rgb(BG_APP))
@@ -324,65 +359,127 @@ fn ready_card(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) ->
             .border_color(rgb(BORDER))
             .child(panel)
     };
+
+    // ------------------------------------------------ 1 · your identity
+    let mut identity = card()
+        .child(step_head(
+            "✓",
+            "Your Nostr identity",
+            Some(status_tag("saved on this computer")),
+            false,
+        ))
+        .child(
+            h_flex()
+                .ml(px(42.))
+                .gap(px(0.))
+                .items_baseline()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .font_family(MONO)
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .text_color(rgb(ACCENT_LIGHT))
+                        .child(short_npub(&summary.npub)),
+                )
+                .child(div().text_color(rgb(TEXT_DIM)).child(" · saved")),
+        );
+    if !summary.profile_found && !generated {
+        // No kind-0 at all on the paste-existing-key path usually means the
+        // WRONG key (a hex public key parses as a plausible secret key and
+        // lands exactly here).
+        identity = identity.child(
+            div()
+                .ml(px(42.))
+                .child(dot_row(
+                    AMBER,
+                    "No profile found for this key. Check that you pasted the \
+                     right one.",
+                    AMBER,
+                )),
+        );
+    }
+
+    // ------------------------------------------------ 2 · a wallet
     // A wallet opened from this panel keeps the panel: its address and QR
     // are the point, and the lud16 it just published would otherwise hide it.
     let session_wallet = view.wallet.created.is_some() || view.wallet.error.is_some();
-    let lud16_row = if session_wallet {
-        wallet_box(wallet::panel(view, true, None, cx)).into_any_element()
-    } else if let Some(lud16) = &view.lud16 {
-        dot_row(GREEN, format!("Lightning address: {lud16}"), TEXT)
-    } else if !summary.profile_checked {
-        dot_row(
-            TEXT_DIM,
-            "Could not check the profile right now. You can still continue.",
-            TEXT_MUTED,
-        )
+    let wallet_done = view.wallet.created.is_some() || view.lud16.is_some();
+    let wallet_tag = if let Some(created) = &view.wallet.created {
+        Some(status_tag(format!(
+            "Coinos wallet ready — {}",
+            created.lightning_address
+        )))
     } else {
+        view.lud16
+            .as_ref()
+            .map(|lud16| status_tag(format!("Lightning address: {lud16}")))
+    };
+    let mut wallet = card()
+        .when(!wallet_done, |this| this.border_color(wash(0x8f7df855)))
+        .child(step_head(
+            if wallet_done { "✓" } else { "2" },
+            "A Lightning wallet",
+            wallet_tag,
+            !wallet_done,
+        ));
+    if session_wallet {
+        wallet = wallet.child(div().ml(px(42.)).child(wallet_box(wallet::panel(
+            view, true, None, cx,
+        ))));
+    } else if view.lud16.is_none() {
         // No lud16, and we know it: instead of sending the person to another
         // app to add one, open a wallet right here. The panel shows the
         // address and a funding QR once the signup lands.
-        v_flex()
-            .gap(px(8.))
-            .when(!summary.profile_found && !generated, |this| {
-                // No kind-0 at all on the paste-existing-key path usually
-                // means the WRONG key (a hex public key parses as a
-                // plausible secret key and lands exactly here).
-                this.child(dot_row(
-                    AMBER,
-                    "No profile found for this key — double-check you pasted the \
-                     right one.",
-                    AMBER,
-                ))
-            })
-            .child(wallet_box(wallet::panel(view, true, None, cx)))
-            .into_any_element()
-    };
-    card()
-        .border_color(rgb(BORDER_3))
-        .child(card_title("Account ready"))
-        .child(
-            h_flex().gap(px(9.)).items_center().child(
+        wallet = wallet.child(
+            v_flex()
+                .ml(px(42.))
+                .gap(px(8.))
+                .when(!summary.profile_checked, |this| {
+                    this.child(dot_row(
+                        TEXT_DIM,
+                        "Couldn't check your profile. You can still continue.",
+                        TEXT_MUTED,
+                    ))
+                })
+                .child(wallet_box(wallet::panel(view, true, None, cx))),
+        );
+    }
+
+    // ------------------------------------- 3 · your trusted community
+    let community = crate::community::card(shell, &summary.pubkey, cx).unwrap_or_else(|| {
+        card()
+            .child(step_head("3", "Your Trusted Community", None, true))
+            .child(
                 div()
-                    .font_family(MONO)
-                    .text_size(px(12.))
-                    .text_color(rgb(ACCENT_LIGHT))
-                    .child(identity),
-            ),
-        )
-        .child(lud16_row)
-        .child(
-            primary_button("setup-start", "Start — Enter")
-                .mt(px(6.))
-                .on_click(cx.listener(|this, _, window, cx| this.leave_account_setup(window, cx))),
-        )
-        .into_any_element()
+                    .ml(px(42.))
+                    .child(muted("Loading the setup steps…", TEXT_MUTED)),
+            )
+            .child(
+                crate::community::dashboard_button(
+                    "community-dashboard",
+                    "Take me to the Magic Carpet Dashboard",
+                    false,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.leave_account_setup(window, cx);
+                })),
+            )
+            .into_any_element()
+    });
+
+    vec![
+        identity.into_any_element(),
+        wallet.into_any_element(),
+        community,
+    ]
 }
 
 fn browse_card(cx: &mut Context<Shell>) -> AnyElement {
     card()
         .child(card_title("Just look around"))
         .child(muted(
-            "Browse the bounties read-only. The + in the rail adds an account later.",
+            "Browse bounties without an account. Click the + button in the left bar to add one later.",
             TEXT_MUTED,
         ))
         .child(
@@ -404,16 +501,22 @@ fn cancel_card(cx: &mut Context<Shell>) -> AnyElement {
 
 pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
     let setup = &shell.setup;
-    let main = if let Some(text) = setup.working {
-        working_card(text)
+    // The ready state is the three visible step cards — the Trusted
+    // Community card's Dashboard button takes over as the way out (Enter
+    // keeps working). Every earlier path is a single card.
+    let (main, width) = if let Some(text) = setup.working {
+        (vec![working_card(text)], 470.)
     } else if let Some(summary) = &setup.ready {
-        ready_card(shell, summary, cx)
+        (ready_steps(shell, summary, cx), 660.)
     } else {
-        match setup.path {
-            Path::Choose => choice_card(cx),
-            Path::Create => create_card(setup, cx),
-            Path::Paste => paste_card(setup, cx),
-        }
+        (
+            vec![match setup.path {
+                Path::Choose => choice_card(cx),
+                Path::Create => create_card(setup, cx),
+                Path::Paste => paste_card(setup, cx),
+            }],
+            470.,
+        )
     };
     // The way out without finishing: first launch browses read-only, add
     // mode goes back to whatever was on screen. Neither while the runtime is
@@ -453,15 +556,18 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                                 .font_weight(FontWeight::BOLD)
                                 .child("Magic Carpet"),
                         )
-                        .child(div().text_size(px(13.)).text_color(rgb(TEXT_MUTED)).child(
-                            "Claim items on live bounties and get paid in sats, automatically.",
-                        )),
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("Claim bounties. Get paid in sats, automatically."),
+                        ),
                 )
                 .child(
                     v_flex()
-                        .w(px(470.))
+                        .w(px(width))
                         .gap(px(14.))
-                        .child(main)
+                        .children(main)
                         .children(exit),
                 ),
         )

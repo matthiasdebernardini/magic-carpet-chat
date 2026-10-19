@@ -20,6 +20,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::api::{Api, ApiError, Bounty, BountyDetail, CreateBounty};
+use crate::brainstorm::{self, SearchHit};
 use crate::coinos;
 use crate::events::{self, EventError};
 use crate::secrets::{self, Secret, SecretError};
@@ -72,6 +73,47 @@ pub fn relay_url() -> String {
         .unwrap_or_else(|| INSTANCE_RELAY.to_string())
 }
 
+/// `MC_TRUST_RELAYS`, comma-separated: trims each entry, skips empties,
+/// normalizes the URL, and drops anything that is not `ws://`/`wss://`.
+/// `None` for unset or when nothing valid remains — the defaults apply.
+fn relays_from_env() -> Option<Vec<String>> {
+    let urls = parse_relay_list(&std::env::var("MC_TRUST_RELAYS").ok()?);
+    (!urls.is_empty()).then_some(urls)
+}
+
+fn parse_relay_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(trust::normalize_relay)
+        .filter(|url| url.starts_with("wss://") || url.starts_with("ws://"))
+        .collect()
+}
+
+/// The read set every trust read unions the account's outbox relays with —
+/// the `MC_TRUST_RELAYS` set when the override is active, else
+/// [`TRUST_FALLBACK_RELAYS`].
+pub fn trust_relays() -> Vec<String> {
+    relays_from_env().unwrap_or_else(|| {
+        TRUST_FALLBACK_RELAYS
+            .iter()
+            .map(|url| trust::normalize_relay(url))
+            .collect()
+    })
+}
+
+/// The set public writes (a new lud16, a kind-3 follow, a kind-10040 map)
+/// go to: the `MC_TRUST_RELAYS` set when the override is active, else
+/// [`PUBLIC_RELAYS`].
+pub fn public_relays() -> Vec<String> {
+    relays_from_env().unwrap_or_else(|| {
+        PUBLIC_RELAYS
+            .iter()
+            .map(|url| trust::normalize_relay(url))
+            .collect()
+    })
+}
+
 /// UI → runtime.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -109,11 +151,15 @@ pub enum Command {
     /// `CreateCoinosWallet`, so one click does everything; `name` then goes
     /// into the kind-0 that step writes, when the key has none yet. The
     /// secret rides the channel inside [`Secret`], so a stray `{:?}` on a
-    /// `Command` cannot leak it.
+    /// `Command` cannot leak it. `generated` marks a key the app itself just
+    /// minted (`StoredAccount.created_in_app`): such a key having no kind-3
+    /// on the relays means "fresh", not "lost", so the first follow write
+    /// needs no confirmation.
     AddAccount {
         secret: Secret,
         name: Option<String>,
         open_wallet: bool,
+        generated: bool,
     },
     /// Delete the account (nsec and Coinos login) from the store, drop its
     /// session, re-emit `AccountsLoaded`.
@@ -154,6 +200,42 @@ pub enum Command {
     /// `TrustPart`, as soon as it is known. `generation` lets the UI drop a
     /// late answer from a fetch it already superseded.
     FetchTrust { pubkey: String, generation: u32 },
+    /// The instance owner's identity for the community panel's recommended
+    /// follow: the issuer's pubkey (the `MC_ISSUER_NPUB`-honouring helper),
+    /// its npub, and the display name its kind-0 carries — read through the
+    /// instance, then the trust relays. Emits `Update::Owner`. No pubkey or
+    /// generation: there is one owner and the answer is never stale.
+    FetchOwner,
+    /// The follow step's profile search (`/search/byText`). `seq` lets the
+    /// UI drop the reply to a query it already replaced.
+    SearchProfiles {
+        pubkey: String,
+        generation: u32,
+        seq: u64,
+        query: String,
+    },
+    /// Append `target` (hex pubkey) to the account's kind-3 under the
+    /// majority rule: a found list is merged, `allow_first_list` is the
+    /// confirmed consent to start one from scratch. Emits `Community` with
+    /// `CommunityPart::Followed`.
+    Follow {
+        pubkey: String,
+        generation: u32,
+        target: String,
+        allow_first_list: bool,
+    },
+    /// The "Calculate my trust scores" step: Brainstorm login, follow-list
+    /// ingest, graperank, then one setup probe. Rate-limited — never re-sent
+    /// for a reason. Emits `Community` with `CommunityPart::Calculated`.
+    CalculateTrust { pubkey: String, generation: u32 },
+    /// A `/setup` read ONLY — no login, nothing rate-limited. The "Try
+    /// again" control. Emits `Community` with `CommunityPart::SetupChecked`.
+    CheckSetup { pubkey: String, generation: u32 },
+    /// Build the kind-10040 from the current `/setup` rows, re-read the
+    /// existing map under the majority rule (an existing one wins — the
+    /// publish refuses), then sign locally and publish. Emits `Community`
+    /// with `CommunityPart::MapPublished`.
+    PublishMap { pubkey: String, generation: u32 },
     Shutdown,
 }
 
@@ -304,6 +386,20 @@ pub enum Update {
         generation: u32,
         part: TrustPart,
     },
+    /// The instance owner's identity, once. No generation: stale is
+    /// impossible for a value that never changes in-flight.
+    Owner {
+        pubkey_hex: String,
+        npub: String,
+        name: Option<String>,
+    },
+    /// One finished piece of a community flow, dropped by the UI unless its
+    /// generation matches the panel's.
+    Community {
+        pubkey: String,
+        generation: u32,
+        part: CommunityPart,
+    },
     Error {
         source: ErrorSource,
         message: String,
@@ -332,6 +428,80 @@ pub enum TrustPart {
         provider: Option<(String, String)>,
         result: Result<Option<Assertion>, String>,
     },
+}
+
+/// One piece of the trusted-community flow. `Ok` is a real answer;
+/// `Err` is fixed text only — Brainstorm's bodies and every token stay on
+/// the runtime thread.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommunityPart {
+    /// A `SearchProfiles` reply; `seq` matches the command's.
+    SearchResults {
+        seq: u64,
+        result: Result<Vec<SearchHit>, String>,
+    },
+    /// A `Follow` outcome.
+    Followed(Result<FollowOk, FollowErr>),
+    /// A `CalculateTrust` outcome: `Ok` means Brainstorm took the request;
+    /// the `SetupState` is what the `/setup` probe then saw.
+    Calculated(Result<SetupState, String>),
+    /// A `CheckSetup` reply.
+    SetupChecked(SetupState),
+    /// A `PublishMap` outcome.
+    MapPublished(Result<PublishOk, String>),
+}
+
+/// What a `/setup` read found — whether the map publish may proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupState {
+    /// Rows ready for a map; the count is display material.
+    Ready { rows: usize },
+    /// A real 404: calculated-but-not-yet, or nothing was ever calculated.
+    Missing,
+    /// The read failed or the body was not setup rows.
+    Unreadable,
+}
+
+/// A follow that landed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FollowOk {
+    /// The hex pubkey now followed.
+    pub target: String,
+    /// Normalized URLs of the relays that accepted the kind-3.
+    pub accepted: Vec<String>,
+    /// Normalized URLs of the asked relays that did not accept it.
+    pub rejected: Vec<String>,
+    /// How many relays the publish went to.
+    pub asked: usize,
+    /// The list already had the key: nothing was published.
+    pub already: bool,
+}
+
+/// A follow that did not land, with everything the retry UI needs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FollowErr {
+    /// Too few relays answered to say whether a list exists. Counts only.
+    Inconclusive { answered: usize, asked: usize },
+    /// A strict majority confirmed no list exists AND the key was not
+    /// generated here: writing one without consent would clobber a list the
+    /// relays cannot see. The UI shows the warning and re-sends with
+    /// `allow_first_list`.
+    NeedsConfirmation { answered: usize, asked: usize },
+    /// Every relay refused the signed kind-3.
+    Rejected { asked: usize },
+    /// Fixed wording (session, signing).
+    Failed(&'static str),
+}
+
+/// A map that landed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishOk {
+    /// Normalized URLs of the relays that accepted the kind-10040.
+    pub accepted: Vec<String>,
+    /// How many relays the publish went to.
+    pub asked: usize,
+    /// How many `/setup` rows the map carries.
+    pub rows: usize,
 }
 
 /// What the wallet signup came back with. `publish_error` is set when the
@@ -371,7 +541,7 @@ pub struct NostrHandle {
 enum BridgeError {
     /// Unreachable while the UI only names stored accounts; kept so a stale
     /// pubkey (removed mid-flight) fails with words, not a panic.
-    #[error("This account has no key stored")]
+    #[error("This account has no secret key saved. Re-add the account.")]
     NoKey,
     #[error(transparent)]
     Secret(#[from] SecretError),
@@ -447,6 +617,20 @@ struct Session {
     keys: Keys,
     api: Api,
     logged_in: bool,
+    /// The Brainstorm bearer token, minted by the challenge exchange. Kept
+    /// inside [`Secret`] so a `{:?}` cannot leak it; in memory only, never
+    /// stored, never in an Update.
+    brainstorm: Option<Secret>,
+    /// The newest kind-3 this session signed or read — the followList
+    /// ingest input, so the calculate step does not re-read the relays.
+    contact_list: Option<Event>,
+    /// Kind-3 event ids followList already accepted. The POST is
+    /// rate-limited (3 shared requests per 30 min), so an id once accepted
+    /// is never sent again.
+    follow_list_sent: HashSet<String>,
+    /// A graperank run was accepted for this account this session — the
+    /// gate `PublishMap` checks, since a new process cannot know.
+    graperank_ok: bool,
 }
 
 /// One session per account (by pubkey hex), shareable across spawned command
@@ -514,10 +698,11 @@ async fn run(
                 secret,
                 name,
                 open_wallet,
+                generated,
             } => {
                 let sessions = sessions.clone();
                 let updates = updates.clone();
-                tokio::spawn(add_account(sessions, secret, name, open_wallet, updates));
+                tokio::spawn(add_account(sessions, secret, name, open_wallet, generated, updates));
             }
             Command::RemoveAccount { pubkey } => {
                 let sessions = sessions.clone();
@@ -660,6 +845,58 @@ async fn run(
                 let updates = updates.clone();
                 tokio::spawn(fetch_trust(pubkey, generation, provider, updates));
             }
+            Command::FetchOwner => {
+                tokio::spawn(fetch_owner(updates.clone()));
+            }
+            Command::SearchProfiles {
+                pubkey,
+                generation,
+                seq,
+                query,
+            } => {
+                let updates = updates.clone();
+                tokio::spawn(async move {
+                    let result = brainstorm::search_by_text(&query)
+                        .await
+                        .map_err(str::to_string);
+                    let _ = updates.unbounded_send(Update::Community {
+                        pubkey,
+                        generation,
+                        part: CommunityPart::SearchResults { seq, result },
+                    });
+                });
+            }
+            Command::Follow {
+                pubkey,
+                generation,
+                target,
+                allow_first_list,
+            } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(follow_account(
+                    sessions,
+                    pubkey,
+                    generation,
+                    target,
+                    allow_first_list,
+                    updates,
+                ));
+            }
+            Command::CalculateTrust { pubkey, generation } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(calculate_trust(sessions, pubkey, generation, updates));
+            }
+            Command::CheckSetup { pubkey, generation } => {
+                let updates = updates.clone();
+                tokio::spawn(check_setup(pubkey, generation, updates));
+            }
+            Command::PublishMap { pubkey, generation } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(publish_map(sessions, pubkey, generation, updates));
+            }
             Command::Shutdown => break,
         }
     }
@@ -687,6 +924,10 @@ async fn session(
         keys,
         api,
         logged_in: false,
+        brainstorm: None,
+        contact_list: None,
+        follow_list_sent: HashSet::new(),
+        graperank_ok: false,
     }));
     map.insert(pubkey.to_string(), session.clone());
     Ok(session)
@@ -829,7 +1070,7 @@ fn merge_lud16(
             Ok(serde_json::Value::Object(map)) => map,
             _ => {
                 return Err(BridgeError::Profile(
-                    "Your current profile could not be read, so it was left alone",
+                    "Your profile data is in an unexpected format, so this app left it alone.",
                 ));
             }
         },
@@ -840,7 +1081,7 @@ fn merge_lud16(
     let current = Profile::from_value(&serde_json::Value::Object(profile.clone())).lud16;
     if current.is_some_and(|current| !current.eq_ignore_ascii_case(lud16.trim())) {
         return Err(BridgeError::Profile(
-            "Your profile already has a Lightning address; it was left alone",
+            "Your profile already has a Lightning address, so this app left it alone.",
         ));
     }
     profile.insert("lud16".into(), serde_json::Value::String(lud16.to_string()));
@@ -869,24 +1110,28 @@ async fn publish_lud16(
     let existing = fetch_kind0(api, &keys.public_key().to_hex())
         .await
         .map_err(|_| {
-            BridgeError::Profile("Could not read your current profile from the instance")
+            BridgeError::Profile(
+                "Couldn't read your profile from the Magic Carpet server. Try again.",
+            )
         })?;
     let profile = merge_lud16(existing.as_deref(), lud16, name)?;
     let content = serde_json::Value::Object(profile.clone()).to_string();
     let event = EventBuilder::new(Kind::Metadata, content)
         .finalize(keys)
-        .map_err(|_| BridgeError::Profile("Could not sign the profile update"))?;
+        .map_err(|_| {
+            BridgeError::Profile("Couldn't sign the profile update. Restart the app and try again.")
+        })?;
 
     // The instance first: it is what the prod payer reads.
-    api.publish_event(&event)
-        .await
-        .map_err(|_| BridgeError::Profile("The instance relay did not accept the profile update"))?;
+    api.publish_event(&event).await.map_err(|_| {
+        BridgeError::Profile("The Magic Carpet server didn't save the profile update.")
+    })?;
 
     // Then the public relays, through a client that lives for this one send.
     // A relay that refuses is fine as long as one accepts; none accepting is
     // a publish failure, because Strike-side lookups would still miss it.
     let client = Client::default();
-    for url in PUBLIC_RELAYS {
+    for url in public_relays() {
         let _ = client.add_relay(url).await;
     }
     client.connect().and_wait(Duration::from_secs(10)).await;
@@ -895,7 +1140,7 @@ async fn publish_lud16(
     match sent {
         Ok(output) if !output.success.is_empty() => Ok(profile),
         _ => Err(BridgeError::Profile(
-            "The relays did not accept the profile update",
+            "The Nostr servers didn't accept the profile update.",
         )),
     }
 }
@@ -904,8 +1149,7 @@ async fn publish_lud16(
 /// before a register that never answered, the wallet turned out to exist,
 /// and the token it answered with is gone. `/api/login` has a captcha, so
 /// there is no second way to get one.
-const NO_TOKEN: &str = "Wallet exists but this app has no token for it; remove the account and \
-     create a new wallet. Your Coinos username and password still work on coinos.io.";
+const NO_TOKEN: &str = "This app lost access to the wallet. Remove the account and create a new wallet. Your Coinos login still works on coinos.io.";
 
 /// The wallet signup, entirely on the runtime thread. Order matters:
 ///
@@ -1006,7 +1250,7 @@ async fn register_wallet(pubkey: &str, mut login: coinos::Login) -> Result<coino
 /// token; on failure, one feed line per streak.
 /// A wallet opened by another install of this app (or on coinos.io itself)
 /// can be funded and shown here, but only the register token pays.
-const CANNOT_SEND: &str = "This wallet cannot send from this app; it was opened elsewhere";
+const CANNOT_SEND: &str = "This app can't send from this wallet. It was opened elsewhere.";
 
 /// `Command::Send`: the stored token pays an invoice pulled from the
 /// recipient's own LNURL endpoint, then the balance is re-read so the panel
@@ -1031,11 +1275,11 @@ async fn send_sats(
         Err(e) => return fail(e.to_string()),
     };
     if sats == 0 {
-        return fail("Enter an amount in sats".into());
+        return fail("Enter an amount in sats.".into());
     }
     let to = to.trim().to_string();
     if coinos::split_address(&to).is_none() {
-        return fail("Enter a Lightning address like name@domain.com".into());
+        return fail("Enter a Lightning address, like name@domain.com.".into());
     }
     let bolt11 = match coinos::lnurl_invoice(&to, sats).await {
         Ok(bolt11) => bolt11,
@@ -1097,7 +1341,7 @@ async fn fetch_balance(
             if mark(true) {
                 let _ = updates.unbounded_send(Update::Error {
                     source: ErrorSource::Wallet,
-                    message: format!("Balance check failed: {e}"),
+                    message: format!("Balance check failed: {e} Try again."),
                 });
             }
             let _ = updates.unbounded_send(Update::BalanceFailed { pubkey, request });
@@ -1175,9 +1419,10 @@ async fn add_account(
     secret: Secret,
     name: Option<String>,
     open_wallet: bool,
+    generated: bool,
     updates: mpsc::UnboundedSender<Update>,
 ) {
-    let record = match secrets::add_account(&secret) {
+    let record = match secrets::add_account(&secret, generated) {
         Ok(record) => record,
         Err(e) => {
             let _ = updates.unbounded_send(Update::AddAccountFailed {
@@ -1501,7 +1746,7 @@ async fn watch_bounty(
                 }
             }
             Err(e) => {
-                let message = format!("watch {bounty_id}: {e}");
+                let message = format!("Bounty {bounty_id} didn't refresh: {e} Retrying.");
                 if last_error.as_deref() != Some(message.as_str()) {
                     if updates
                         .unbounded_send(Update::Error {
@@ -1542,7 +1787,7 @@ async fn watch_bounty(
                     subscribed = claim_ids;
                 }
                 Err(e) => {
-                    let message = format!("receipt subscription failed: {e}");
+                    let message = format!("Payment receipt watch failed: {e}. Retrying.");
                     if last_error.as_deref() != Some(message.as_str()) {
                         if updates
                             .unbounded_send(Update::Error {
@@ -1611,7 +1856,7 @@ async fn fetch_trust(
     };
 
     let client = Client::default();
-    for url in TRUST_FALLBACK_RELAYS {
+    for url in trust_relays() {
         let _ = client.add_relay(url).await;
     }
     // Reads on a relay still connecting fail; give them a moment first.
@@ -1654,7 +1899,7 @@ async fn fetch_trust(
         }
         None => send(TrustPart::InstanceAssertion {
             provider: None,
-            result: Err("Couldn't determine the instance's rank provider.".into()),
+            result: Err("Couldn't find this server's score provider. Try again later.".into()),
         }),
     }
 
@@ -1663,13 +1908,10 @@ async fn fetch_trust(
 
 /// The relays the account claims to write to: `r` tags of its newest
 /// kind-10002 that carry no marker or marker `write`, unioned with
-/// [`TRUST_FALLBACK_RELAYS`]. A failed or absent 10002 yields the fallback
+/// [`trust_relays`]. A failed or absent 10002 yields the fallback
 /// set on its own — never an error.
 async fn outbox_relays(client: &Client, pubkey: &str) -> Vec<String> {
-    let mut urls: BTreeSet<String> = TRUST_FALLBACK_RELAYS
-        .iter()
-        .map(|url| trust::normalize_relay(url))
-        .collect();
+    let mut urls: BTreeSet<String> = trust_relays().into_iter().collect();
     let Ok(public) = PublicKey::parse(pubkey) else {
         return urls.into_iter().collect();
     };
@@ -1769,14 +2011,16 @@ async fn read_designation(
     outbox: &[String],
 ) -> Result<Designation, String> {
     let Ok(public) = PublicKey::parse(pubkey) else {
-        return Err("Couldn't read kind-10040 from the relays.".into());
+        return Err("The account's public key is invalid, so no Nostr server was asked.".into());
     };
     let filter = Filter::new().kind(Kind::Custom(10040)).author(public);
     let results = read_per_relay(client, outbox, filter).await;
     let total = results.len();
     let (answered, events) = answered(results);
     if answered == 0 {
-        return Err(format!("Couldn't read kind-10040 from {total} relays."));
+        return Err(format!(
+            "No Nostr server answered (asked {total}). Try again."
+        ));
     }
     Ok(trust::parse_designation(&events, pubkey))
 }
@@ -1790,7 +2034,7 @@ async fn read_follows(
     outbox: &[String],
 ) -> Result<Option<u32>, String> {
     let Ok(public) = PublicKey::parse(pubkey) else {
-        return Err("Couldn't read kind-3 from the relays.".into());
+        return Err("The account's public key is invalid, so no Nostr server was asked.".into());
     };
     let filter = Filter::new()
         .kind(Kind::ContactList)
@@ -1800,7 +2044,9 @@ async fn read_follows(
     let total = results.len();
     let (answered, events) = answered(results);
     if answered == 0 {
-        return Err(format!("Couldn't read kind-3 from {total} relays."));
+        return Err(format!(
+            "Couldn't read your follow list: no Nostr server answered (asked {total}). Try again."
+        ));
     }
     Ok(events
         .iter()
@@ -1822,7 +2068,7 @@ async fn read_assertion(
     subject: &str,
 ) -> Result<Option<Assertion>, String> {
     let Ok(provider_key) = PublicKey::parse(provider) else {
-        return Err("Couldn't read the provider's assertions.".into());
+        return Err("The score provider's key is invalid, so its scores can't be read.".into());
     };
     let relay = trust::normalize_relay(relay);
     let _ = client.add_relay(relay.as_str()).await;
@@ -1840,11 +2086,11 @@ async fn read_assertion(
             }
             Ok(assertion)
         }
-        _ => Err(format!("Couldn't read {relay}.")),
+        _ => Err(format!("Couldn't read from {relay}. Try again.")),
     }
 }
 
-/// `GET https://api.brainstorm.world/setup/{hex}`: 404 means the npub has no
+/// `GET {brainstorm::base()}/setup/{hex}`: 404 means the npub has no
 /// Brainstorm account (`Ok(NoAccount)`); any other failure is `Err` with
 /// fixed wording — the endpoint's own error text is never shown.
 async fn fetch_brainstorm_key(hex: &str) -> Result<BrainstormKey, String> {
@@ -1852,24 +2098,27 @@ async fn fetch_brainstorm_key(hex: &str) -> Result<BrainstormKey, String> {
         .user_agent(crate::USER_AGENT)
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|_| "Couldn't reach the Brainstorm setup service.".to_string())?;
+        .map_err(|_| {
+            "Couldn't reach Brainstorm. Check your connection and try again.".to_string()
+        })?;
     let response = http
-        .get(format!("{}{hex}", trust::BRAINSTORM_SETUP))
+        .get(format!("{}{}/{hex}", brainstorm::base(), trust::BRAINSTORM_SETUP_PATH))
         .send()
         .await
-        .map_err(|_| "Couldn't reach the Brainstorm setup service.".to_string())?;
+        .map_err(|_| {
+            "Couldn't reach Brainstorm. Check your connection and try again.".to_string()
+        })?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(BrainstormKey::NoAccount);
     }
     if !response.status().is_success() {
-        return Err("The Brainstorm setup service returned an error.".into());
+        return Err("Brainstorm returned an error. Try again in a few minutes.".into());
     }
-    let body = response
-        .text()
-        .await
-        .map_err(|_| "The Brainstorm setup answer could not be read.".to_string())?;
+    let body = response.text().await.map_err(|_| {
+        "Brainstorm sent an answer the app can't read. Try again later.".to_string()
+    })?;
     trust::parse_setup(&body)
-        .ok_or_else(|| "The Brainstorm setup answer could not be read.".to_string())
+        .ok_or_else(|| "Brainstorm sent an answer the app can't read. Try again later.".to_string())
 }
 
 /// `(key, relay)` of the provider the instance scores from: the issuer's own
@@ -1905,6 +2154,436 @@ async fn resolve_instance_provider(
         *cache.lock().await = Some(provider.clone());
     }
     resolved
+}
+
+// ─── The trusted-community flow ────────────────────────────────────────────
+// Follow (kind-3 merge), calculate (Brainstorm login → followList →
+// graperank → setup probe), publish (kind-10040 from the setup rows). Every
+// failure string here is fixed wording — relay replies, Brainstorm bodies
+// and the token itself never cross into an Update.
+
+/// The instance owner, for the panel's recommended follow: the issuer's
+/// pubkey and npub always, its kind-0 display name when a read finds one —
+/// through the instance first, then the trust relays.
+async fn fetch_owner(updates: mpsc::UnboundedSender<Update>) {
+    let pubkey_hex = issuer_pubkey();
+    let npub = PublicKey::from_hex(&pubkey_hex)
+        .ok()
+        .and_then(|pk| pk.to_bech32().ok())
+        .unwrap_or_else(|| pubkey_hex.clone());
+    let mut name = None;
+    if let Ok(api) = Api::new()
+        && let Ok(Some(content)) = fetch_kind0(&api, &pubkey_hex).await
+    {
+        name = parse_profile(&content).name;
+    }
+    if name.is_none()
+        && let Ok(public) = PublicKey::parse(&pubkey_hex)
+    {
+        let urls = trust_relays();
+        let client = Client::default();
+        for url in &urls {
+            let _ = client.add_relay(url.as_str()).await;
+        }
+        client.connect().and_wait(Duration::from_secs(5)).await;
+        let filter = Filter::new().kind(Kind::Metadata).author(public).limit(5);
+        let results = read_per_relay(&client, &urls, filter).await;
+        client.disconnect().await;
+        let (_, events) = answered(results);
+        name = events
+            .into_iter()
+            .filter(|(_, event)| {
+                event.pubkey.to_hex() == pubkey_hex && event.verify().is_ok()
+            })
+            .max_by_key(|(_, event)| event.created_at)
+            .and_then(|(_, event)| parse_profile(&event.content).name);
+    }
+    let _ = updates.unbounded_send(Update::Owner {
+        pubkey_hex,
+        npub,
+        name,
+    });
+}
+
+/// Open a throwaway client on the trust relays, then widen it to the set
+/// the community flows read and publish through: the account's outbox
+/// relays unioned with [`trust_relays`], plus the instance relay. The set
+/// is also exactly the relays `client.send_event` writes to.
+async fn community_client(pubkey: &str) -> (Client, Vec<String>) {
+    let client = Client::default();
+    for url in trust_relays() {
+        let _ = client.add_relay(url).await;
+    }
+    client.connect().and_wait(Duration::from_secs(5)).await;
+    let mut urls: BTreeSet<String> = outbox_relays(&client, pubkey).await.into_iter().collect();
+    urls.insert(trust::normalize_relay(&relay_url()));
+    for url in &urls {
+        let _ = client.add_relay(url.as_str()).await;
+    }
+    client.connect().and_wait(Duration::from_secs(3)).await;
+    (client, urls.into_iter().collect())
+}
+
+/// The account's kind-3 under the Brainstorm `probeContactList` majority
+/// rule — see [`trust::classify_contacts`].
+async fn read_contacts(client: &Client, pubkey: &str, relays: &[String]) -> trust::ContactRead {
+    let Ok(public) = PublicKey::parse(pubkey) else {
+        return trust::ContactRead::Inconclusive {
+            answered: 0,
+            asked: relays.len(),
+        };
+    };
+    let filter = Filter::new()
+        .kind(Kind::ContactList)
+        .author(public)
+        .limit(5);
+    let results = read_per_relay(client, relays, filter).await;
+    trust::classify_contacts(&results, pubkey)
+}
+
+/// Broadcast `event` to every relay `client` knows (the full `urls` set
+/// `community_client` returned). Returns the normalized URLs that accepted
+/// it and how many were asked.
+async fn publish_event(client: &Client, urls: &[String], event: &Event) -> (Vec<String>, usize) {
+    let asked = urls.len();
+    let accepted = match client.send_event(event).await {
+        Ok(output) => output
+            .success
+            .keys()
+            .map(|url| trust::normalize_relay(url.as_str()))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    (accepted, asked)
+}
+
+/// `Command::Follow`: read the account's kind-3 under the majority rule,
+/// merge `target` in (or start the list, with consent or an app-made key),
+/// sign and publish — or report why nothing was published.
+async fn follow_account(
+    sessions: SharedSessions,
+    pubkey: String,
+    generation: u32,
+    target: String,
+    allow_first_list: bool,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let result = do_follow(&sessions, &pubkey, &target, allow_first_list).await;
+    let _ = updates.unbounded_send(Update::Community {
+        pubkey,
+        generation,
+        part: CommunityPart::Followed(result),
+    });
+}
+
+async fn do_follow(
+    sessions: &SharedSessions,
+    pubkey: &str,
+    target: &str,
+    allow_first_list: bool,
+) -> Result<FollowOk, FollowErr> {
+    let session = session(sessions, pubkey).await.map_err(|_| {
+        FollowErr::Failed("This account has no secret key saved. Re-add the account.")
+    })?;
+    // The session lock is held across the whole read → merge → publish: two
+    // Follow commands can never build on the same base list, and the
+    // calculate step sees only a settled contact_list.
+    let mut session = session.lock().await;
+    let keys = session.keys.clone();
+    let (client, urls) = community_client(pubkey).await;
+    let mut absent = None;
+    let relay_found = match read_contacts(&client, pubkey, &urls).await {
+        trust::ContactRead::Found(event) => Some(event),
+        trust::ContactRead::Absent { answered, asked } => {
+            absent = Some((answered, asked));
+            None
+        }
+        trust::ContactRead::Inconclusive { answered, asked } => {
+            client.disconnect().await;
+            return Err(FollowErr::Inconclusive { answered, asked });
+        }
+    };
+    // The base is the NEWEST list this session knows — the relay's, or the
+    // one we signed moments ago (relays lag behind a publish).
+    let base = trust::merge_base(relay_found, session.contact_list.clone());
+    if base.is_none() {
+        // Genuinely no list anywhere this session can see. An app-minted
+        // key was never used elsewhere: no list is a fact, not a hazard.
+        // Anything else needs the user's word.
+        let (answered, asked) = absent.unwrap_or((0, urls.len()));
+        let minted = secrets::created_in_app(pubkey).unwrap_or(false);
+        if !minted && !allow_first_list {
+            client.disconnect().await;
+            return Err(FollowErr::NeedsConfirmation { answered, asked });
+        }
+    }
+    // `merge_follow(None)` is the first-list bootstrap: one p tag, "" content.
+    let Some((tags, content)) = trust::merge_follow(base.as_ref(), target) else {
+        // The newest list already follows this key — nothing to publish,
+        // but the list itself is the followList input the calculate step
+        // would otherwise re-read.
+        session.contact_list = base;
+        client.disconnect().await;
+        return Ok(FollowOk {
+            target: target.to_string(),
+            accepted: Vec::new(),
+            rejected: Vec::new(),
+            asked: urls.len(),
+            already: true,
+        });
+    };
+    let signed = EventBuilder::new(Kind::ContactList, content)
+        .tags(tags)
+        .finalize(&keys)
+        .map_err(|_| {
+            FollowErr::Failed("Couldn't sign your follow list. Restart the app and try again.")
+        });
+    let event = match signed {
+        Ok(event) => event,
+        Err(fail) => {
+            client.disconnect().await;
+            return Err(fail);
+        }
+    };
+    let (accepted, asked) = publish_event(&client, &urls, &event).await;
+    client.disconnect().await;
+    if accepted.is_empty() {
+        return Err(FollowErr::Rejected { asked });
+    }
+    let rejected: Vec<String> = urls
+        .iter()
+        .map(|url| trust::normalize_relay(url))
+        .filter(|url| !accepted.contains(url))
+        .collect();
+    // The newest list this session knows of: the calculate step posts it
+    // to followList without another relay round-trip.
+    session.contact_list = Some(event);
+    Ok(FollowOk {
+        target: target.to_string(),
+        accepted,
+        rejected,
+        asked,
+        already: false,
+    })
+}
+
+/// The account's Brainstorm session token: the session's cached one, else
+/// the challenge exchange. `force` mints a new one (the 401 retry).
+async fn brainstorm_token(
+    session: &Arc<TokioMutex<Session>>,
+    force: bool,
+) -> Result<Secret, String> {
+    if !force && let Some(token) = session.lock().await.brainstorm.clone() {
+        return Ok(token);
+    }
+    let (hex, keys) = {
+        let session = session.lock().await;
+        (session.keys.public_key().to_hex(), session.keys.clone())
+    };
+    let challenge = brainstorm::auth_challenge(&hex)
+        .await
+        .map_err(str::to_string)?;
+    let login = brainstorm::login_event(&keys, &challenge);
+    let token = brainstorm::verify_challenge(&hex, &login)
+        .await
+        .map_err(str::to_string)?;
+    session.lock().await.brainstorm = Some(token.clone());
+    Ok(token)
+}
+
+/// `Command::CalculateTrust`: the Brainstorm equivalent of the mock's "one
+/// click" — login, POST the kind-3 (once per event id), POST graperank
+/// (once per session), then a single `/setup` probe.
+async fn calculate_trust(
+    sessions: SharedSessions,
+    pubkey: String,
+    generation: u32,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let send = |result: Result<SetupState, String>| {
+        let _ = updates.unbounded_send(Update::Community {
+            pubkey: pubkey.clone(),
+            generation,
+            part: CommunityPart::Calculated(result),
+        });
+    };
+    let session = match session(&sessions, &pubkey).await {
+        Ok(session) => session,
+        Err(e) => return send(Err(e.to_string())),
+    };
+    let hex = session.lock().await.keys.public_key().to_hex();
+
+    // The list to ingest: the one this session published or read, else a
+    // fresh majority-rule read. There is nothing to calculate without one.
+    let event = match session.lock().await.contact_list.clone() {
+        Some(event) => Some(event),
+        None => {
+            let (client, urls) = community_client(&pubkey).await;
+            let read = read_contacts(&client, &pubkey, &urls).await;
+            client.disconnect().await;
+            match read {
+                trust::ContactRead::Found(event) => Some(event),
+                _ => None,
+            }
+        }
+    };
+    let Some(event) = event else {
+        return send(Err(
+            "Follow at least one account first, then try again.".into()
+        ));
+    };
+
+    let mut token = match brainstorm_token(&session, false).await {
+        Ok(token) => token,
+        Err(message) => return send(Err(message)),
+    };
+    let event_id = event.id.to_hex();
+    if !session.lock().await.follow_list_sent.contains(&event_id) {
+        let outcome = match brainstorm::post_follow_list(&token, &event).await {
+            // A token too old to be valid: mint once, retry once.
+            Err(brainstorm::Fail::Unauthorized) => {
+                match brainstorm_token(&session, true).await {
+                    Ok(fresh) => {
+                        token = fresh;
+                        brainstorm::post_follow_list(&token, &event).await
+                    }
+                    Err(message) => return send(Err(message)),
+                }
+            }
+            other => other,
+        };
+        match outcome {
+            Ok(()) => {
+                session.lock().await.follow_list_sent.insert(event_id);
+            }
+            Err(brainstorm::Fail::Unauthorized) => {
+                return send(Err(
+                    "Brainstorm refused the login. Try again, or visit brainstorm.world.".into(),
+                ));
+            }
+            Err(brainstorm::Fail::Text(message)) => return send(Err(message.into())),
+        }
+    }
+
+    let outcome = match brainstorm::post_graperank(&token).await {
+        Err(brainstorm::Fail::Unauthorized) => match brainstorm_token(&session, true).await {
+            Ok(fresh) => brainstorm::post_graperank(&fresh).await,
+            Err(message) => return send(Err(message)),
+        },
+        other => other,
+    };
+    match outcome {
+        Ok(()) => {
+            session.lock().await.graperank_ok = true;
+        }
+        Err(brainstorm::Fail::Unauthorized) => {
+            return send(Err(
+                "Brainstorm refused the login. Try again, or visit brainstorm.world.".into(),
+            ));
+        }
+        Err(brainstorm::Fail::Text(message)) => return send(Err(message.into())),
+    }
+
+    // The calculation is queued — the setup answer may still take a while.
+    send(Ok(match brainstorm::get_setup(&hex).await {
+        Ok(Some(rows)) => SetupState::Ready { rows: rows.len() },
+        Ok(None) => SetupState::Missing,
+        Err(_) => SetupState::Unreadable,
+    }));
+}
+
+/// `Command::CheckSetup`: the `/setup` read and nothing else. Never a POST —
+/// the "Try again" link must not spend the shared rate limit.
+async fn check_setup(pubkey: String, generation: u32, updates: mpsc::UnboundedSender<Update>) {
+    let state = match brainstorm::get_setup(&pubkey).await {
+        Ok(Some(rows)) => SetupState::Ready { rows: rows.len() },
+        Ok(None) => SetupState::Missing,
+        Err(_) => SetupState::Unreadable,
+    };
+    let _ = updates.unbounded_send(Update::Community {
+        pubkey,
+        generation,
+        part: CommunityPart::SetupChecked(state),
+    });
+}
+
+/// `Command::PublishMap`: `/setup` rows → kind-10040, but only after the
+/// majority rule says no map already exists (or only a withdrawn one —
+/// empty tags — does). An existing map wins; we refuse rather than replace.
+async fn publish_map(
+    sessions: SharedSessions,
+    pubkey: String,
+    generation: u32,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let send = |result: Result<PublishOk, String>| {
+        let _ = updates.unbounded_send(Update::Community {
+            pubkey: pubkey.clone(),
+            generation,
+            part: CommunityPart::MapPublished(result),
+        });
+    };
+    let session = match session(&sessions, &pubkey).await {
+        Ok(session) => session,
+        Err(e) => return send(Err(e.to_string())),
+    };
+    if !session.lock().await.graperank_ok {
+        return send(Err(
+            "Ask Brainstorm to calculate your trust scores first.".into()
+        ));
+    }
+    let keys = session.lock().await.keys.clone();
+    let rows = match brainstorm::get_setup(&pubkey).await {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            return send(Err(
+                "Brainstorm has no data for this account yet. The first calculation can take \
+                 an hour. Try again later."
+                    .into(),
+            ));
+        }
+        Err(message) => return send(Err(message.into())),
+    };
+
+    let (client, urls) = community_client(&pubkey).await;
+    let read = match PublicKey::parse(&pubkey) {
+        Ok(public) => {
+            let filter = Filter::new().kind(Kind::Custom(10040)).author(public);
+            let results = read_per_relay(&client, &urls, filter).await;
+            trust::classify_replaceable(&results, &pubkey, Kind::Custom(10040))
+        }
+        Err(_) => trust::ContactRead::Inconclusive {
+            answered: 0,
+            asked: urls.len(),
+        },
+    };
+    let outcome = match read {
+        // An existing map stands — tell the user to reload instead of
+        // replacing it. A map with no tags is a withdrawal: safe to re-add.
+        trust::ContactRead::Found(event) if event.tags.iter().next().is_some() => {
+            Err("This account already has a Treasure Map. Check again to load it.".into())
+        }
+        trust::ContactRead::Found(_) | trust::ContactRead::Absent { .. } => {
+            let event = trust::map_event(&keys, &rows);
+            let (accepted, asked) = publish_event(&client, &urls, &event).await;
+            if accepted.is_empty() {
+                Err(format!(
+                    "No Nostr server accepted your Treasure Map (tried {asked}). Try again."
+                ))
+            } else {
+                Ok(PublishOk {
+                    accepted,
+                    asked,
+                    rows: rows.len(),
+                })
+            }
+        }
+        trust::ContactRead::Inconclusive { answered, asked } => Err(format!(
+            "Couldn't check for an existing Treasure Map: {answered} of {asked} Nostr servers answered. Nothing was published. Try again."
+        )),
+    };
+    client.disconnect().await;
+    send(outcome);
 }
 
 #[cfg(test)]
@@ -2203,7 +2882,7 @@ mod tests {
             created: WalletCreated {
                 username: "carpetab12cd34".into(),
                 lightning_address: "carpetab12cd34@coinos.io".into(),
-                publish_error: Some("The relays did not accept the profile update".into()),
+                publish_error: Some("The Nostr servers didn't accept the profile update.".into()),
             },
         };
         assert!(!format!("{update:?}").contains("password"));
@@ -2217,10 +2896,71 @@ mod tests {
             secret: Secret::new("nsec1extremelysecretvalue"),
             name: Some("Ada".into()),
             open_wallet: true,
+            generated: true,
         };
         let printed = format!("{command:?}");
         assert!(!printed.contains("extremelysecret"), "leaked: {printed}");
         assert!(printed.contains("<redacted>"), "not redacted: {printed}");
+    }
+
+    #[test]
+    fn community_updates_never_carry_a_token() {
+        // The Brainstorm bearer token lives in the session behind a Secret;
+        // nothing in the Command/Update channel may print it.
+        let update = Update::Community {
+            pubkey: "aa".repeat(32),
+            generation: 1,
+            part: CommunityPart::Calculated(Ok(SetupState::Ready { rows: 6 })),
+        };
+        let printed = format!("{update:?}");
+        assert!(!printed.contains("token"), "leaked: {printed}");
+        for command in [
+            format!(
+                "{:?}",
+                Command::CalculateTrust {
+                    pubkey: "aa".repeat(32),
+                    generation: 1
+                }
+            ),
+            format!(
+                "{:?}",
+                Command::PublishMap {
+                    pubkey: "aa".repeat(32),
+                    generation: 1
+                }
+            ),
+            format!(
+                "{:?}",
+                Command::Follow {
+                    pubkey: "aa".repeat(32),
+                    generation: 1,
+                    target: "bb".repeat(32),
+                    allow_first_list: true
+                }
+            ),
+        ] {
+            assert!(!command.contains("token"), "leaked: {command}");
+        }
+    }
+
+    #[test]
+    fn trust_relays_env_parses_or_falls_back() {
+        // The pure half: trimming, empty entries, normalization, rejection.
+        assert_eq!(
+            parse_relay_list(" wss://a.example/ , , wss://b.example"),
+            vec!["wss://a.example".to_string(), "wss://b.example".to_string()]
+        );
+        assert_eq!(
+            parse_relay_list("https://not-a-relay.example, ws://local:7777/"),
+            vec!["ws://local:7777".to_string()]
+        );
+        assert!(parse_relay_list("").is_empty());
+        assert!(parse_relay_list("https://x , ftp://y").is_empty());
+        // Unset env → the shipped defaults.
+        if std::env::var("MC_TRUST_RELAYS").is_err() {
+            assert_eq!(trust_relays().len(), TRUST_FALLBACK_RELAYS.len());
+            assert_eq!(public_relays().len(), PUBLIC_RELAYS.len());
+        }
     }
 
     /// A one-claim detail with no payment row, shaped like the live API.

@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-"""magic-carpet-chat end-to-end suite. Runs on the magic-carpet-cua box host,
-drives the app inside the `mc` container, and writes one report per run.
+"""magic-carpet-chat end-to-end suite. `--target box` (default) drives the app
+inside the `mc` container on the magic-carpet-cua box host. `--target omac`
+drives a local XWayland binary on this Omarchy host. Writes one report per run.
 
-    ~/mc/.venv/bin/python ~/mc/e2e/suite.py --run-id 20260923-1400 [--no-paid] [--only A,B] [--mock-jev]
+    suite.py --run-id 20260923-1400 [--target box|omac] [--no-paid] [--only A,B] [--mock-jev]
 
 Every UI step goes through the agent.py pattern: the scenario owns a candidate
 table, Jev picks one id, Jev judges the postcondition from the OCR. On top of
 Jev, each scenario makes hard checks (literal OCR phrases, fake-server log
 lines, the clipboard, the float) that decide PASS or FAIL.
 
-Secrets: keys.json is read here and handed to the app only through the docker
-client's environment (`docker exec -e MC_NSECS`, no value on the command
-line). Nothing secret is printed, logged or written to the report.
+Secrets: keys.json is read here and handed to the app only through environment
+values passed to its launch, never on a command line, in a log or in the report.
 """
-import argparse, asyncio, dataclasses, json, os, re, shlex, subprocess, sys, time, traceback
+import argparse, asyncio, dataclasses, json, os, re, shlex, shutil, subprocess, sys, time, traceback
 
 HOME = os.path.expanduser("~")
 MC = os.path.join(HOME, "mc")
 E2E = os.path.dirname(os.path.abspath(__file__))
 KEYS = os.path.join(MC, "keys.json")
+OMAC_CONF = os.path.join(HOME, ".config", "magic-carpet-e2e")
 CDIR = "/tmp/e2e"                       # work dir inside the mc container
 APP_BIN = "/usr/local/bin/magic-carpet-chat-e2e"   # run.sh installs here; the demo's binary is left alone
 WALLET = "node /usr/local/lib/node_modules/brainstorm/node_modules/.bin/agent-wallet"
 FAKE_URL, RELAY_URL = "http://127.0.0.1:8787", "ws://127.0.0.1:10547"
+BS_URL = "http://127.0.0.1:8788"        # fake Brainstorm (same fake_instance.py)
 
 sys.path.insert(0, MC)
 sys.path.insert(0, E2E)
@@ -113,15 +115,117 @@ def shot_bytes(img):
     return img if isinstance(img, (bytes, bytearray)) else getattr(img, "data", None) or img
 
 
+def accent_pills(data):
+    """The accent-gradient buttons ('Follow', 'Calculate my trust scores',
+    'Publish my Treasure Map') paint dark text on violet — OCR cannot read
+    them. Detect the pills by colour instead: connected blobs of ACCENT-ish
+    pixels, returned as [(cx, cy, w, h)]."""
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    w, h = im.size
+    cell = 4
+    px = im.load()
+    grid = set()
+    for gy in range(h // cell):
+        for gx in range(w // cell):
+            n = 0
+            for y in range(gy * cell, (gy + 1) * cell):
+                for x in range(gx * cell, (gx + 1) * cell):
+                    r, g, b = px[x, y][:3]
+                    # ACCENT violet, or the AMBER fill of 'Start a new
+                    # follow list' — both unreadable to OCR (dark text).
+                    if (0x60 <= r <= 0xb0 and 0x50 <= g <= 0xa0 and b >= 0xd0) or \
+                       (r >= 0xd0 and 0x90 <= g <= 0xd0 and b <= 0x90):
+                        n += 1
+            if n >= 8:
+                grid.add((gx, gy))
+    pills = []
+    while grid:
+        stack, comp = [grid.pop()], []
+        while stack:
+            c = stack.pop()
+            comp.append(c)
+            for dx_, dy_ in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nb = (c[0] + dx_, c[1] + dy_)
+                if nb in grid:
+                    grid.discard(nb)
+                    stack.append(nb)
+        xs = [c[0] for c in comp]
+        ys = [c[1] for c in comp]
+        x0, x1, y0, y1 = min(xs) * cell, (max(xs) + 1) * cell, min(ys) * cell, (max(ys) + 1) * cell
+        if x1 - x0 >= 30 and 15 <= y1 - y0 <= 60:   # a pill, not text glyphs
+            pills.append(((x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0))
+    return pills
+
+
+def ocr_phrase_pos(data, phrase):
+    """(x, y) of `phrase`'s first occurrence in the 2x OCR, or None."""
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(data)).convert("L")
+    im.resize((im.width * 2, im.height * 2), Image.LANCZOS).save("/tmp/ocr-pos.png")
+    tsv = subprocess.run(["tesseract", "/tmp/ocr-pos.png", "-", "--psm", "3", "tsv"],
+                         capture_output=True, text=True).stdout
+    lines = {}
+    for ln in tsv.splitlines()[1:]:
+        p = ln.split("\t")
+        if len(p) < 12 or not p[11].strip():
+            continue
+        lines.setdefault((p[2], p[3], p[4]), []).append(
+            (p[11], float(p[6]) + float(p[8]) / 2, float(p[7]) + float(p[9]) / 2))
+    needle = phrase.lower()
+    for ws in sorted(lines.values(), key=lambda ws: (min(w[2] for w in ws), min(w[1] for w in ws))):
+        joined = " ".join(w[0] for w in ws).lower()
+        i = joined.find(needle)
+        if i < 0:
+            continue
+        off, sel = 0, []
+        for w_, cx, cy in ws:
+            w0, w1 = off, off + len(w_)
+            off += len(w_) + 1
+            if w0 < i + len(needle) and w1 > i:
+                sel.append((cx, cy))
+        if sel:
+            return (sum(x for x, _ in sel) / len(sel) / 2,
+                    sum(y for _, y in sel) / len(sel) / 2)
+    return None
+
+
 class FineDriver(Driver):
-    """agent.Driver plus `click_fine`: click a sidebar phrase found by fine_lines."""
+    """agent.Driver plus `click_fine` (sidebar OCR) and `click_pill`
+    (accent buttons by colour — OCR cannot read their dark-on-violet text)."""
+
+    # Named rail targets -> window-local point. The box coordinates were
+    # measured on the suite's first build; the current rail puts the first
+    # avatar higher, which OmacDriver overrides below.
+    AVATARS = {"house": (34, 190), "claimant": (34, 245), "plus": (34, 300)}
 
     async def act(self, kind, arg):
+        if kind == "avatar":
+            await self.sb.mouse.click(*self.AVATARS[arg])
+            return None
         if kind == "stamp":     # remember when this point of the action ran
             self.scenario.stamps[arg] = time.time()
             return None
         if kind == "snap":      # a raw evidence frame between actions, no OCR
             return await self.scenario.snap(arg)
+        if kind == "click_pill":
+            # arg: an OCR anchor phrase (or its prefix): the accent pill
+            # nearest it — same row for "RECOMMENDED", below a step heading
+            # for the calc/publish buttons.
+            data = shot_bytes(await self.sb.screenshot())
+            pills = accent_pills(data)
+            if not pills:
+                raise RuntimeError("click_pill: no accent pill on screen")
+            pos = ocr_phrase_pos(data, arg)
+            if pos is None:
+                raise RuntimeError(f"click_pill: anchor {arg!r} not on screen")
+            ax, ay = pos
+            # Same-row anchors (the recommended row) beat vertical distance.
+            best = min(pills, key=lambda p: (abs(p[1] - ay) * 8) + abs(p[0] - ax))
+            await self.sb.mouse.click(best[0], best[1])
+            return f"click_pill near {arg!r} -> ({best[0]:.0f},{best[1]:.0f})"
         if kind != "click_fine":
             return await super().act(kind, arg)
         text = arg["text"] if isinstance(arg, dict) else arg
@@ -141,6 +245,7 @@ class Box:
         self.keys = keys
 
     def setup(self):
+        self.cdir = CDIR   # so collect() can address both targets uniformly
         dx(f"mkdir -p {CDIR}/rec {CDIR}/logs && chmod 700 {CDIR}")
         run(["docker", "cp", os.path.join(E2E, "fake_instance.py"), f"mc:{CDIR}/fake_instance.py"], check=True)
         if dx(f"test -x {CDIR}/nak").returncode != 0:
@@ -191,10 +296,11 @@ class Box:
     def app_alive(self):
         return dx("pgrep -x magic-carpet-ch").returncode == 0
 
-    def launch(self, name, run_id, target="fake", seed=False):
+    def launch(self, name, run_id, target="fake", seed=False, nsecs=None, extra_env=None):
         """Relaunch with a fresh MC_STORE_DIR. seed copies the demo store
         (/root/mc-store/accounts.json, which holds the claimant's Coinos
-        login) into it, container-internal, never read here."""
+        login) into it, container-internal, never read here. `nsecs` overrides
+        the default house+claimant pair (per-scenario throwaway keys)."""
         self.kill_app()
         store = f"/root/e2e-stores/{run_id}/{name}"
         dx(f"mkdir -p {shlex.quote(store)} && chmod 700 /root/e2e-stores {shlex.quote(store)}")
@@ -203,14 +309,15 @@ class Box:
         base, relay = (FAKE_URL, RELAY_URL) if target == "fake" else ("http://tapestry", "ws://tapestry/relay")
         env = dict(os.environ)
         env.update({
-            "MC_NSECS": f"{self.keys['house']['sec']},{self.keys['claimant']['sec']}",
+            "MC_NSECS": nsecs or f"{self.keys['house']['sec']},{self.keys['claimant']['sec']}",
             "MC_ISSUER_NPUB": self.keys["house"]["npub"], "MC_BASE_URL": base, "MC_RELAY_URL": relay,
             "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "DISPLAY": ":1", "RUST_BACKTRACE": "1",
         })
+        env.update(extra_env or {})
         env.pop("ANTHROPIC_API_KEY", None)
         dx(f"exec {APP_BIN} > {CDIR}/logs/{name}.app.log 2>&1", detach=True,
-           env_names=("MC_NSECS", "MC_ISSUER_NPUB", "MC_BASE_URL", "MC_RELAY_URL", "MC_STORE_DIR",
-                      "MC_SENTRY_DSN", "DISPLAY", "RUST_BACKTRACE"), env=env)
+           env_names=tuple(k for k in env if k.startswith("MC_") or k in ("DISPLAY", "RUST_BACKTRACE")),
+           env=env)
         wid = ""
         for _ in range(60):
             wid = dx("DISPLAY=:1 xdotool search --name 'Magic Carpet' | head -1").stdout.strip()
@@ -256,6 +363,277 @@ class Box:
             return int(json.loads(r.stdout.strip().splitlines()[-1])["balance_sats"])
         except (ValueError, KeyError, IndexError):
             return None
+
+
+# ============================================================== --target omac
+# The app runs as a local XWayland client (DISPLAY=:0, no WAYLAND_DISPLAY) so
+# xdotool reaches it exactly like on the box, window-targeted with --window.
+# Hyprland places/keeps it floating at 0,0 1280x960 via hl.dsp eval calls, so
+# window-local coordinates equal screen coordinates and the SIDEBAR/CONTENT
+# crops keep working. Screenshots are grim grabs of that exact region.
+#
+# Measured on omac (Hyprland 0.56.2, cua-driver 0.34.0):
+# - cua-driver background delivery refuses gpui (client_not_qualified) and
+#   every foreground action refuses with primary_target_busy — the app binds
+#   seat resources the Hyprland input-v3 plugin counts as busy (foot accepts
+#   the same calls).
+# - hl.dsp.send_shortcut and wtype deliver to foot but produce zero effect on
+#   the app, and Omarchy binds super+digit/bracket/n/r anyway.
+# - xdotool --window over XTEST is the reliable path (same as the box).
+
+def hy_eval(expr):
+    r = run(["hyprctl", "eval", expr], timeout=15)
+    return r.returncode == 0 and "error" not in (r.stdout + r.stderr)
+
+
+class _LocalShell:
+    async def run(self, cmd, timeout=60):
+        return run(["sh", "-c", cmd], timeout=timeout)
+
+
+class _XdotoolMouse:
+    """Sandbox mouse over xdotool --window (window-local pixels)."""
+    def __init__(self, sb):
+        self.sb = sb
+
+    async def click(self, x, y):
+        wid = self.sb.wid
+        run(["xdotool", "mousemove", "--window", str(wid), str(int(x)), str(int(y)),
+             "click", "1"], env={**os.environ, "DISPLAY": ":0"})
+
+    async def move(self, x, y):
+        run(["xdotool", "mousemove", "--window", str(self.sb.wid), str(int(x)), str(int(y))],
+            env={**os.environ, "DISPLAY": ":0"})
+
+
+class OmacSandbox:
+    """Drop-in for the box's cua Sandbox: screenshot/shell/mouse/disconnect."""
+
+    def __init__(self):
+        self.wid = 0
+        self.shell = _LocalShell()
+        self.mouse = _XdotoolMouse(self)
+
+    async def screenshot(self):
+        """PNG bytes of the app window: grim over its live hyprctl geometry."""
+        geo = run(["hyprctl", "clients", "-j"], timeout=10).stdout
+        at, size = (0, 0), (1280, 960)
+        for c in json.loads(geo):
+            if "Magic Carpet" in c.get("title", ""):
+                at, size = c["at"], c["size"]
+                break
+        png = f"/tmp/mc-e2e-shot-{os.getpid()}.png"
+        run(["grim", "-g", f"{at[0]},{at[1]} {size[0]}x{size[1]}", png], timeout=20)
+        data = open(png, "rb").read()
+        os.unlink(png)
+        return data
+
+    async def disconnect(self):
+        pass
+
+
+class OmacDriver(FineDriver):
+    """agent.Driver's kinds over local XWayland xdotool, window-targeted."""
+
+    # Measured on the current rail at 1280x960: first avatar ~y141, then
+    # one every ~54 px, "+" below the last account.
+    AVATARS = {"house": (35, 141), "claimant": (35, 195), "plus": (35, 250)}
+
+    async def x(self, cmd):
+        return await self.sb.shell.run(f"DISPLAY=:0 {cmd}", timeout=60)
+
+    async def act(self, kind, arg):
+        wid = self.sb.wid
+        if kind == "key":
+            await self.x(f"xdotool key --window {wid} --clearmodifiers {arg}")
+        elif kind == "type":
+            # --delay 40: at 20 gpui's masked input drops keystrokes on a
+            # 63-char nsec (measured; 45 worked, 40 keeps fields brisk).
+            await self.x(f"xdotool type --window {wid} --delay 40 " +
+                         json.dumps(agent.secret(arg) if arg.startswith("$") else arg))
+        elif kind == "focus":
+            # windowactivate is unreliable on rootless XWayland; the Hyprland
+            # focus dispatcher plus a pointer park does it.
+            addr = self.sb.addr
+            hy_eval(f'local w=hl.get_window("{addr}") hl.dispatch(hl.dsp.focus({{window=w}}))')
+            await self.x("xdotool mousemove 20 740")
+        else:
+            return await super().act(kind, arg)
+
+
+class OmacBox:
+    """Local twin of Box: fake server + relay + app + wf-recorder, all on
+    this host under /tmp/mc-e2e-work/<run-id> (mode 700)."""
+
+    def __init__(self, keys):
+        self.keys = keys
+        self.proc = None
+        self.addr = ""
+        self.sandbox = None       # set by Suite once the sandbox exists
+        self.fake_proc = None
+        self.relay_proc = None
+        self.rec_proc = None
+
+    def setup(self):
+        self.cdir = os.environ["MC_E2E_DIR"]
+        os.makedirs(os.path.join(self.cdir, "rec"), exist_ok=True)
+        os.makedirs(os.path.join(self.cdir, "logs"), exist_ok=True)
+        os.chmod(self.cdir, 0o700)
+
+    def app_version(self, app_bin):
+        r = run(["sh", "-c", f"strings {shlex.quote(app_bin)} | grep -m1 -oE 'magic-carpet-chat/[0-9]+\\.[0-9]+\\.[0-9]+(-rc[0-9]+)?'; "
+                             f"sha256sum {shlex.quote(app_bin)} | cut -c1-16"])
+        return " ".join(r.stdout.split())
+
+    # --- fake instance + Brainstorm + relay (fresh per scenario) ----------
+    def start_fake(self, mode):
+        self.stop_fake()
+        self.set_mode(mode)
+        open(os.path.join(self.cdir, "server.log"), "w").close()
+        env = {**os.environ, "E2E_DIR": self.cdir}
+        self.fake_proc = subprocess.Popen(
+            ["python3", os.path.join(E2E, "fake_instance.py")],
+            env=env, stdout=open(os.path.join(self.cdir, "fake.out"), "w"), stderr=subprocess.STDOUT)
+        self.relay_proc = subprocess.Popen(
+            ["nak", "serve", "--hostname", "127.0.0.1", "--port", "10547"],
+            stdout=open(os.path.join(self.cdir, "relay.log"), "w"), stderr=subprocess.STDOUT)
+        for _ in range(40):
+            if run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    f"{FAKE_URL}/api/bounties"], timeout=5).stdout.strip() == "200":
+                return
+            time.sleep(0.25)
+        raise RuntimeError("the fake instance did not come up")
+
+    def stop_fake(self):
+        run(["pkill", "-f", "fake_instance.py"])
+        run(["pkill", "-f", "nak serve"])
+        for p in (getattr(self, "fake_proc", None), getattr(self, "relay_proc", None)):
+            if p and p.poll() is None:
+                p.terminate()
+        self.fake_proc = self.relay_proc = None
+
+    def set_mode(self, mode):
+        full = {"create": "ok", "hang_secs": 45, "scan": "ok", "dup_coordinate": "",
+                "graperank": "ok", "setup": "ok", "delay_secs": 0}
+        full.update(mode)
+        tmp = os.path.join(self.cdir, "mode.tmp")
+        open(tmp, "w").write(json.dumps(full))
+        os.rename(tmp, os.path.join(self.cdir, "mode.json"))
+
+    def mark(self, text):
+        with open(os.path.join(self.cdir, "server.log"), "a") as f:
+            f.write("%.3f === %s\n" % (time.time(), text))
+
+    def server_log(self):
+        try:
+            return open(os.path.join(self.cdir, "server.log")).read()
+        except FileNotFoundError:
+            return ""
+
+    # --- the app -----------------------------------------------------------
+    def kill_app(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            for _ in range(20):
+                if self.proc.poll() is not None:
+                    break
+                time.sleep(0.25)
+            if self.proc.poll() is None:
+                self.proc.kill()
+        self.proc = None
+        run(["pkill", "-x", "magic-carpet-ch"])
+
+    def app_alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def launch(self, name, run_id, target="fake", seed=False, nsecs=None, extra_env=None, app_bin=None):
+        """Launch locally under XWayland with a fresh mode-0700 MC_STORE_DIR.
+        No seeded store exists on omac (seed is a no-op)."""
+        self.kill_app()
+        app_bin = app_bin or getattr(self, "app_bin", None)
+        store = os.path.join(self.cdir, "stores", name)
+        os.makedirs(store, exist_ok=True)
+        os.chmod(store, 0o700)
+        base, relay = (FAKE_URL, RELAY_URL) if target == "fake" else ("http://tapestry", "ws://tapestry/relay")
+        env = dict(os.environ)
+        env.update({
+            # XWayland: no WAYLAND_DISPLAY, so gpui takes the X11 backend and
+            # xdotool --window reaches it, bypassing the Hyprland super binds.
+            "DISPLAY": ":0",
+            "MC_NSECS": nsecs or f"{self.keys['house']['sec']},{self.keys['claimant']['sec']}",
+            "MC_ISSUER_NPUB": self.keys["house"]["npub"], "MC_BASE_URL": base, "MC_RELAY_URL": relay,
+            "MC_BRAINSTORM_URL": BS_URL, "MC_TRUST_RELAYS": relay,
+            "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "RUST_BACKTRACE": "1",
+        })
+        env.update(extra_env or {})
+        env.pop("WAYLAND_DISPLAY", None)
+        env.pop("ANTHROPIC_API_KEY", None)
+        logf = open(os.path.join(self.cdir, "logs", f"{name}.app.log"), "w")
+        self.proc = subprocess.Popen([app_bin], env=env, stdout=logf, stderr=subprocess.STDOUT)   # noqa: F821 -- set from argv
+        wid = ""
+        for _ in range(60):
+            r = run(["xdotool", "search", "--name", "Magic Carpet"],
+                    env={**os.environ, "DISPLAY": ":0"}, timeout=10)
+            wid = r.stdout.strip().splitlines()[:1]
+            if wid:
+                wid = wid[0]
+                break
+            time.sleep(0.5)
+        if not wid:
+            raise RuntimeError("the app window never appeared; see the app log")
+        self.wid = wid
+        # Float the window to 0,0 1280x960 so window-local == screen coords.
+        for _ in range(40):
+            addr = ""
+            for c in json.loads(run(["hyprctl", "clients", "-j"], timeout=10).stdout):
+                if c.get("pid") == self.proc.pid and "Magic Carpet" in c.get("title", ""):
+                    addr = c["address"]
+                    break
+            if addr:
+                break
+            time.sleep(0.25)
+        if not addr:
+            raise RuntimeError("hyprctl never saw the app window")
+        self.addr = addr
+        if self.sandbox is not None:
+            self.sandbox.wid, self.sandbox.addr = int(wid), addr
+        for expr in ('hl.dsp.window.float({action="set", window=w})',
+                     'hl.dsp.window.resize({x=1280,y=960,window=w})',
+                     'hl.dsp.window.move({x=0,y=0,window=w})'):
+            hy_eval(f'local w=hl.get_window("{addr}") hl.dispatch({expr})')
+        time.sleep(6)   # first bounty list, profile scans, relay connect
+        return store
+
+    def accounts_in_store(self, store):
+        r = run(["jq", ".accounts | length", os.path.join(store, "accounts.json")])
+        try:
+            return int(r.stdout.strip())
+        except ValueError:
+            return -1
+
+    # --- recording ---------------------------------------------------------
+    def rec_start(self, name):
+        self.rec_proc = subprocess.Popen(
+            ["wf-recorder", "-g", "0,0 1280x960", "-f",
+             os.path.join(self.cdir, "rec", f"{name}.mp4")],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def rec_stop(self, name):
+        if self.rec_proc and self.rec_proc.poll() is None:
+            self.rec_proc.send_signal(2)   # SIGINT finalizes the mp4's moov atom
+            try:
+                self.rec_proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.rec_proc.kill()
+        self.rec_proc = None
+
+    # --- clipboard (G) -----------------------------------------------------
+    def clipboard(self):
+        return run(["timeout", "5", "wl-paste"], timeout=10).stdout
+
+    # --- the float (P): no tapestry agent-wallet on omac -------------------
+    def float_sats(self):
+        return None
 
 
 class Scenario:
@@ -414,22 +792,36 @@ class Scenario:
 class Suite:
     def __init__(self, args):
         self.args = args
+        self.target = args.target
         self.run_id = args.run_id
-        self.out = os.path.join(E2E, "runs", self.run_id)
+        if self.target == "omac":
+            self.cdir = os.environ.get("MC_E2E_DIR", os.path.join("/tmp/mc-e2e-work", self.run_id))
+            os.environ["MC_E2E_DIR"] = self.cdir   # anything that reads it late sees the same dir
+            agent.E2E_DIR, agent.KEYS = self.cdir, os.path.join(OMAC_CONF, "keys.json")
+            self.keys_path = os.path.join(OMAC_CONF, "keys.json")
+            self.env_path = os.path.join(OMAC_CONF, ".env")
+            self.out = os.path.join("/tmp/mc-e2e", self.run_id)
+            self.app_bin = args.app_bin
+        else:
+            self.keys_path = KEYS
+            self.env_path = os.path.join(MC, ".env")
+            self.out = os.path.join(E2E, "runs", self.run_id)
+            self.app_bin = APP_BIN
         os.makedirs(self.out, exist_ok=True)
-        self.keys = json.load(open(KEYS))
-        self.secrets = [self.keys[w]["sec"] for w in ("house", "claimant")]
-        self.box = Box(self.keys)
+        self.keys = json.load(open(self.keys_path))
+        self.secrets = [self.keys[w]["sec"] for w in ("house", "claimant") if w in self.keys]
+        self.box = OmacBox(self.keys) if self.target == "omac" else Box(self.keys)
         self.results = []
 
     async def run(self, registry):
-        load_env(os.path.join(MC, ".env"))
+        load_env(self.env_path)
         if self.args.mock_jev:
             os.environ.pop("TYPESAFE_API_KEY", None)
         self.jev = Jev()
         wanted = [s.strip().upper() for s in self.args.only.split(",")] if self.args.only else list(registry)
-        paid = "P" in wanted and not self.args.no_paid
-        meta = {"run_id": self.run_id, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        paid = "P" in wanted and not self.args.no_paid and self.target == "box"
+        meta = {"run_id": self.run_id, "target": self.target,
+                "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "jev": "live" if self.jev.live else "mock", "paid": paid}
         self.meta = meta
         if paid:
@@ -442,23 +834,48 @@ class Suite:
                 self.write(meta)
                 return 3
         self.box.setup()
-        if dx(f"test -x {APP_BIN}").returncode != 0:
-            print(f"no e2e binary at {APP_BIN}; install one with run.sh <run-id|path>", flush=True)
-            meta["stopped"] = f"no binary at {APP_BIN}"
-            self.write(meta)
-            return 2
-        meta["app"] = self.box.app_version()
+        if self.target == "omac":
+            if not self.app_bin or not os.path.exists(self.app_bin):
+                print("no app binary given/existing: run.sh --target omac <binary>", flush=True)
+                meta["stopped"] = "no app binary"
+                self.write(meta)
+                return 2
+            meta["app"] = self.box.app_version(self.app_bin)
+            self.sb = OmacSandbox()
+            self.box.sandbox = self.sb
+            self.box.app_bin = self.app_bin
+            self.driver = OmacDriver(self.sb)
+        else:
+            if dx(f"test -x {APP_BIN}").returncode != 0:
+                print(f"no e2e binary at {APP_BIN}; install one with run.sh <run-id|path>", flush=True)
+                meta["stopped"] = f"no binary at {APP_BIN}"
+                self.write(meta)
+                return 2
+            meta["app"] = self.box.app_version()
+            from cua import Sandbox
+            self.sb = await Sandbox.connect("mc", http_url=f"http://{agent.IP}:8000")
+            self.driver = FineDriver(self.sb)
         print(f"suite {self.run_id}: app {meta['app']}, jev {meta['jev']}, paid {paid}", flush=True)
-        from cua import Sandbox
-        self.sb = await Sandbox.connect("mc", http_url=f"http://{agent.IP}:8000")
-        self.driver = FineDriver(self.sb)
         try:
             for sid, (title, fn) in registry.items():
                 if sid not in wanted:
                     continue
+                if sid == "P" and self.target == "omac":
+                    self.results.append({"scenario": sid, "title": title, "result": "SKIP",
+                                         "why": "needs the real instance and its float", "duration_s": 0,
+                                         "evidence": "", "judge": [], "checks": []})
+                    continue
                 if sid == "P" and not paid:
                     self.results.append({"scenario": sid, "title": title, "result": "SKIP",
                                          "why": "--no-paid", "duration_s": 0, "evidence": "", "judge": [], "checks": []})
+                    continue
+                if sid == "H" and self.target == "omac":
+                    # No seeded demo store with the claimant's Coinos login on
+                    # omac: the sats-left check cannot run. BLOCKED, not FAIL.
+                    self.results.append({"scenario": sid, "title": title, "result": "BLOCKED",
+                                         "why": "no seeded Coinos login for the claimant on omac; "
+                                                "fund the claimant's Coinos wallet to run H",
+                                         "duration_s": 0, "evidence": "", "judge": [], "checks": []})
                     continue
                 self.results.append(await self.one(sid, title, fn))
                 self.write(meta)
@@ -466,13 +883,18 @@ class Suite:
             await self.sb.disconnect()
             self.box.kill_app()
             self.box.stop_fake()
-            # The stores hold copies of keys.json's nsecs. The box rule is
-            # "mv to ~/.trash, never delete": into root's 0700 trash they go.
-            run_dir = shlex.quote(f"/root/e2e-stores/{self.run_id}")
-            dx(f"mkdir -p /root/.trash/e2e-stores && chmod 700 /root/.trash /root/.trash/e2e-stores && "
-               f"test -d {run_dir} && mv {run_dir} /root/.trash/e2e-stores/; true")
-            if not self.args.no_restore:
-                run([os.path.join(MC, "run-app.sh")], timeout=90)   # leave the demo desktop as it was
+            if self.target == "omac":
+                # The stores hold nsec copies; the suite created them under
+                # /tmp, so plain removal is the rule here.
+                run(["rm", "-rf", self.cdir])
+            else:
+                # The stores hold copies of keys.json's nsecs. The box rule is
+                # "mv to ~/.trash, never delete": into root's 0700 trash they go.
+                run_dir = shlex.quote(f"/root/e2e-stores/{self.run_id}")
+                dx(f"mkdir -p /root/.trash/e2e-stores && chmod 700 /root/.trash /root/.trash/e2e-stores && "
+                   f"test -d {run_dir} && mv {run_dir} /root/.trash/e2e-stores/; true")
+                if not self.args.no_restore:
+                    run([os.path.join(MC, "run-app.sh")], timeout=90)   # leave the demo desktop as it was
         meta["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         self.write(meta)
         return 0 if all(r["result"] != "FAIL" for r in self.results) else 1
@@ -528,10 +950,16 @@ class Suite:
 
     def collect(self, sid):
         d = os.path.join(self.out, sid)
-        for src, dst in ((f"{CDIR}/rec/{sid}.mp4", f"{sid}.mp4"), (f"{CDIR}/logs/{sid}.app.log", "app.log"),
-                         (f"{CDIR}/server.log", "fake-server.log")):
+        for src, dst in ((f"{self.box.cdir}/rec/{sid}.mp4", f"{sid}.mp4"), (f"{self.box.cdir}/logs/{sid}.app.log", "app.log"),
+                         (f"{self.box.cdir}/server.log", "fake-server.log")):
             p = os.path.join(d, dst)
-            run(["docker", "cp", f"mc:{src}", p])
+            if self.target == "omac":
+                try:
+                    shutil.copy2(src, p)
+                except FileNotFoundError:
+                    continue
+            else:
+                run(["docker", "cp", f"mc:{src}", p])
             if dst.endswith(".log") and os.path.exists(p):
                 txt = open(p, errors="replace").read()
                 open(p, "w").write(redact(txt, self.secrets))
@@ -550,7 +978,8 @@ class Suite:
                         f"{met}/{len(r['judge'])} | {ok}/{len(r['checks'])}{' — ' + extra if extra else ''} | "
                         f"{r['evidence']}/ |")
         head = [f"# magic-carpet-chat e2e run {meta['run_id']}", "",
-                f"App: `{meta.get('app', '?')}` · Jev: {meta['jev']} · paid scenario: {meta['paid']}"]
+                f"Target: {meta.get('target', 'box')} · App: `{meta.get('app', '?')}` · Jev: {meta['jev']} · "
+                f"paid scenario: {meta['paid']}"]
         if "float_before" in meta or "float_after" in meta:
             head.append(f"Float: {meta.get('float_before')} sats before, {meta.get('float_after')} sats after")
         if meta.get("stopped"):
@@ -575,10 +1004,14 @@ def _quiet_agent_log():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", default=time.strftime("%Y%m%d-%H%M%S"))
+    ap.add_argument("--target", choices=["box", "omac"], default="box",
+                    help="box: the exe.dev sandbox over the cua API; "
+                         "omac: this machine, app on XWayland, xdotool + grim")
+    ap.add_argument("--app-bin", default="", help="omac only: path to the binary under test")
     ap.add_argument("--no-paid", action="store_true", help="development only: skip scenario P")
     ap.add_argument("--only", default="", help="comma list of scenario ids, e.g. A,G")
     ap.add_argument("--mock-jev", action="store_true", help="development only: no TypeSafe calls")
-    ap.add_argument("--no-restore", action="store_true", help="do not relaunch run-app.sh at the end")
+    ap.add_argument("--no-restore", action="store_true", help="box only: do not relaunch run-app.sh at the end")
     args = ap.parse_args()
     _quiet_agent_log()
     from scenarios import SCENARIOS
