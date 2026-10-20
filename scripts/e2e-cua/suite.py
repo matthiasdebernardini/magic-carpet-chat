@@ -313,6 +313,10 @@ class Box:
             "MC_ISSUER_NPUB": self.keys["house"]["npub"], "MC_BASE_URL": base, "MC_RELAY_URL": relay,
             "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "DISPLAY": ":1", "RUST_BACKTRACE": "1",
         })
+        if target == "fake":
+            # Not for "instance": a new account's kind-0 goes to the
+            # MC_TRUST_RELAYS set when it is set, and must reach public relays.
+            env.update({"MC_BRAINSTORM_URL": BS_URL, "MC_TRUST_RELAYS": relay})
         env.update(extra_env or {})
         env.pop("ANTHROPIC_API_KEY", None)
         dx(f"exec {APP_BIN} > {CDIR}/logs/{name}.app.log 2>&1", detach=True,
@@ -337,6 +341,15 @@ class Box:
         except ValueError:
             return -1
 
+    def wallet_accounts_in_store(self, store):
+        """Accounts the app created itself, with a Coinos wallet stored.
+        jq prints the count only; the logins stay in the container."""
+        r = dx(f"jq '[.accounts[] | select(.created_in_app == true and .coinos != null)] | length' {store}/accounts.json")
+        try:
+            return int(r.stdout.strip())
+        except ValueError:
+            return -1
+
     # --- recording --------------------------------------------------------
     def rec_start(self, name):
         dx(f"exec ffmpeg -y -loglevel error -f x11grab -video_size 1280x960 -framerate 10 -i :1 "
@@ -355,6 +368,22 @@ class Box:
         """The X11 CLIPBOARD selection. Stays in memory; callers only derive
         booleans and an 8-character prefix from it."""
         return dx("DISPLAY=:1 timeout 5 xclip -o -selection clipboard 2>/dev/null").stdout
+
+    # --- nak and the fake Brainstorm: inside the container, where they run ---
+    def nak(self, args, input=None, sec=None):
+        """(returncode, stdout) of nak in the container. A "$NAK_SEC" argument
+        expands to `sec` from the environment, so the key never sits in a
+        script string."""
+        line = " ".join(a if a == "$NAK_SEC" else shlex.quote(a) for a in args)
+        env = dict(os.environ, NAK_SEC=sec) if sec else None
+        r = dx(f"{CDIR}/nak {line}", input=input, env_names=("NAK_SEC",) if sec else (), env=env, timeout=30)
+        return r.returncode, r.stdout
+
+    def bs_get(self, path):
+        r = dx(f"curl -sf {BS_URL}{path}", timeout=15)
+        if r.returncode != 0:
+            raise RuntimeError(f"GET {path} failed (curl {r.returncode})")
+        return r.stdout
 
     # --- the float (P) ----------------------------------------------------
     def float_sats(self):
@@ -562,9 +591,10 @@ class OmacBox:
             "DISPLAY": ":0",
             "MC_NSECS": nsecs or f"{self.keys['house']['sec']},{self.keys['claimant']['sec']}",
             "MC_ISSUER_NPUB": self.keys["house"]["npub"], "MC_BASE_URL": base, "MC_RELAY_URL": relay,
-            "MC_BRAINSTORM_URL": BS_URL, "MC_TRUST_RELAYS": relay,
             "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "RUST_BACKTRACE": "1",
         })
+        if target == "fake":
+            env.update({"MC_BRAINSTORM_URL": BS_URL, "MC_TRUST_RELAYS": relay})
         env.update(extra_env or {})
         env.pop("WAYLAND_DISPLAY", None)
         env.pop("ANTHROPIC_API_KEY", None)
@@ -630,6 +660,16 @@ class OmacBox:
     # --- clipboard (G) -----------------------------------------------------
     def clipboard(self):
         return run(["timeout", "5", "wl-paste"], timeout=10).stdout
+
+    # --- nak and the fake Brainstorm: host-local on omac ------------------
+    def nak(self, args, input=None, sec=None):
+        args = [sec if a == "$NAK_SEC" else a for a in args]
+        r = run(["nak", *args], input=input, timeout=30)
+        return r.returncode, r.stdout
+
+    def bs_get(self, path):
+        import urllib.request
+        return urllib.request.urlopen(f"{BS_URL}{path}", timeout=10).read().decode()
 
     # --- the float (P): no tapestry agent-wallet on omac -------------------
     def float_sats(self):
@@ -711,7 +751,7 @@ class Scenario:
             p_pick, p_abst = probs.get(pick, conf), probs.get("abstain", 0.0)
             weak = c is not None and c.id != "already-done" and (p_pick < min_conf or p_abst >= 0.3)
             if c is None or c.id == "abstain" or weak:
-                rec["halt"] = "unknown id" if c is None else ("weak " + c.id if weak else c.id)
+                rec["halt"] = "unknown id" if c is None else (f"weak {c.id} (p={p_pick:.2f}, abstain={p_abst:.2f})" if weak else c.id)
                 break
             for kind, arg in c.do:
                 try:
@@ -785,6 +825,18 @@ class Scenario:
         idx = max((i for i, l in enumerate(lines) if l.split(" ", 1)[-1] == f"=== {marker}"), default=-1)
         return [l.split(" ", 1)[-1] for l in lines[idx + 1:]]
 
+    def accept_step(self, label, reason):
+        """A hard check settles a step the judge called unmet: mark the latest
+        unmet record with that label, keeping its p and picks as they were."""
+        rec = next((r for r in reversed(self.steps) if r["step"] == label and not r["met"]), None)
+        if rec is None:
+            return
+        if "act_errors" in rec:
+            print(f"  [{self.sid}] step '{label}' not accepted: actions raised", flush=True)
+            return
+        rec["met"], rec["override"] = True, reason
+        print(f"  [{self.sid}] step '{label}' accepted by hard check: {reason}", flush=True)
+
     def skip(self, why):
         self.skip_reason = why
 
@@ -819,7 +871,7 @@ class Suite:
             os.environ.pop("TYPESAFE_API_KEY", None)
         self.jev = Jev()
         wanted = [s.strip().upper() for s in self.args.only.split(",")] if self.args.only else list(registry)
-        paid = "P" in wanted and not self.args.no_paid and self.target == "box"
+        paid = ("P" in wanted or "R" in wanted) and not self.args.no_paid and self.target == "box"
         meta = {"run_id": self.run_id, "target": self.target,
                 "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "jev": "live" if self.jev.live else "mock", "paid": paid}
@@ -827,10 +879,11 @@ class Suite:
         if paid:
             bal = self.box.float_sats()
             meta["float_before_suite"] = bal
-            if bal is None or bal < 200:
-                print(f"PREFLIGHT: the auto-pay float is {bal} sats, below 200. "
+            need = 352 if "P" in wanted and "R" in wanted else 250 if "R" in wanted else 200   # R pays two newcomers
+            if bal is None or bal < need:
+                print(f"PREFLIGHT: the auto-pay float is {bal} sats, below {need}. "
                       f"Stopping. fund with ~/mc/fund.sh 500", flush=True)
-                meta["stopped"] = "float below 200 sats"
+                meta["stopped"] = f"float below {need} sats"
                 self.write(meta)
                 return 3
         self.box.setup()
@@ -860,12 +913,17 @@ class Suite:
             for sid, (title, fn) in registry.items():
                 if sid not in wanted:
                     continue
+                if sid == "R" and self.target == "omac":
+                    self.results.append({"scenario": sid, "title": title, "result": "BLOCKED",
+                                         "why": "needs the real instance and live Coinos",
+                                         "duration_s": 0, "evidence": "", "judge": [], "checks": []})
+                    continue
                 if sid == "P" and self.target == "omac":
                     self.results.append({"scenario": sid, "title": title, "result": "SKIP",
                                          "why": "needs the real instance and its float", "duration_s": 0,
                                          "evidence": "", "judge": [], "checks": []})
                     continue
-                if sid == "P" and not paid:
+                if sid in ("P", "R") and not paid:
                     self.results.append({"scenario": sid, "title": title, "result": "SKIP",
                                          "why": "--no-paid", "duration_s": 0, "evidence": "", "judge": [], "checks": []})
                     continue
@@ -938,7 +996,8 @@ class Suite:
         r = {"scenario": sid, "title": title, "result": result, "duration_s": round(time.time() - t0, 1),
              "evidence": os.path.relpath(sc.dir, self.out), "recording": f"{sid}/{sid}.mp4",
              "judge": [{"step": s["step"], "cond": s["cond"], "picks": s["picks"], "p": s["p"],
-                        "met": s["met"], **({"halt": s["halt"]} if "halt" in s else {}),
+                        "met": s["met"], **({"override": s["override"]} if "override" in s else {}),
+                        **({"halt": s["halt"]} if "halt" in s else {}),
                         **({"act_errors": s["act_errors"]} if "act_errors" in s else {})} for s in judged],
              "checks": sc.checks, "notes": sc.notes}
         if err:
@@ -974,14 +1033,18 @@ class Suite:
             ok = sum(1 for c in r["checks"] if c["ok"])
             fails = "; ".join(c["check"] for c in r["checks"] if not c["ok"])
             extra = r.get("error") or r.get("why") or (f"failed: {fails}" if fails else "")
+            n_over = sum(1 for s in r["judge"] if "override" in s)
+            by_check = f" ({n_over} by hard check)" if n_over else ""
             rows.append(f"| {r['scenario']} {r['title']} | **{r['result']}** | {r['duration_s']} s | "
-                        f"{met}/{len(r['judge'])} | {ok}/{len(r['checks'])}{' — ' + extra if extra else ''} | "
+                        f"{met}/{len(r['judge'])}{by_check} | {ok}/{len(r['checks'])}{' — ' + extra if extra else ''} | "
                         f"{r['evidence']}/ |")
         head = [f"# magic-carpet-chat e2e run {meta['run_id']}", "",
                 f"Target: {meta.get('target', 'box')} · App: `{meta.get('app', '?')}` · Jev: {meta['jev']} · "
                 f"paid scenario: {meta['paid']}"]
         if "float_before" in meta or "float_after" in meta:
             head.append(f"Float: {meta.get('float_before')} sats before, {meta.get('float_after')} sats after")
+        if "float_before_r" in meta or "float_after_r" in meta:
+            head.append(f"Float (R): {meta.get('float_before_r')} sats before, {meta.get('float_after_r')} sats after")
         if meta.get("stopped"):
             head.append(f"STOPPED: {meta['stopped']} (fund with ~/mc/fund.sh 500)")
         open(os.path.join(self.out, "report.md"), "w").write("\n".join(head + [""] + rows) + "\n")
@@ -1008,7 +1071,7 @@ def main():
                     help="box: the exe.dev sandbox over the cua API; "
                          "omac: this machine, app on XWayland, xdotool + grim")
     ap.add_argument("--app-bin", default="", help="omac only: path to the binary under test")
-    ap.add_argument("--no-paid", action="store_true", help="development only: skip scenario P")
+    ap.add_argument("--no-paid", action="store_true", help="development only: skip P and R")
     ap.add_argument("--only", default="", help="comma list of scenario ids, e.g. A,G")
     ap.add_argument("--mock-jev", action="store_true", help="development only: no TypeSafe calls")
     ap.add_argument("--no-restore", action="store_true", help="box only: do not relaunch run-app.sh at the end")

@@ -7,7 +7,7 @@ sc.check / check_screen  hard checks; every scenario needs at least one
 sc.log_after(marker)     fake-server log lines after sc.box.mark(marker)
 
 Candidate actions are complete; none of them may create a wallet, remove an
-account for real, or publish anywhere but the fake server (P excepted).
+account for real, or publish anywhere but the fake server (P and R excepted).
 """
 import asyncio, os, time
 from agent import Step, Cand
@@ -78,19 +78,20 @@ async def scenario_a(sc):
               "Fill and submit the form, then press super+], click the '+' in the rail, click 'Remove this account' then 'Click again to remove' in the sidebar, then press Escape.",
               fill("hang-city").do + [
                   ("wait", 1.5), ("snap", "submitted"),
-                  ("key", "super+bracketright"), ("wait", 0.8), ("snap", "after super+]"),
-                  ("avatar", "plus"), ("wait", 0.8), PARK, ("snap", "after plus"),
-                  ("click_fine", "Remove this account"), ("wait", 0.8), ("click_fine", "Click again to remove"), ("wait", 0.8), PARK,
+                  ("key", "super+bracketright"), ("wait", 0.5), ("snap", "after super+]"),
+                  ("avatar", "plus"), ("wait", 0.5), PARK, ("snap", "after plus"),
+                  ("click", REMOVE_LINK_XY), ("wait", 0.5), ("click", REMOVE_LINK_XY), ("wait", 0.5), PARK,
                   ("snap", "after remove x2"),
-                  ("key", "Escape"), ("stamp", "attempts done"), ("wait", 0.8)])],
+                  ("key", "Escape"), ("stamp", "attempts done"), ("wait", 0.5)])],
         "The bounty form is still open and still reads 'Publishing…'; the header button still reads 'New DList + bounty' (the house is still selected); no account setup screen.",
         tries=1, settle=0.5, cues=("Publishing", "New DList + bounty", "Submit a bounty claim", "Your Nostr account")),
         must_act=True, label="submit and in-flight attempts", second_look=False)   # a later look would be past the timeout
     t_submit = sc.stamps.get("submitted", time.time())
     done_at = sc.stamps.get("attempts done", time.time())
     sc.check("the attempts ran inside the client timeout", done_at - t_submit < 18, f"{done_at - t_submit:.1f} s after submit")
-    sc.check_screen("switch, setup, remove and esc all refused",
-                    ["Publishing", "Cancel (esc)", "New DList + bounty"], ["Submit a bounty claim", "Your Nostr account"])
+    if sc.check_screen("switch, setup, remove and esc all refused",
+                       ["Publishing", "Cancel (esc)", "New DList + bounty"], ["Submit a bounty claim", "Your Nostr account"]):
+        sc.accept_step("submit and in-flight attempts", "Publishing, Cancel (esc) and New DList + bounty on screen after the attempts")
     # The client timeout is 20 s; give it 26 from the submit.
     await asyncio.sleep(max(0, t_submit + 26 - time.time()))
     # After the timeout the form reads "Checking the list…" until the
@@ -153,8 +154,13 @@ async def scenario_d(sc):
     if not await open_house_form(sc):
         return
     sc.box.mark("D submit")
-    await submit_form(sc, "dup-city", "The form shows 'This list already has an open bounty. Pick it from the list instead.'",
-                      ("already has an open bounty", "Publishing"))
+    # Driven directly: the dup mode already lists dup-city, so the judge half
+    # believes a fill step is done and its pick comes back weak.
+    for kind, arg in fill("dup-city").do:
+        await sc.suite.driver.act(kind, arg)
+    await sc.step(Step("Wait for the form's answer to the duplicate.", [Cand("wait", "Wait 2 seconds.", [("wait", 2)])],
+                       "The form shows 'This list already has an open bounty. Pick it from the list instead.'",
+                       tries=2, settle=1, cues=("already has an open bounty", "Publishing")), label="dup answer")
     await asyncio.sleep(2)
     await sc.see("after dup submit")
     sc.check_screen("duplicate refused in the form", ["already has an open bounty"])
@@ -222,6 +228,7 @@ async def scenario_f(sc):
 
 # ---------------------------------------------------------------- G
 CHIP_XY = (135, 116)  # the account name at the top of the sidebar
+REMOVE_LINK_XY = (143, 155)  # "Remove this account" under the chip (window at 0,0, 1280x960); fixed, so no OCR pass
 IDENTITY = Step("Open the Identity & keys tab of the active account's page.",
                 [Cand("chip-then-identity", "Click the account name at the top of the sidebar (opens the account page), then click the 'Identity & keys' tab.",
                       [FOCUS, ("click", CHIP_XY), ("wait", 1.5), PARK, ("click_text", "Identity"), ("wait", 1), PARK])],
@@ -381,42 +388,205 @@ def has_failed(screen):
     return "auto-pay failed" in screen.lower()
 
 
+# ---------------------------------------------------------------- R (paid)
+# Rail slots on the box with the house first: the 2nd avatar slot is also
+# where "+" sits while only the house exists; the 3rd is "+" with two accounts.
+SLOT2, SLOT3 = ("avatar", "claimant"), ("avatar", "plus")
+
+
+def create_account(who, stamp, plus):
+    """Steps that add one app-made account (and its Coinos wallet) and leave
+    account setup by the Dashboard. `plus` is the "+" click for this rail."""
+    name = f"E2E Newcomer {who} {stamp}"
+    return [
+        Step(f"Open account setup from the '+' in the left rail and choose 'Create a new account' for newcomer {who}.",
+             [Cand("plus-then-create", "Click the '+' in the left rail, then the 'Create a new account' button.",
+                   [FOCUS, plus, ("wait", 1.5), PARK, ("click_text", "Create a new account"), ("wait", 1), PARK])],
+             "The 'Create a new account' card is open with a 'Name (optional)' input and a 'Create — Enter' button.",
+             tries=1, settle=1, cues=("Name (optional)", "Create — Enter", "Create a new account", "I already have a key")),
+        # tries=1: a second Enter would be a second account and wallet.
+        Step(f"Type the name '{name}' and create the account.",
+             [Cand("name-then-enter", "Type the name (the input is already focused), then press Enter.",
+                   [FOCUS, ("type", name), ("wait", 0.4), ("key", "Return"), ("wait", 1)]),
+              Cand("name-then-button", "Type the name (the input is already focused), then click 'Create — Enter'.",
+                   [FOCUS, ("type", name), ("wait", 0.4), ("click_text", "Create — Enter"), ("wait", 1)])],
+             "The account is being created, or the ready panel shows 'Coinos wallet ready'.",
+             tries=1, settle=10, cues=("Coinos wallet ready", "Creating", "Create — Enter", "Couldn't")),
+    ]
+
+
+async def newcomer(sc, who, stamp, plus):
+    steps = create_account(who, stamp, plus)
+    if not await sc.step(steps[0], must_act=True, label=f"newcomer {who} setup"):
+        return False
+    if not await sc.step(steps[1], must_act=True, label=f"newcomer {who} create"):
+        return False
+    # Live coinos.io plus a kind-0 publish: allow a minute.
+    screen = await sc.wait_for(["Coinos wallet ready"], ["failed"], timeout=60, every=4, label=f"newcomer {who} wallet")
+    if not sc.check_screen(f"newcomer {who}: Coinos wallet ready", ["Coinos wallet ready"], ["failed"], screen=screen):
+        return False
+    # Driven directly: the judge kept re-observing instead of pressing Enter.
+    # The ready panel's Dashboard button is below the fold at 1280x960; Enter
+    # leaves setup once the account is ready.
+    for kind, arg in (FOCUS, ("key", "Return"), ("wait", 1.5)):
+        await sc.suite.driver.act(kind, arg)
+    label = f"newcomer {who} dashboard"
+    met = await sc.step(Step("Confirm the Dashboard is shown.", [Cand("wait", "Wait 2 seconds.", [("wait", 2)])],
+                             "The Dashboard is shown with a 'Recent activity' panel and the sidebar.",
+                             tries=2, settle=1, cues=("Recent activity", "Dashboard", "Coinos wallet ready")), label=label)
+    # The Dashboard also says "Coinos wallet ready: ..." in Needs attention;
+    # only the ready panel has the Copy password button.
+    if not sc.check_screen(f"newcomer {who}: back on the Dashboard", ["Recent activity"], ["Copy password"]):
+        return False
+    if not met:
+        sc.accept_step(label, "Recent activity on screen, ready panel gone")
+    return True
+
+
+async def scenario_r(sc):
+    """Two brand-new accounts made in the app each claim one bounty seat on the
+    same list (cap 200, reward 100) and both get auto-paid. Never retried."""
+    # Depends on the box instance's trust-gate bypass (NODE_ENV=development,
+    # DEV_SKIP_TRUST_CHECK=true): with the gate on, brand-new keys never get paid.
+    stamp = sc.suite.run_id.replace("-", "")[-10:]
+    name = f"e2e-new-{stamp}"
+    meta = sc.suite.meta
+    meta["float_before_r"] = sc.box.float_sats()
+    if not sc.check("float at least 250 sats (two payouts plus fees)", (meta["float_before_r"] or 0) >= 250, f"{meta['float_before_r']} sats"):
+        return
+    # Only the house starts in the store; the newcomers are made in the app.
+    store = sc.box.launch("R", sc.suite.run_id, target="instance", seed=False, nsecs=sc.box.keys["house"]["sec"])
+    try:
+        await newcomers_flow(sc, name, stamp, store)
+    finally:
+        meta["float_after_r"] = sc.box.float_sats()
+        spent = (meta["float_before_r"] or 0) - (meta["float_after_r"] or 0)
+        sc.check("float dropped by two payouts, not more", 150 < spent <= 300, f"{meta['float_before_r']} -> {meta['float_after_r']} sats")
+
+
+async def newcomers_flow(sc, name, stamp, store):
+    import dataclasses, importlib
+    import demo_settled
+    replace = dataclasses.replace
+    if not await newcomer(sc, "A", stamp, SLOT2):
+        return
+    if not await newcomer(sc, "B", stamp, SLOT3):
+        return
+    sc.check("house plus two app-made accounts with Coinos wallets",
+             sc.box.accounts_in_store(store) == 3 and sc.box.wallet_accounts_in_store(store) == 2,
+             f"{sc.box.accounts_in_store(store)} accounts, {sc.box.wallet_accounts_in_store(store)} app-made with a wallet")
+    # The house issues one bounty that pays two claims, then closes.
+    os.environ["LIST_NAME"], os.environ["CLAIM_ITEM"] = name, f"E2E Newcomer A {stamp}"
+    import demo_bounty, demo_claim
+    for m in (demo_bounty, demo_claim):
+        importlib.reload(m)   # they read LIST_NAME / CLAIM_ITEM at import
+    b = demo_bounty.STEPS
+    if not await sc.step(Step("Show the Bounties screen with the house issuer selected (its header button reads 'New DList + bounty').",
+                              [HOUSE, BOUNTIES], "The Bounties screen is shown and its header button reads 'New DList + bounty'.",
+                              settle=2, cues=HOUSE_CUES), must_act=True, label="house on bounties"):
+        return
+    if not sc.check_screen("house selected", ["New DList + bounty"], ["Submit a bounty claim"]):
+        return
+    if not await sc.steps_(b[:3]):
+        return
+    # Gate: FILL ends in Enter, which in a claim form would claim and pay.
+    if not sc.check_screen("the house's New DList + bounty form is open", ["New DList + bounty", "Cancel (esc)"],
+                           ["Claim an item on", "Submit a bounty claim"]):
+        await sc.suite.driver.act("key", "Escape")
+        return
+    # cap 200 = two payouts of 100; tries=1: a retried Enter is a second bounty.
+    publish = replace(b[3], tries=1, cands=[fill(name, cap="200")] + b[3].cands[1:])
+    if not await sc.step(publish, must_act=True, label="publish bounty"):
+        return
+    await sc.wait_for(["Auto-pay armed"], timeout=20, every=3, label="auto-pay armed")
+    if not sc.check_screen("auto-pay armed on the new bounty", ["Auto-pay armed"]):
+        return
+    for who, slot in (("A", SLOT2), ("B", SLOT3)):
+        item = f"E2E Newcomer {who} {stamp}"
+        os.environ["CLAIM_ITEM"] = item
+        importlib.reload(demo_claim)
+        c = demo_claim.ALL
+        # Pick the newcomer by rail slot: demo_claim's own select step names
+        # the second avatar only, which is A.
+        select = Step(f"Select newcomer {who} in the left rail and show Bounties (the header button reads 'Submit a bounty claim').",
+                      [Cand(f"newcomer-{who}-avatar", f"Click newcomer {who}'s avatar in the left rail, then press super+2 for Bounties.",
+                            [FOCUS, slot, ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])],
+                      "The Bounties header button reads 'Submit a bounty claim'.", settle=3,
+                      cues=("Submit a bounty claim", "New DList + bounty"))
+        if not await sc.step(select, must_act=True, label=f"select newcomer {who}"):
+            return
+        # Gate on the sidebar's account name (the main pane also lists A's
+        # claim on B's turn, so only the sidebar OCR pass is read for names).
+        other = "B" if who == "A" else "A"
+        sidebar = sc.screen.split("\n[sidebar]\n")[-1] if "\n[sidebar]\n" in sc.screen else ""
+        ok = sc.check_screen(f"newcomer {who} selected (header)", ["Submit a bounty claim"], ["New DList + bounty"])
+        ok = sc.check_screen(f"newcomer {who} selected (sidebar name)", [item], [f"E2E Newcomer {other} {stamp}"], screen=sidebar) and ok
+        if not ok:
+            await sc.suite.driver.act("key", "Escape")
+            return
+        # Baseline from the Bounties pane, before the claim form can hide A's card.
+        n_settled = sc.count("Payment settled")
+        if not await sc.step(c[1], label=f"open claim form {who}"):
+            return
+        # Gate: the claim form must be on this run's bounty, or we'd pay another one.
+        if not sc.check_screen(f"newcomer {who}: claim form is on this run's bounty", [f"Claim an item on {name}"]):
+            await sc.suite.driver.act("key", "Escape")
+            sc.notes.append(f"claim form for {who} was not on this run's bounty; cancelled, nothing claimed")
+            return
+        # tries=1: a second submit is a second payout.
+        # The pane lists every claim, so A's settled card is on screen when B
+        # acts: count occurrences against what was there before this submit.
+        if not await sc.step(replace(c[2], tries=1), must_act=True, label=f"submit claim {who}"):
+            return
+        await sc.step(replace(c[3], tries=6), label=f"wait for settlement {who}")
+        screen = await sc.wait_for(["Payment settled", "Payment receipt"], ["Auto-pay failed"], timeout=150, every=10, label=f"settle poll {who}")
+        if has_failed(screen):
+            sc.notes.append(f"Auto-pay failed on newcomer {who}'s claim card; not retried, not reset")
+        await sc.step(demo_settled.STEPS[0], label=f"settled after refresh {who}")
+        both = sc.screen + "\n" + screen
+        sc.check_screen(f"newcomer {who}: claim item on screen, no Auto-pay failed", [item, "Payment receipt"], ["Auto-pay failed"], screen=both)
+        n = max(sc.count("Payment settled", sc.screen), sc.count("Payment settled", screen))
+        sc.check(f"newcomer {who}: a new Payment settled card ({n} now, {n_settled} before)", n >= n_settled + 1)
+
+
 # ------------------------------------------------------------ L..Q: trust
 # Feature 2: "Your Trusted Community". Every scenario runs its own throwaway
 # account key and its own throwaway owner (well-known account) — the house and
 # claimant keys never appear here. The app talks Brainstorm to the fake on
 # :8788 and trust reads/publishes to the local nak relay on :10547.
 import json
-from suite import run
 
 LOCAL_RELAY = "ws://127.0.0.1:10547"
-BS = "http://127.0.0.1:8788"
 
 
-def fresh_key():
+def fresh_key(box):
     """A throwaway keypair via nak: hex sec, hex pub, npub."""
-    sec = run(["nak", "key", "generate"], timeout=15).stdout.strip()
-    pub = run(["nak", "key", "public", sec], timeout=15).stdout.strip()
-    npub = run(["nak", "encode", "npub", pub], timeout=15).stdout.strip()
+    def nak(args, what, sec=None):
+        rc, out = box.nak(args, sec=sec)
+        if rc != 0 or not out.strip():
+            raise RuntimeError(f"nak failed: {what}")
+        return out.strip()
+    sec = nak(["key", "generate"], "key generate")
+    pub = nak(["key", "public", "$NAK_SEC"], "key public", sec=sec)
+    npub = nak(["encode", "npub", pub], "encode npub")
     return {"sec": sec, "pub": pub, "npub": npub}
 
 
-def nak_publish(sec, kind, content, tags=()):
-    """Sign and publish an event to the local relay. sec stays an argument,
-    never logged; nak itself is trusted (same as on the box)."""
-    cmd = ["nak", "event", "-k", str(kind), "-c", content]
+def nak_publish(box, sec, kind, content, tags=()):
+    """Sign and publish an event to the local relay. sec goes by environment
+    name, never logged; nak itself is trusted (same as on the box)."""
+    cmd = ["event", "-k", str(kind), "-c", content]
     for t in tags:
         cmd += ["-t", t]
-    cmd += ["--sec", sec, LOCAL_RELAY]
-    r = run(cmd, timeout=30)
-    return r.returncode == 0
+    cmd += ["--sec", "$NAK_SEC", LOCAL_RELAY]
+    return box.nak(cmd, sec=sec)[0] == 0
 
 
-def nak_req(kind, author_hex):
+def nak_req(box, kind, author_hex):
     """Events for (kind, author) on the local relay, newest first."""
-    r = run(["nak", "req", "-k", str(kind), "-a", author_hex, LOCAL_RELAY], timeout=30)
+    out = box.nak(["req", "-k", str(kind), "-a", author_hex, LOCAL_RELAY])[1]
     evs = []
-    for line in r.stdout.splitlines():
+    for line in out.splitlines():
         line = line.strip()
         if line.startswith("{"):
             try:
@@ -426,16 +596,13 @@ def nak_req(kind, author_hex):
     return sorted(evs, key=lambda e: e.get("created_at", 0), reverse=True)
 
 
-def bs_setup_rows():
-    import urllib.request
-    body = json.load(urllib.request.urlopen(f"{BS}/setup/{fresh_key()['pub']}", timeout=10))
-    # The fake answers every hex; the argument above only needs to be valid hex.
-    return body
+def bs_setup_rows(box, pub):
+    return json.loads(box.bs_get(f"/setup/{pub}"))
 
 
-def publish_owner_profile(owner, run_id):
+def publish_owner_profile(box, owner, run_id):
     """A kind-0 name so the recommended row shows a name, not a bare npub."""
-    nak_publish(owner["sec"], 0, json.dumps(
+    nak_publish(box, owner["sec"], 0, json.dumps(
         {"name": f"E2E Owner {run_id[-4:]}", "display_name": f"E2E Owner {run_id[-4:]}"}))
 
 
@@ -455,7 +622,13 @@ TRUST_TAB = Step(
 
 
 async def open_trust(sc):
-    return await sc.step(TRUST_TAB, label="trust tab")
+    if await sc.step(TRUST_TAB, label="trust tab"):
+        return True
+    # A long warning on the page can sink the judge; the literal steps decide.
+    if sc.check_screen("the Trust tab's steps are on screen", ["Calculate my trust scores", "Publish my Treasure Map"]):
+        sc.accept_step("trust tab", "Calculate my trust scores and Publish my Treasure Map on screen")
+        return True
+    return False
 
 
 async def follow_owner(sc, expect_confirm):
@@ -516,12 +689,12 @@ async def publish_map(sc):
 
 def check_map_rows(sc, acct_pub):
     """The relay's kind-10040 tags must equal the fake /setup rows, in order."""
-    maps = nak_req(10040, acct_pub)
+    maps = nak_req(sc.box, 10040, acct_pub)
     sc.check("a kind-10040 exists on the local relay", bool(maps), f"{len(maps)} events")
     if not maps:
         return
     try:
-        rows = bs_setup_rows()
+        rows = bs_setup_rows(sc.box, acct_pub)
     except Exception as e:
         sc.check("the fake /setup answered for the check", False, e)
         return
@@ -534,9 +707,9 @@ def check_map_rows(sc, acct_pub):
 async def scenario_l(sc):
     """Fresh account, no kind-3: confirm the first list, follow the owner,
     calculate, publish the map."""
-    acct, owner = fresh_key(), fresh_key()
+    acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({})
-    publish_owner_profile(owner, sc.suite.run_id)
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
     sc.box.launch("L", sc.suite.run_id, nsecs=acct["sec"],
                   extra_env={"MC_ISSUER_NPUB": owner["npub"]})
     if not await open_trust(sc):
@@ -548,7 +721,7 @@ async def scenario_l(sc):
         return
     if not await publish_map(sc):
         return
-    k3 = nak_req(3, acct["pub"])
+    k3 = nak_req(sc.box, 3, acct["pub"])
     sc.check("a kind-3 on the local relay", bool(k3), f"{len(k3)} events")
     if k3:
         p_owner = any(t[:2] == ["p", owner["pub"]] for t in k3[0].get("tags", []))
@@ -563,11 +736,11 @@ async def scenario_l(sc):
 async def scenario_m(sc):
     """Existing kind-3 (three follows, content 'e2e old content'): following
     the owner appends one p tag and keeps the content byte-for-byte."""
-    acct, owner = fresh_key(), fresh_key()
-    others = [fresh_key()["pub"] for _ in range(3)]
+    acct, owner = fresh_key(sc.box), fresh_key(sc.box)
+    others = [fresh_key(sc.box)["pub"] for _ in range(3)]
     sc.box.start_fake({})
-    publish_owner_profile(owner, sc.suite.run_id)
-    nak_publish(acct["sec"], 3, "e2e old content", [f"p={p}" for p in others])
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
+    nak_publish(sc.box, acct["sec"], 3, "e2e old content", [f"p={p}" for p in others])
     await asyncio.sleep(1)
     sc.box.launch("M", sc.suite.run_id, nsecs=acct["sec"],
                   extra_env={"MC_ISSUER_NPUB": owner["npub"]})
@@ -576,7 +749,7 @@ async def scenario_m(sc):
     if not await follow_owner(sc, expect_confirm=False):
         return
     sc.check_screen("owner followed without a confirmation", ["Following"], ["Start a new follow list"])
-    k3 = nak_req(3, acct["pub"])
+    k3 = nak_req(sc.box, 3, acct["pub"])
     sc.check("a kind-3 on the local relay", bool(k3), f"{len(k3)} events")
     if k3:
         ps = [t for t in k3[0].get("tags", []) if t and t[0] == "p"]
@@ -590,9 +763,9 @@ async def scenario_m(sc):
 async def scenario_n(sc):
     """Local relay plus a dead one: the follow read is inconclusive, the error
     line shows, and nothing is published."""
-    acct, owner = fresh_key(), fresh_key()
+    acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({})
-    publish_owner_profile(owner, sc.suite.run_id)
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
     sc.box.launch("N", sc.suite.run_id, nsecs=acct["sec"],
                   extra_env={"MC_ISSUER_NPUB": owner["npub"],
                              "MC_TRUST_RELAYS": f"{LOCAL_RELAY}, ws://127.0.0.1:10599"})
@@ -611,17 +784,17 @@ async def scenario_n(sc):
     sc.check_screen("the inconclusive error line shows", ["Couldn't check your follow list"],
                     ["Following"], screen=screen)
     await asyncio.sleep(2)
-    sc.check("no kind-3 was published to the local relay", not nak_req(3, acct["pub"]))
+    sc.check("no kind-3 was published to the local relay", not nak_req(sc.box, 3, acct["pub"]))
 
 
 # ---------------------------------------------------------------- O
 async def scenario_o(sc):
     """graperank 429, then 403, then 503: each click shows the right wording
     and can be retried; followList is posted at most once."""
-    acct, owner = fresh_key(), fresh_key()
+    acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({"graperank": ["429", "403", "503"]})
-    publish_owner_profile(owner, sc.suite.run_id)
-    nak_publish(acct["sec"], 3, "", [f"p={owner['pub']}"])
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
+    nak_publish(sc.box, acct["sec"], 3, "", [f"p={owner['pub']}"])
     await asyncio.sleep(1)
     sc.box.launch("O", sc.suite.run_id, nsecs=acct["sec"],
                   extra_env={"MC_ISSUER_NPUB": owner["npub"]})
@@ -664,10 +837,10 @@ async def scenario_o(sc):
 async def scenario_q(sc):
     """graperank ok but /setup 404: Publish stays disabled, a click sends
     nothing, no kind-10040 lands."""
-    acct, owner = fresh_key(), fresh_key()
+    acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({"setup": "404"})
-    publish_owner_profile(owner, sc.suite.run_id)
-    nak_publish(acct["sec"], 3, "", [f"p={owner['pub']}"])
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
+    nak_publish(sc.box, acct["sec"], 3, "", [f"p={owner['pub']}"])
     await asyncio.sleep(1)
     sc.box.launch("Q", sc.suite.run_id, nsecs=acct["sec"],
                   extra_env={"MC_ISSUER_NPUB": owner["npub"]})
@@ -675,6 +848,9 @@ async def scenario_q(sc):
         return
     if not await calculate(sc):
         return
+    # The line renders under step 3, below the 960 px window: scroll to it.
+    await sc.suite.driver.act("scroll", "down")
+    await sc.suite.driver.act(*PARK)
     screen = await sc.wait_for(["Brainstorm has no data for this account"], timeout=30, every=3,
                                label="setup missing")
     sc.check_screen("Brainstorm has no data wording", ["Brainstorm has no data for this account"],
@@ -686,7 +862,7 @@ async def scenario_q(sc):
     except Exception as e:
         sc.notes.append(f"publish click found no button ({e})")
     await asyncio.sleep(4)
-    sc.check("no kind-10040 on the local relay", not nak_req(10040, acct["pub"]))
+    sc.check("no kind-10040 on the local relay", not nak_req(sc.box, 10040, acct["pub"]))
     lines = sc.log_after("Q publish attempt")
     posts = [l for l in lines if l.startswith("BS POST")]
     sc.check("the disabled publish sent no Brainstorm request", not posts, posts)
@@ -707,4 +883,5 @@ SCENARIOS = {
     "O": ("trust: graperank 429/403/503 wording and retries", scenario_o),
     "Q": ("trust: /setup 404 keeps publish disabled", scenario_q),
     "P": ("paid: real bounty, claim, settle", scenario_p),
+    "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),
 }

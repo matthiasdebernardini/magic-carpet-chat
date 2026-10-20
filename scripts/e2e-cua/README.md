@@ -10,7 +10,7 @@ One command from the Mac, one report at the end:
 
 `run.sh` copies the binary into `mc` as `/usr/local/bin/magic-carpet-chat-e2e`, beside the demo's `magic-carpet-chat`, which it never touches. It syncs this folder to `~/mc/e2e/` on `magic-carpet-cua.exe.xyz`, runs `suite.py` there, and copies the run back to `/tmp/mc-e2e/<timestamp>/`. It exits nonzero if any scenario fails. The box never compiles and never needs a GitHub token. The suite takes over the desktop and relaunches `~/mc/run-app.sh` at the end.
 
-Development flags (after the first argument): `--no-paid` skips P, `--only A,G` runs a subset, `--mock-jev` makes no TypeSafe calls, `--no-restore` leaves the desktop as the suite left it.
+Development flags (after the first argument): `--no-paid` skips P and R, `--only A,G` runs a subset, `--mock-jev` makes no TypeSafe calls, `--no-restore` leaves the desktop as the suite left it.
 
 ## `--target omac`: the same suite on an Omarchy host
 
@@ -35,7 +35,7 @@ so.) Keys in `~/.config/magic-carpet-e2e/keys.json` (house, claimant),
 `wf-recorder`, `tesseract`, `nak`, `wl-paste`, `hyprctl`.
 
 Differences from the box: P reports **SKIP** ("needs the real instance and
-its float") and H reports **BLOCKED** — a new result value the exit code
+its float"); R reports **BLOCKED** ("needs the real instance and live Coinos"); H reports **BLOCKED** too — a new result value the exit code
 ignores — because there is no seeded store with the claimant's Coinos
 login. L–Q (the Feature-2 trust panel) generate their own account and owner
 keys per scenario, publish the owner's kind-0 name to the local relay, and
@@ -70,7 +70,7 @@ unaffected by the input gap, but the suite holds the pid anyway).
 
 ## What each scenario checks
 
-Every scenario starts from a clean state: a fresh `MC_STORE_DIR`, the app relaunched with its own env, and an ffmpeg x11grab recording. A to H run against `fake_instance.py` (inside `mc` on 127.0.0.1:8787) and a `nak serve` relay on 127.0.0.1:10547, so nothing reaches the real instance. Two exceptions reach live services: trust reads go to public relays (read only), and H and P talk to live coinos.io for the claimant's wallet balance. H needs that wallet to hold sats, or its sats-left check fails.
+Every scenario starts from a clean state: a fresh `MC_STORE_DIR`, the app relaunched with its own env, and an ffmpeg x11grab recording. A to H run against `fake_instance.py` (inside `mc` on 127.0.0.1:8787) and a `nak serve` relay on 127.0.0.1:10547, so nothing reaches the real instance. Two exceptions reach live services: trust reads of the fake-target scenarios go to the local relay, and R publishes two "E2E Newcomer …" kind-0 profiles (with a Lightning address) to the public relays, because the instance target leaves `MC_TRUST_RELAYS` unset. H and P talk to live coinos.io for the claimant's wallet balance. R makes two new Coinos wallets there. H needs that wallet to hold sats, or its sats-left check fails.
 
 | ID | Checks |
 |---|---|
@@ -88,12 +88,13 @@ Every scenario starts from a clean state: a fresh `MC_STORE_DIR`, the app relaun
 | O | graperank answers 429, 403, 503: each shows its wording ("Please wait a few minutes before recalculating…" twice, then "The Brainstorm server is temporarily unavailable…"), Calculate stays clickable each time (three graperank requests), and `followList` is posted at most once. |
 | Q | graperank ok but `/setup` 404: "Publish my Treasure Map" stays disabled — clicking it sends nothing, no kind-10040 lands — and the "Brainstorm has no data for this account" line shows. |
 | P | Paid, against the real tapestry instance. The house creates a 100-sat bounty with cap 100 (closed after its one payout) on a list named `e2e-<run>`; the claimant claims it; the card must show "Payment settled" and "Payment receipt". The claim form must name this run's list before Enter, so no other bounty gets paid. The create and the claim run once each, never retried. |
+| R | Paid, against the real tapestry instance, with only the house in the store. Two newcomers (A, B) each create an account in the app (`+`, "Create a new account"): the Coinos wallet is made and "Coinos wallet ready" shows. The store then holds three accounts, two app-made with a wallet. The house publishes a 100-sat bounty with cap 200 on `e2e-new-<run>` ("Auto-pay armed"); A and B each claim it and each card must show "Payment settled" and "Payment receipt". Same gates and never-retried create and claims as P. |
 
-A scenario passes when every Jev postcondition is met and every hard check passes (literal OCR phrases, fake-server log lines, the clipboard, the float).
+A scenario passes when every judged step is met, or accepted by a hard check on the same screen (shown as "(N by hard check)"), and every hard check passes (literal OCR phrases, fake-server log lines, the clipboard, the float).
 
 ## The float
 
-P needs at least 200 sats in the instance's agent-wallet; below that the suite stops before it starts and says so. One run spends about 102 sats (100 payout plus fees). An e2e bounty closes after its payout, so a leftover one never pays again. To top up, on the box:
+P needs at least 200 sats in the instance's agent-wallet, R at least 250 (two payouts plus fees); below that the suite stops before it starts and says so. P spends about 102 sats (100 payout plus fees), R about 204; a run with both P and R needs 352 and spends about 306. A run that stops between R's publish and B's payout leaves an open auto-pay bounty with up to 200 sats of cap on the instance; with the box's trust-gate bypass, any key that reaches the instance could claim a leftover bounty. Each R run also leaves about 100 sats in each of two throwaway Coinos wallets, whose logins end up in `/root/.trash` with the store. An e2e bounty closes after its payout, so a leftover one never pays again. To top up, on the box:
 
     ~/mc/fund.sh 500
 
@@ -109,4 +110,4 @@ The scenario stores (`/root/e2e-stores/<run>` in `mc`) hold copies of the nsecs;
 
 1. Write `async def scenario_x(sc)` in `scenarios.py`: `sc.box.start_fake({...})` (modes are in `fake_instance.py`), `sc.box.launch("X", sc.suite.run_id)`, then `await sc.step(Step(goal, [Cand(...)], done, cues=...))` for each UI action. Add `must_act=True` when the goal state is already on screen before the action.
 2. Add hard checks with `sc.check_screen(...)`, `sc.check(...)` or `sc.log_after(marker)`. A scenario with no hard check fails.
-3. Register it in `SCENARIOS`. Candidates must never create a wallet, really remove an account, or publish outside the fake server.
+3. Register it in `SCENARIOS`. Candidates must never create a wallet, really remove an account, or publish outside the fake server (except P and R).
