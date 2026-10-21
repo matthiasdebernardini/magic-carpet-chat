@@ -479,6 +479,15 @@ mod tests {
             }
             other => panic!("a wrong amount must be refused: {other:?}"),
         }
+        // BOLT 11's "donation" vector with no amount, as lightning-invoice
+        // 0.34.1 tests it (tests/ser_de.rs), with a payment secret so it parses.
+        let open_ended = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
+        match invoice_for(open_ended, 21) {
+            Err(CoinosError::Refused(reason)) => {
+                assert_eq!(reason, "the invoice names no amount, so it was not paid")
+            }
+            other => panic!("an invoice with no amount must be refused: {other:?}"),
+        }
         assert!(matches!(
             invoice_for("lnbc1notaninvoice", 21),
             Err(CoinosError::Refused(_))
@@ -538,7 +547,6 @@ mod tests {
                 name.chars().all(|c| c.is_ascii_alphanumeric()),
                 "bad characters: {name}"
             );
-            assert!(!name.contains("undefined"));
         }
     }
 

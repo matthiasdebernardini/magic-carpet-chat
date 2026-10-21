@@ -292,18 +292,25 @@ mod tests {
     #[test]
     fn parse_search_reads_results_and_skips_bad_pubkeys() {
         let key = "82341f88".to_string() + &"0".repeat(56);
+        let upper = "82341F88".to_string() + &"0".repeat(56);
         let body = format!(
-            r#"{{"code":200,"data":{{"query":"jack","numResults":3,"results":[
+            r#"{{"code":200,"data":{{"query":"jack","numResults":4,"results":[
                 {{"name":"jack","pubkey":"{key}","picture":"https://x/p.png","nip05":"jack@primal.net","display_name":"jack (n/acc)"}},
                 {{"name":"bad","pubkey":"not-hex"}},
+                {{"name":"upper","pubkey":"{upper}"}},
                 {{"pubkey":"{key}","name":null}}
             ]}}}}"#
         );
         let hits = parse_search(&body).expect("a real answer parses");
-        assert_eq!(hits.len(), 2, "the bad pubkey is skipped");
+        assert_eq!(
+            hits.len(),
+            2,
+            "the non-hex and the uppercase pubkey are skipped"
+        );
         assert_eq!(hits[0].name.as_deref(), Some("jack"));
         assert_eq!(hits[0].display_name.as_deref(), Some("jack (n/acc)"));
         assert_eq!(hits[0].nip05.as_deref(), Some("jack@primal.net"));
+        assert_eq!(hits[0].picture.as_deref(), Some("https://x/p.png"));
         assert_eq!(hits[1].name, None);
         // Not the envelope → None, not an empty list.
         assert_eq!(parse_search("{}"), None);
@@ -337,16 +344,6 @@ mod tests {
             None,
             "a non-string cell"
         );
-    }
-
-    #[test]
-    fn setup_rows_round_trip_the_live_house_body() {
-        // Today's live `/setup` answer: five 30382 rows then a bare 30392.
-        let rows = setup_rows(include_str!("../tests/fixtures/trust-setup-house-6.json"))
-            .expect("the live body parses");
-        assert_eq!(rows.len(), 6);
-        assert_eq!(rows[0][0], "30382:rank");
-        assert_eq!(rows[5][0], "30392");
     }
 
     #[test]

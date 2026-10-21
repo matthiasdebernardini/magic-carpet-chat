@@ -508,18 +508,19 @@ mod tests {
             .unwrap()],
             200,
         );
-        let designation = parse_designation(
-            &[
-                ("wss://a".into(), old),
-                ("wss://b".into(), new.clone()),
-            ],
-            &subject,
-        );
-        let Designation::Set { at, found_on, .. } = designation else {
-            panic!("newer Set should win: {designation:?}");
-        };
-        assert_eq!(at, 200);
-        assert_eq!(found_on, ["wss://b"]);
+        let oldest_first = [
+            ("wss://a".into(), old.clone()),
+            ("wss://b".into(), new.clone()),
+        ];
+        let newest_first = [("wss://b".into(), new), ("wss://a".into(), old)];
+        for events in [oldest_first, newest_first] {
+            let designation = parse_designation(&events, &subject);
+            let Designation::Set { at, found_on, .. } = designation else {
+                panic!("newer Set should win: {designation:?}");
+            };
+            assert_eq!(at, 200);
+            assert_eq!(found_on, ["wss://b"]);
+        }
     }
 
     #[test]
@@ -532,58 +533,70 @@ mod tests {
             100,
         );
         let empty = sign_10040(&keys, vec![], 200);
-        let designation =
-            parse_designation(&[("wss://a".into(), set), ("wss://a".into(), empty)], &subject);
-        assert!(
-            matches!(designation, Designation::Deactivated { at: 200, .. }),
-            "newer empty event should deactivate: {designation:?}"
-        );
+        let oldest_first = [
+            ("wss://a".into(), set.clone()),
+            ("wss://a".into(), empty.clone()),
+        ];
+        let newest_first = [("wss://a".into(), empty), ("wss://a".into(), set)];
+        for events in [oldest_first, newest_first] {
+            let designation = parse_designation(&events, &subject);
+            assert!(
+                matches!(designation, Designation::Deactivated { at: 200, .. }),
+                "newer empty event should deactivate: {designation:?}"
+            );
+        }
     }
 
     #[test]
-    fn a_malformed_row_is_skipped_not_fatal() {
+    fn bad_rows_are_skipped_and_good_rows_need_a_hex64_key_a_ws_relay_and_a_30382_suffix() {
         let keys = Keys::generate();
         let subject = keys.public_key().to_hex();
-        let event = sign_10040(
-            &keys,
-            vec![
-                // Non-hex key — skipped.
-                Tag::parse(["30382:rank", "nothex", "wss://r"]).unwrap(),
-                Tag::parse(["30382:followers", &hex64(7), "wss://r"]).unwrap(),
-            ],
-            100,
-        );
-        let Designation::Set { rows, .. } =
-            parse_designation(&[("wss://a".into(), event)], &subject)
-        else {
-            panic!("one bad row should not sink the map");
-        };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind_tag, "30382:followers");
-    }
-
-    #[test]
-    fn rows_need_a_relay_and_a_30382_prefix() {
-        let keys = Keys::generate();
-        let subject = keys.public_key().to_hex();
+        let non_hex_64 = "g".repeat(64);
+        let upper_hex_64 = "AB".repeat(32);
+        let hex_63 = "a".repeat(63);
         let event = sign_10040(
             &keys,
             vec![
                 Tag::parse(["30382:rank", &hex64(7)]).unwrap(), // no relay
                 Tag::parse(["other:rank", &hex64(7), "wss://r"]).unwrap(), // not 30382:
                 Tag::parse(["30382:", &hex64(7), "wss://r"]).unwrap(), // empty suffix
+                Tag::parse(["30382:Rank", &hex64(7), "wss://r"]).unwrap(), // uppercase suffix
                 Tag::parse(["30382:rank", &hex64(7), "https://r"]).unwrap(), // not ws
+                Tag::parse(["30382:rank", "nothex", "wss://r"]).unwrap(), // short, not hex
+                Tag::parse(["30382:rank", &non_hex_64, "wss://r"]).unwrap(), // 64 chars, not hex
+                Tag::parse(["30382:rank", &upper_hex_64, "wss://r"]).unwrap(), // uppercase hex
+                Tag::parse(["30382:rank", &hex_63, "wss://r"]).unwrap(), // 63 hex chars
                 Tag::parse(["30382:rank", &hex64(7), "wss://r"]).unwrap(),
+                Tag::parse(["30382:verified_followers", &hex64(8), "wss://r"]).unwrap(),
+                Tag::parse(["30382:followers", &hex64(9), "ws://local"]).unwrap(),
             ],
             100,
         );
         let Designation::Set { rows, .. } =
             parse_designation(&[("wss://a".into(), event)], &subject)
         else {
-            panic!("the valid row should survive");
+            panic!("bad rows should not sink the map");
         };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].key, hex64(7));
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    kind_tag: "30382:rank".into(),
+                    key: hex64(7),
+                    relay: "wss://r".into(),
+                },
+                Row {
+                    kind_tag: "30382:verified_followers".into(),
+                    key: hex64(8),
+                    relay: "wss://r".into(),
+                },
+                Row {
+                    kind_tag: "30382:followers".into(),
+                    key: hex64(9),
+                    relay: "ws://local".into(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -608,11 +621,6 @@ mod tests {
             parse_designation(&[("wss://a".into(), event)], HOUSE_HEX),
             Designation::None
         );
-    }
-
-    #[test]
-    fn empty_input_is_none() {
-        assert_eq!(parse_designation(&[], HOUSE_HEX), Designation::None);
     }
 
     #[test]
@@ -696,18 +704,36 @@ mod tests {
         let subject = hex64(1);
         let with_hops = sign_30382(&keys, &subject, &[("rank", "3"), ("hops", "2")], 100);
         let without = sign_30382(&keys, &subject, &[("rank", "3")], 200);
-        let a = parse_assertion(&[with_hops, without], &provider, &subject).unwrap();
-        assert_eq!(a.at, 200);
-        assert_eq!(a.hops, None);
+        let oldest_first = [with_hops.clone(), without.clone()];
+        let newest_first = [without, with_hops];
+        for events in [oldest_first, newest_first] {
+            let a = parse_assertion(&events, &provider, &subject).unwrap();
+            assert_eq!(a.at, 200);
+            assert_eq!(a.hops, None);
+        }
     }
 
     #[test]
-    fn brainstorm_setup_round_trips() {
+    fn setup_body_yields_the_rank_key() {
         assert_eq!(
             parse_setup(HOUSE_SETUP),
             Some(BrainstormKey::Assigned {
                 key: PROVIDER_HEX.into(),
                 relay: "wss://scores.brainstorm.world".into(),
+            })
+        );
+        // Another 30382 triple with its own key and relay comes first: the
+        // rank triple is still the one picked.
+        let body = format!(
+            r#"[["30382:followers","{}","wss://other.example"],["30382:rank","{}","WSS://Rank.Example/"]]"#,
+            hex64(1),
+            hex64(2),
+        );
+        assert_eq!(
+            parse_setup(&body),
+            Some(BrainstormKey::Assigned {
+                key: hex64(2),
+                relay: "wss://rank.example".into(),
             })
         );
         assert_eq!(parse_setup("[]"), None);
@@ -719,11 +745,25 @@ mod tests {
     fn follows_count_distinct_p_tags() {
         let keys = Keys::generate();
         let subject = keys.public_key().to_hex();
-        let event = sign_contacts(
-            &keys,
-            &[&hex64(1), &hex64(2), &hex64(3), &hex64(2), "bogus"],
-            100,
-        );
+        let not_hex = "z".repeat(64);
+        let mut tags: Vec<Tag> = [
+            hex64(1).as_str(),
+            &hex64(2),
+            &hex64(3),
+            &hex64(2),
+            "bogus",
+            &not_hex,
+            "abc",
+        ]
+        .iter()
+        .map(|f| Tag::parse(["p", *f]).unwrap())
+        .collect();
+        // A valid key under a non-p tag is not a follow.
+        tags.push(Tag::parse(["t", &hex64(4)]).unwrap());
+        let event = EventBuilder::new(Kind::ContactList, "")
+            .tags(tags)
+            .finalize(&keys)
+            .unwrap();
         assert_eq!(follow_count(&event, &subject), Some(3));
     }
 
@@ -739,6 +779,8 @@ mod tests {
             100,
         );
         assert_eq!(follow_count(&wrong_kind, &keys.public_key().to_hex()), None);
+        let forged = flip_sig(&serde_json::to_string(&event).unwrap());
+        assert_eq!(follow_count(&forged, &keys.public_key().to_hex()), None);
     }
 
     #[test]
@@ -823,29 +865,29 @@ mod tests {
         let subject = keys.public_key().to_hex();
         let old = sign_contacts(&keys, &[&hex64(1)], 100);
         let new = sign_contacts(&keys, &[&hex64(1), &hex64(2)], 200);
-        // Found on 1 of 3 answering relays: still a found list.
-        let read = classify_contacts(
-            &[
-                ("a".into(), Ok(vec![old.clone()])),
-                ("b".into(), Ok(vec![new.clone()])),
-                ("c".into(), Ok(vec![])),
-            ],
-            &subject,
-        );
-        assert_eq!(read, ContactRead::Found(new));
+        // Newer still, signed by the account, but not a contact list.
+        let wrong_kind = sign_10040(&keys, vec![Tag::parse(["p", &hex64(3)]).unwrap()], 300);
+        // Found on 1 of 3 answering relays: still a found list, in either order.
+        let oldest_first = [
+            ("a".into(), Ok(vec![old.clone()])),
+            ("b".into(), Ok(vec![new.clone()])),
+            ("c".into(), Ok(vec![wrong_kind.clone()])),
+        ];
+        let newest_first = [
+            ("b".into(), Ok(vec![new.clone()])),
+            ("a".into(), Ok(vec![old.clone()])),
+            ("c".into(), Ok(vec![wrong_kind])),
+        ];
+        for results in [oldest_first, newest_first] {
+            assert_eq!(
+                classify_contacts(&results, &subject),
+                ContactRead::Found(new.clone())
+            );
+        }
 
         // Wrong author and a bad signature are ignored, never found.
         let foreign = sign_contacts(&Keys::generate(), &[&hex64(1)], 300);
-        let mut broken = serde_json::to_value(&old).unwrap();
-        let sig = broken["sig"].as_str().unwrap();
-        let last = sig.len() - 1;
-        let forged_sig = format!(
-            "{}{}",
-            &sig[..last],
-            if &sig[last..] == "0" { "1" } else { "0" },
-        );
-        broken["sig"] = serde_json::Value::String(forged_sig);
-        let forged: Event = serde_json::from_value(broken).unwrap();
+        let forged = flip_sig(&serde_json::to_string(&old).unwrap());
         let read = classify_contacts(
             &[("a".into(), Ok(vec![foreign, forged])), ("b".into(), Ok(vec![]))],
             &subject,

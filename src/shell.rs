@@ -3108,31 +3108,8 @@ mod tests {
         form_locked, next_bounties_read, on_outcome_unknown, pick_active, relay_address_gap,
         remove_click, still_checking_list,
     };
-    use std::collections::HashMap;
 
     use magic_carpet_chat::nostr::{Command, Update};
-
-    /// The community stale-reply guard, exercised the way
-    /// `apply_community` uses it: look the panel up by pubkey, hand its
-    /// generation in. A reply for A never reaches B's panel because the
-    /// map lookup yields B's generation.
-    #[test]
-    fn community_replies_need_a_live_panel_at_their_generation() {
-        let panels: HashMap<String, u32> = [("a".to_string(), 2), ("b".to_string(), 1)]
-            .into_iter()
-            .collect();
-        let accepts_for = |pubkey: &str, generation: u32| {
-            crate::community::accepts(panels.get(pubkey).copied(), generation)
-        };
-        assert!(accepts_for("a", 2));
-        assert!(accepts_for("a", 3), "a newer generation is still current");
-        assert!(!accepts_for("a", 1), "a stale reply is dropped");
-        // A reply stamped for A's older life, aimed at B's panel, never fits.
-        assert!(!accepts_for("b", 0));
-        assert!(accepts_for("b", 1));
-        // A removed account has no panel at all.
-        assert!(!accepts_for("gone", 5));
-    }
 
     #[test]
     fn an_auto_pay_claim_gets_a_short_toast_and_the_rank_note_behind_a_click() {
@@ -3147,6 +3124,18 @@ mod tests {
         assert!(!notice.short.contains(RANK_NOTE));
         // Nothing to expand when the bounty is unknown.
         assert!(claim_notice(None).full.is_none());
+        // A bounty with no minimum rank names no number.
+        let unranked = claim_notice(Some((true, 0, 21_000)));
+        assert_eq!(
+            unranked.short,
+            "A high enough rank (trust score) gets 21,000 sats in about a minute. Click for details."
+        );
+        assert!(
+            !unranked
+                .full
+                .expect("auto-pay has details")
+                .contains("of 0 or higher")
+        );
         let manual = claim_notice(Some((false, 0, 500)));
         assert!(manual.full.expect("manual pay has details").contains("by hand"));
     }
@@ -3278,6 +3267,7 @@ mod tests {
         let Some(Command::FetchBalance { pubkey, request: Some(id) }) = command else {
             panic!("the arming click sent no tagged balance read");
         };
+        let first_id = id;
         assert_eq!((pubkey.as_str(), check), ("a", BalanceCheck::Checking(id)));
         assert_eq!(armed.as_deref(), Some("a"));
 
@@ -3307,11 +3297,16 @@ mod tests {
         assert_eq!((action, command.is_none()), (RemoveAction::Refuse, true));
         assert_eq!(armed, None);
 
-        // Re-armed and answered, the second click removes.
-        click(&mut armed, &mut check, false);
+        // Re-armed under a fresh request id and answered, the second click
+        // removes.
+        let (_, command) = click(&mut armed, &mut check, false);
         let BalanceCheck::Checking(id) = check else {
             panic!("re-arming did not read the balance");
         };
+        assert_ne!(id, first_id, "re-arming reused the first read's id");
+        assert!(
+            matches!(command, Some(Command::FetchBalance { request: Some(sent), .. }) if sent == id)
+        );
         let failed = Update::BalanceFailed {
             pubkey: "a".into(),
             request: Some(id),

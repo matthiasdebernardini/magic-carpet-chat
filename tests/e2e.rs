@@ -256,7 +256,7 @@ async fn send(handle: &mut NostrHandle, from: &Account, to: &str, sats: u64) -> 
     }
 }
 
-#[ignore]
+#[ignore = "moves real sats through coinos.io and the instance relay"]
 #[tokio::test(flavor = "multi_thread")]
 async fn two_new_users_open_wallets_and_pay_each_other() {
     let store_dir = std::env::temp_dir().join(format!(

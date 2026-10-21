@@ -1619,3 +1619,28 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
             .into_any_element(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::accepts;
+
+    /// A reply fits a live panel at its generation or newer; an older
+    /// generation, or no panel at all, drops it.
+    #[test]
+    fn community_replies_need_a_live_panel_at_their_generation() {
+        for (panel, generation, accepted) in [
+            (Some(2), 2, true),
+            (Some(2), 3, true),
+            (Some(2), 1, false),
+            (Some(1), 0, false),
+            (Some(1), 1, true),
+            (None, 5, false),
+        ] {
+            assert_eq!(
+                accepts(panel, generation),
+                accepted,
+                "panel {panel:?}, generation {generation}"
+            );
+        }
+    }
+}

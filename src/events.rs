@@ -184,10 +184,6 @@ impl Receipt {
     pub fn amount_sats(&self) -> Option<u64> {
         self.amount_msats.map(|msats| msats / 1000)
     }
-
-    pub fn pays_claim(&self, claim_event_id: &str) -> bool {
-        self.claim_event_ids.iter().any(|id| id == claim_event_id)
-    }
 }
 
 /// Parse a live relay event as a receipt. `None` when it is not kind-9735.
@@ -347,9 +343,10 @@ mod tests {
             receipt.receipt_id,
             "b3b3f887aab52d97796777aeac056f72ddaf745fd98329a3fcdb9ac37ba332c7"
         );
-        assert!(receipt.pays_claim(
-            "afb4bfe5b6556aa4a65a3c51a82d0e974c234dbe9551963d347208aa5d4ebc85"
-        ));
+        assert_eq!(
+            receipt.claim_event_ids,
+            ["afb4bfe5b6556aa4a65a3c51a82d0e974c234dbe9551963d347208aa5d4ebc85"]
+        );
         // The payer is the description-JSON pubkey (the delegate), NOT the
         // receipt's signer (Strike's zapper key 8b7cd498…).
         assert_eq!(

@@ -91,6 +91,21 @@ mod tests {
         assert_eq!(relative(100, 79), "21 s ago");
         assert_eq!(relative(1_000, 100), "15 min ago");
         assert_eq!(relative(90_000, 100), "1 d ago");
+        // Each arm's edges, as seconds since `then`.
+        let then = 1_000_000;
+        for (delta, text) in [
+            (4, "just now"),
+            (5, "5 s ago"),
+            (59, "59 s ago"),
+            (60, "1 min ago"),
+            (3_599, "59 min ago"),
+            (3_600, "1 h ago"),
+            (7_200, "2 h ago"),
+            (86_399, "23 h ago"),
+            (86_400, "1 d ago"),
+        ] {
+            assert_eq!(relative(then + delta, then), text, "{delta} s");
+        }
     }
 
     #[test]

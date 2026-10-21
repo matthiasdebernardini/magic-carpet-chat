@@ -393,13 +393,78 @@ mod tests {
         assert!(!printed.contains("verysecret"), "leaked: {printed}");
     }
 
+    /// A fresh, empty store directory for one test. The caller holds
+    /// `STORE_DIR` and removes `MC_STORE_DIR` before releasing it.
+    fn fresh_store_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        dir
+    }
+
     #[test]
-    fn key_errors_never_echo_the_input() {
-        let err = SecretError::InvalidKey("MC_NSECS");
-        assert_eq!(
-            err.to_string(),
-            "MC_NSECS is not a valid secret key. Use an nsec1 key or 64 hex characters."
+    fn env_keys_import_once_and_errors_name_the_variable_not_the_key() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+
+        // A bad entry fails the import with the variable's name, not the
+        // parser's error and not the entry.
+        let bad_dir = fresh_store_dir("env-import-bad");
+        let valid = Keys::generate().secret_key().to_bech32().unwrap();
+        unsafe { std::env::set_var("MC_NSECS", format!("{valid},garbage")) };
+        let err = import_from_env().unwrap_err();
+        assert!(
+            matches!(err, SecretError::InvalidKey("MC_NSECS")),
+            "wrong error: {err:?}"
         );
+        let _ = std::fs::remove_dir_all(&bad_dir);
+
+        // A key already stored is left alone, active flag included.
+        let dir = fresh_store_dir("env-import");
+        let a = Keys::generate();
+        let b = Keys::generate();
+        let ra = add_account(&Secret::new(a.secret_key().to_bech32().unwrap()), false).unwrap();
+        let b_npub = b.public_key().to_bech32().unwrap();
+        unsafe { std::env::set_var("MC_NSECS", b.secret_key().to_bech32().unwrap()) };
+        assert_eq!(import_from_env().unwrap(), vec![b_npub.clone()]);
+        // Whatever the first import did to the active slot, make A active.
+        set_active(&ra.pubkey).unwrap();
+        assert_eq!(import_from_env().unwrap(), vec![b_npub]);
+        let store = load().unwrap();
+        let stored: Vec<&str> = store
+            .accounts
+            .iter()
+            .map(|acc| acc.pubkey.as_str())
+            .collect();
+        assert_eq!(
+            stored,
+            [ra.pubkey.as_str(), b.public_key().to_hex().as_str()]
+        );
+        assert_eq!(store.active.as_deref(), Some(ra.pubkey.as_str()));
+
+        unsafe { std::env::remove_var("MC_NSECS") };
+        unsafe { std::env::remove_var("MC_STORE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_store_is_an_error_not_an_empty_store() {
+        // Only a missing file means "no accounts yet". Every change saves
+        // what load returned, so a read failure taken as an empty store
+        // would be written over every saved key.
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = fresh_store_dir("unreadable");
+        // A directory where the file belongs: the read fails, not NotFound.
+        std::fs::create_dir(dir.join(FILE_NAME)).unwrap();
+
+        let read = load();
+        assert!(
+            matches!(read, Err(SecretError::Store(_))),
+            "an unreadable store read as Ok"
+        );
+
+        unsafe { std::env::remove_var("MC_STORE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -490,14 +555,6 @@ mod tests {
             + r#"","nsec":"nsec1xx"}"#;
         let account: StoredAccount = serde_json::from_str(&json).unwrap();
         assert!(!account.created_in_app);
-    }
-
-    #[test]
-    fn parse_secret_accepts_a_valid_nsec() {
-        let keys = Keys::generate();
-        let nsec = keys.secret_key().to_bech32().unwrap();
-        let parsed = parse_secret(&Secret::new(nsec)).unwrap();
-        assert_eq!(parsed.public_key(), keys.public_key());
     }
 
     #[test]

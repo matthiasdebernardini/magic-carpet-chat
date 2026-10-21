@@ -277,12 +277,17 @@ mod tests {
         // …and a failed re-read keeps the prior verdict.
         state.apply(TrustPart::Designation(Ok(set_designation())), 2);
         state.apply(
-            TrustPart::Designation(Err("Couldn't read kind-10040 from 7 relays.".into())),
+            TrustPart::Designation(Err("Couldn't read kind-10040 from 5 relays.".into())),
             3,
         );
         assert_eq!(state.map_unreadable(), None);
         assert_eq!(state.needs_map(), None);
         assert_eq!(state.checked_at, Some(2));
+        // The failure note still shows under the surviving verdict.
+        assert_eq!(
+            state.map_read_failed(),
+            Some("Couldn't read kind-10040 from 5 relays.")
+        );
     }
 
     #[test]
@@ -339,11 +344,37 @@ mod tests {
     }
 
     #[test]
-    fn stale_generations_do_not_apply() {
+    fn begin_keeps_prior_answers_marks_them_loading_and_refuses_older_generations() {
         let mut state = TrustState::default();
         state.begin(2, 10);
-        assert!(state.accepts(2));
+        state.apply(TrustPart::Designation(Ok(set_designation())), 11);
+        state.apply(TrustPart::Brainstorm(Ok(BrainstormKey::NoAccount)), 11);
+        state.apply(TrustPart::Follows(Ok(Some(2))), 11);
+        state.apply(TrustPart::OwnAssertion(Ok(Some(assertion(Some(3))))), 11);
+        state.apply(
+            TrustPart::InstanceAssertion {
+                provider: None,
+                result: Ok(None),
+            },
+            11,
+        );
+
+        state.begin(3, 20);
+        assert_eq!(state.generation, 3);
+        assert_eq!(state.requested_at, 20);
+        assert_eq!(state.designation.last, Some(set_designation()));
+        assert_eq!(state.designation.status, Status::Loading);
+        assert_eq!(state.brainstorm.last, Some(BrainstormKey::NoAccount));
+        assert_eq!(state.brainstorm.status, Status::Loading);
+        assert_eq!(state.follows.last, Some(Some(2)));
+        assert_eq!(state.follows.status, Status::Loading);
+        assert_eq!(state.own.last, Some(Some(assertion(Some(3)))));
+        assert_eq!(state.own.status, Status::Loading);
+        assert_eq!(state.instance.last, Some(None));
+        assert_eq!(state.instance.status, Status::Loading);
+
         assert!(state.accepts(3));
-        assert!(!state.accepts(1));
+        assert!(state.accepts(4));
+        assert!(!state.accepts(2));
     }
 }

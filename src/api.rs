@@ -641,8 +641,8 @@ mod tests {
 
         // The receipt round-trips through the shared parser.
         let receipt = claim.receipt().unwrap();
+        assert_eq!(receipt.claim_event_ids, [claim.event.id.as_str()]);
         assert_eq!(receipt.amount_sats(), Some(100));
-        assert!(receipt.pays_claim(&claim.event.id));
     }
 
     #[test]

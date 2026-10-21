@@ -492,7 +492,6 @@ pub fn panel(
 mod tests {
     // Named imports: `super::*` would bring gpui's `test` attribute along.
     use super::{WalletState, delta_text};
-    use crate::timefmt;
 
     #[test]
     fn the_delta_tag_reads_as_a_signed_change_and_the_old_balance() {
@@ -500,10 +499,7 @@ mod tests {
         assert_eq!(delta_text(40, 55), ("+15".to_string(), "was 40".to_string()));
         assert_eq!(
             delta_text(1_000, 12_345),
-            (
-                format!("+{}", timefmt::fmt_sats(11_345)),
-                format!("was {}", timefmt::fmt_sats(1_000))
-            )
+            ("+11,345".to_string(), "was 1,000".to_string())
         );
     }
 

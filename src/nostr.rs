@@ -75,10 +75,13 @@ pub fn relay_url() -> String {
 
 /// `MC_TRUST_RELAYS`, comma-separated: trims each entry, skips empties,
 /// normalizes the URL, and drops anything that is not `ws://`/`wss://`.
-/// `None` for unset or when nothing valid remains — the defaults apply.
-fn relays_from_env() -> Option<Vec<String>> {
-    let urls = parse_relay_list(&std::env::var("MC_TRUST_RELAYS").ok()?);
-    (!urls.is_empty()).then_some(urls)
+/// Unset, or nothing valid left: the normalized `defaults` apply.
+fn relays_or(raw: Option<&str>, defaults: &[&str]) -> Vec<String> {
+    let urls = raw.map(parse_relay_list).unwrap_or_default();
+    if urls.is_empty() {
+        return defaults.iter().map(|url| trust::normalize_relay(url)).collect();
+    }
+    urls
 }
 
 fn parse_relay_list(raw: &str) -> Vec<String> {
@@ -94,24 +97,20 @@ fn parse_relay_list(raw: &str) -> Vec<String> {
 /// the `MC_TRUST_RELAYS` set when the override is active, else
 /// [`TRUST_FALLBACK_RELAYS`].
 pub fn trust_relays() -> Vec<String> {
-    relays_from_env().unwrap_or_else(|| {
-        TRUST_FALLBACK_RELAYS
-            .iter()
-            .map(|url| trust::normalize_relay(url))
-            .collect()
-    })
+    relays_or(
+        std::env::var("MC_TRUST_RELAYS").ok().as_deref(),
+        &TRUST_FALLBACK_RELAYS,
+    )
 }
 
 /// The set public writes (a new lud16, a kind-3 follow, a kind-10040 map)
 /// go to: the `MC_TRUST_RELAYS` set when the override is active, else
 /// [`PUBLIC_RELAYS`].
 pub fn public_relays() -> Vec<String> {
-    relays_from_env().unwrap_or_else(|| {
-        PUBLIC_RELAYS
-            .iter()
-            .map(|url| trust::normalize_relay(url))
-            .collect()
-    })
+    relays_or(
+        std::env::var("MC_TRUST_RELAYS").ok().as_deref(),
+        &PUBLIC_RELAYS,
+    )
 }
 
 /// UI → runtime.
@@ -2597,6 +2596,8 @@ mod tests {
         assert!(unknown(ApiError::Http("timed out".into())));
         assert!(unknown(ApiError::Decode("eof".into())));
         assert!(unknown(ApiError::Status { status: 502, message: String::new() }));
+        assert!(unknown(ApiError::Status { status: 500, message: String::new() }));
+        assert!(!unknown(ApiError::Status { status: 499, message: String::new() }));
         assert!(!unknown(ApiError::Status { status: 400, message: String::new() }));
         assert!(!unknown(ApiError::Status { status: 401, message: String::new() }));
         assert!(!unknown(ApiError::Rejected("no".into())));
@@ -2613,7 +2614,7 @@ mod tests {
         assert_eq!(relay_answer(Some(Ok(vec![])), true), Ok(vec![]));
         assert_eq!(
             relay_answer(Some(Ok(vec![event.clone()])), false),
-            Ok(vec![event])
+            Ok(vec![event.clone()])
         );
         assert_eq!(relay_answer(Some(Err(())), true), Err(()));
         // All timed out: nobody answered, so the designation read is Err and
@@ -2623,6 +2624,15 @@ mod tests {
             ("wss://b".into(), relay_answer(Some(Ok(vec![])), false)),
         ]);
         assert_eq!((count, events.len()), (0, 0));
+        // Mixed: an empty answer and a non-empty answer both count; the
+        // failed relay does not, and only the one event comes back.
+        let (count, events) = answered(vec![
+            ("wss://a".into(), Ok(vec![])),
+            ("wss://b".into(), Ok(vec![event.clone()])),
+            ("wss://c".into(), Err(())),
+        ]);
+        assert_eq!(count, 2);
+        assert_eq!(events, vec![("wss://b".to_string(), event)]);
     }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/bounty-5f44688e.json");
@@ -2769,6 +2779,22 @@ mod tests {
     }
 
     #[test]
+    fn a_watch_stops_only_once_the_bounty_is_over_and_nothing_is_pending() {
+        // The pristine fixture's derivedStatus is "fulfilled", a terminal status.
+        let over = parse_detail(FIXTURE).unwrap();
+        assert!(watch_done(&over, false));
+        assert!(
+            !watch_done(&over, true),
+            "a pending receipt keeps the watch alive"
+        );
+
+        let mut open: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        open["bounty"]["derivedStatus"] = "open".into();
+        let open = parse_detail(&open.to_string()).unwrap();
+        assert!(!watch_done(&open, false));
+    }
+
+    #[test]
     fn merging_lud16_keeps_every_other_profile_field() {
         let existing = r#"{"name":"Matthias","picture":"https://x/p.png","about":"hi","nip05":"m@x.io","custom":{"deep":1}}"#;
         let merged = merge_lud16(Some(existing), "carpet1234@coinos.io", None).unwrap();
@@ -2861,6 +2887,14 @@ mod tests {
         assert_eq!(profile.name.as_deref(), Some("Alice"));
         let profile = parse_profile(r#"{"display_name":"","name":"A"}"#);
         assert_eq!(profile.name.as_deref(), Some("A"));
+        let profile = parse_profile(r#"{"display_name":"D","name":"N"}"#);
+        assert_eq!(profile.name.as_deref(), Some("D"));
+        let profile =
+            parse_profile(r#"{"picture":"  https://p.example/a.png ","lud16":" ada@coinos.io  "}"#);
+        assert_eq!(profile.picture.as_deref(), Some("https://p.example/a.png"));
+        assert_eq!(profile.lud16.as_deref(), Some("ada@coinos.io"));
+        let profile = parse_profile(r#"{"name":"A","lud16":""}"#);
+        assert_eq!(profile.lud16, None);
         assert_eq!(parse_profile("[1,2]"), Profile::default());
         assert_eq!(parse_profile("not json"), Profile::default());
     }
@@ -2876,7 +2910,10 @@ mod tests {
                 pubkey: "aa".repeat(32)
             }
         );
-        assert_eq!(printed, format!("CreateCoinosWallet {{ pubkey: \"{}\" }}", "aa".repeat(32)));
+        assert_eq!(
+            printed,
+            format!("CreateCoinosWallet {{ pubkey: \"{}\" }}", "aa".repeat(32))
+        );
         let update = Update::WalletCreated {
             pubkey: "aa".repeat(32),
             created: WalletCreated {
@@ -2885,7 +2922,9 @@ mod tests {
                 publish_error: Some("The Nostr servers didn't accept the profile update.".into()),
             },
         };
-        assert!(!format!("{update:?}").contains("password"));
+        let printed = format!("{update:?}");
+        assert!(!printed.contains("password"), "leaked: {printed}");
+        assert!(!printed.contains("token"), "leaked: {printed}");
     }
 
     #[test]
@@ -2944,7 +2983,7 @@ mod tests {
     }
 
     #[test]
-    fn trust_relays_env_parses_or_falls_back() {
+    fn relay_override_parses_or_falls_back_to_each_callers_defaults() {
         // The pure half: trimming, empty entries, normalization, rejection.
         assert_eq!(
             parse_relay_list(" wss://a.example/ , , wss://b.example"),
@@ -2956,11 +2995,45 @@ mod tests {
         );
         assert!(parse_relay_list("").is_empty());
         assert!(parse_relay_list("https://x , ftp://y").is_empty());
-        // Unset env → the shipped defaults.
-        if std::env::var("MC_TRUST_RELAYS").is_err() {
-            assert_eq!(trust_relays().len(), TRUST_FALLBACK_RELAYS.len());
-            assert_eq!(public_relays().len(), PUBLIC_RELAYS.len());
-        }
+        // Unset, empty, or nothing valid left: the normalized defaults.
+        let defaults = ["WSS://Relay.Example/", "wss://other.example"];
+        let normalized = vec![
+            "wss://relay.example".to_string(),
+            "wss://other.example".to_string(),
+        ];
+        assert_eq!(relays_or(None, &defaults), normalized);
+        assert_eq!(relays_or(Some(""), &defaults), normalized);
+        assert_eq!(
+            relays_or(Some("https://x , ftp://y"), &defaults),
+            normalized
+        );
+        assert_eq!(
+            relays_or(Some(" wss://a.example/ "), &defaults),
+            vec!["wss://a.example".to_string()]
+        );
+        // With no override, trust reads and public writes each get their
+        // own list.
+        // SAFETY: no other test reads or writes MC_TRUST_RELAYS, and these
+        // tests read the environment only through std, which serializes
+        // this call with every read.
+        unsafe { std::env::remove_var("MC_TRUST_RELAYS") };
+        assert_eq!(
+            trust_relays(),
+            [
+                "wss://relay.damus.io",
+                "wss://nos.lol",
+                "wss://relay.primal.net",
+                "wss://purplepag.es",
+            ]
+        );
+        assert_eq!(
+            public_relays(),
+            [
+                "wss://relay.damus.io",
+                "wss://nos.lol",
+                "wss://relay.primal.net"
+            ]
+        );
     }
 
     /// A one-claim detail with no payment row, shaped like the live API.
