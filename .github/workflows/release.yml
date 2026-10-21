@@ -20,12 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # 1.99.0 matches rust-toolchain.toml; bump both together.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: 1.99.0
-          components: rustfmt, clippy
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      # rust-toolchain.toml is the only place the Rust version lives; rustup
+      # installs that channel and its components from it.
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup toolchain install && rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -88,11 +86,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # 1.99.0 matches rust-toolchain.toml; bump both together.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: 1.99.0
-          components: rustfmt, clippy
+      # rust-toolchain.toml is the only place the Rust version lives; rustup
+      # installs that channel and its components from it.
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
