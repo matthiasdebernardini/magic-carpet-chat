@@ -6,7 +6,7 @@
 //! channel and drains [`Update`]s from the other into the fields here, using
 //! the same task-held-in-`self` pattern as the chat's streaming reply.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
@@ -551,7 +551,7 @@ pub(crate) const BOUNTY_FIELD_DEFS: [(&str, &str, &str); 7] = [
 const F_SINGULAR: usize = 0;
 const F_PLURAL: usize = 1;
 const F_DESCRIPTION: usize = 2;
-const F_CRITERIA: usize = 3;
+pub(crate) const F_CRITERIA: usize = 3;
 const F_AMOUNT: usize = 4;
 const F_CAP: usize = 5;
 const F_RANK: usize = 6;
@@ -559,8 +559,13 @@ const F_RANK: usize = 6;
 /// The issuer's "New DList + bounty" form. Enter advances through the fields
 /// and submits from the last one; the flow it starts is
 /// PublishDList → DListPublished → CreateBounty → BountyCreated.
+/// Opened from the detail pane's "New bounty on this list" it is the
+/// existing-list mode: no list fields, CreateBounty straight away.
 pub(crate) struct BountyForm {
     pub fields: Vec<Entity<InputState>>,
+    /// Set: post on this existing list's coordinate. The list header is not
+    /// republished and the three list fields are hidden and unvalidated.
+    pub existing_list: Option<String>,
     pub error: Option<String>,
     pub submitting: bool,
     /// The create's outcome is unknown and a list read is out: the form
@@ -568,6 +573,86 @@ pub(crate) struct BountyForm {
     /// bounty the server may have made.
     pub checking_list: Option<u64>,
     _subs: Vec<Subscription>,
+}
+
+/// Whether any bounty on the list is still open (the server never dedupes).
+/// `known` is every bounty the app has seen, not just the loaded list (see
+/// `Shell::known_bounties`): the list may not have caught up.
+fn list_has_open_bounty<'a>(known: impl IntoIterator<Item = &'a Bounty>, coordinate: &str) -> bool {
+    let known: Vec<&Bounty> = known.into_iter().collect();
+    // Terminal is final, so it beats a stale "open" copy of the same id
+    // (details are never pruned).
+    known.iter().any(|b| {
+        b.list_coordinate == coordinate
+            && b.effective_status() == "open"
+            && !known
+                .iter()
+                .any(|t| t.id == b.id && nostr::TERMINAL_STATUSES.contains(&t.effective_status()))
+    })
+}
+
+/// A create on an existing list whose outcome is unknown (timed out or lost
+/// its reply). It lives on the shell, keyed by the list coordinate, not on
+/// the form, so closing and reopening the form cannot drop it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct UnknownCreate {
+    /// The bounty ids known on the list when that create went out.
+    ids_before: HashSet<String>,
+    /// A resubmit was refused, so the user has seen the warning.
+    refused: bool,
+}
+
+/// After an unknown outcome on `coordinate`: a bounty id on the list that
+/// was not there at that submit is most likely the one the server
+/// finished, so a resubmit would pay twice.
+fn new_bounty_since_submit<'a>(
+    unknown: &HashMap<String, UnknownCreate>,
+    known: impl IntoIterator<Item = &'a Bounty>,
+    coordinate: &str,
+) -> bool {
+    let Some(unknown) = unknown.get(coordinate) else {
+        return false;
+    };
+    known
+        .into_iter()
+        .any(|b| b.list_coordinate == coordinate && !unknown.ids_before.contains(&b.id))
+}
+
+/// The in-flight existing-list create's outcome is unknown: its snapshot
+/// becomes the resubmit guard for its list. Guards on other lists stay.
+fn on_list_create_unknown(
+    unknown: &mut HashMap<String, UnknownCreate>,
+    in_flight: &mut Option<(String, HashSet<String>)>,
+) {
+    if let Some((coordinate, ids_before)) = in_flight.take() {
+        unknown.insert(
+            coordinate,
+            UnknownCreate {
+                ids_before,
+                refused: false,
+            },
+        );
+    }
+}
+
+/// A bounty was created on `coordinate`: the guard for that list is done.
+fn on_list_created(unknown: &mut HashMap<String, UnknownCreate>, coordinate: &str) {
+    unknown.remove(coordinate);
+}
+
+/// The form on `coordinate` closed. After a refusal there the user has seen
+/// the warning, so a deliberate reopen-and-type is a real new bounty;
+/// before one, the guard stays. Other lists' guards are untouched.
+fn on_bounty_form_closed(unknown: &mut HashMap<String, UnknownCreate>, coordinate: &str) {
+    if unknown.get(coordinate).is_some_and(|u| u.refused) {
+        unknown.remove(coordinate);
+    }
+}
+
+/// "New bounty on this list" shows for the bounty's own issuer, whatever
+/// the list's other bounties are doing.
+fn can_post_on_list(active: Option<&str>, bounty: &Bounty) -> bool {
+    active == Some(bounty.issuer_pubkey.as_str())
 }
 
 /// The claimant's one-field claim form for the selected bounty.
@@ -612,6 +697,15 @@ pub struct Shell {
     /// The request as it went to the server (coordinate filled in), kept so
     /// `BountyCreated` can build the optimistic card from real values.
     submitted_bounty: Option<CreateBounty>,
+    /// The existing-list create that is out: its coordinate and the bounty
+    /// ids known on that list when it went out. One at most: the only
+    /// bounty form stays locked while its request is out.
+    list_submit: Option<(String, HashSet<String>)>,
+    /// The resubmit guards after existing-list creates' unknown outcomes,
+    /// by list coordinate. An entry is cleared by a create on that list or
+    /// a close of that list's form after a refusal. An account switch
+    /// keeps them: the coordinate carries the issuer's key.
+    unknown_create: HashMap<String, UnknownCreate>,
     /// Scrolls the bounty list; `scroll_to` is the id to bring into view once
     /// the list containing it arrives.
     pub(crate) bounty_list_scroll: ScrollHandle,
@@ -753,6 +847,8 @@ impl Shell {
             first_screen_decided: false,
             pending_bounty: None,
             submitted_bounty: None,
+            list_submit: None,
+            unknown_create: HashMap::new(),
             bounty_list_scroll: ScrollHandle::new(),
             scroll_to: None,
             commands,
@@ -793,6 +889,24 @@ impl Shell {
 
     pub(crate) fn views(&self) -> impl Iterator<Item = &AccountView> {
         self.views.iter().map(|(_, v)| v)
+    }
+
+    /// Whether the detail pane offers "New bounty on this list" for `bounty`.
+    pub(crate) fn can_post_on_list(&self, bounty: &Bounty) -> bool {
+        can_post_on_list(self.active.as_deref(), bounty)
+    }
+
+    /// The loaded list, the just-created card and the watched details: a new
+    /// bounty can live in only one of them until the list refetch lands.
+    fn known_bounties(&self) -> impl Iterator<Item = &Bounty> {
+        let loaded = match &self.bounties {
+            Load::Ready(bounties) => bounties.as_slice(),
+            _ => &[],
+        };
+        loaded
+            .iter()
+            .chain(self.optimistic.as_ref())
+            .chain(self.details.values().map(|d| &d.bounty))
     }
 
     /// The active account IS the issuer: ⌘N opens the bounty form, not a
@@ -1229,11 +1343,13 @@ impl Shell {
                 );
                 self.bounty_form = None;
                 self.pending_bounty = None;
+                self.list_submit = None;
                 self.focus.focus(window, cx);
                 self.selected = Some(id.clone());
                 // The detail pane shows the submitted values immediately; the
                 // watch's first snapshot (or the refreshed list) replaces them.
                 if let Some(req) = self.submitted_bounty.take() {
+                    on_list_created(&mut self.unknown_create, &req.list_coordinate);
                     self.optimistic = Some(optimistic_bounty(&id, req, now));
                 }
                 self.scroll_to = Some(id.clone());
@@ -1331,6 +1447,10 @@ impl Shell {
                                 self.pending_bounty = None;
                                 self.submitted_bounty = None;
                                 if source == ErrorSource::BountyOutcomeUnknown {
+                                    on_list_create_unknown(
+                                        &mut self.unknown_create,
+                                        &mut self.list_submit,
+                                    );
                                     // A timeout or dropped reply says nothing
                                     // about whether the server created it.
                                     form.error = Some(format!(
@@ -1342,6 +1462,7 @@ impl Shell {
                                     );
                                     let _ = self.commands.unbounded_send(read);
                                 }
+                                self.list_submit = None;
                             }
                     }
                     ErrorSource::Claim => {
@@ -2035,7 +2156,7 @@ impl Shell {
             self.go(Screen::Bounties, window, cx);
         }
         if self.is_active_issuer() {
-            self.open_bounty_form(window, cx)
+            self.open_bounty_form(None, window, cx)
         } else {
             self.open_claim_form(window, cx)
         }
@@ -2072,6 +2193,13 @@ impl Shell {
             return;
         }
         if self.bounty_form.is_some() || self.claim_form.is_some() {
+            if let Some(list) = self
+                .bounty_form
+                .as_ref()
+                .and_then(|f| f.existing_list.as_deref())
+            {
+                on_bounty_form_closed(&mut self.unknown_create, list);
+            }
             self.bounty_form = None;
             self.claim_form = None;
             self.pending_bounty = None;
@@ -2087,13 +2215,33 @@ impl Shell {
             }
     }
 
-    fn open_bounty_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the bounty form: the normal new-list mode, or (with a list
+    /// coordinate) the existing-list mode.
+    pub(crate) fn open_bounty_form(
+        &mut self,
+        existing_list: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.claim_form = None;
-        if self.bounty_form.is_some() {
-            // Already open: just put the caret back on the first field.
-            self.focus_bounty_field(F_SINGULAR, window, cx);
-            cx.notify();
-            return;
+        let first = if existing_list.is_some() {
+            F_CRITERIA
+        } else {
+            F_SINGULAR
+        };
+        if let Some(form) = &self.bounty_form {
+            if form.existing_list == existing_list {
+                // Already open: just put the caret back on the first field.
+                self.focus_bounty_field(first, window, cx);
+                cx.notify();
+                return;
+            }
+            // The other mode is open: replace it, unless its request is out.
+            if form_locked(form.submitting, form.checking_list) {
+                self.hold_for_submit();
+                cx.notify();
+                return;
+            }
         }
 
         let fields: Vec<Entity<InputState>> = BOUNTY_FIELD_DEFS
@@ -2123,12 +2271,13 @@ impl Shell {
 
         self.bounty_form = Some(BountyForm {
             fields,
+            existing_list,
             error: None,
             submitting: false,
             checking_list: None,
             _subs: subs,
         });
-        self.focus_bounty_field(F_SINGULAR, window, cx);
+        self.focus_bounty_field(first, window, cx);
         cx.notify();
     }
 
@@ -2156,6 +2305,7 @@ impl Shell {
         let value =
             |ix: usize| -> String { form.fields[ix].read(cx).value().trim().to_string() };
 
+        let existing_list = form.existing_list.clone();
         let singular = value(F_SINGULAR);
         let plural = value(F_PLURAL);
         let description = value(F_DESCRIPTION);
@@ -2168,7 +2318,7 @@ impl Shell {
         // positive) must be caught here, not by the server.
         // (message, field to put the caret back on)
         let mut fail: Option<(&str, usize)> = None;
-        if singular.is_empty() {
+        if existing_list.is_none() && singular.is_empty() {
             fail = Some(("Add an item name (singular).", F_SINGULAR));
         } else if criteria.is_empty() {
             fail = Some(("Add bounty criteria.", F_CRITERIA));
@@ -2222,37 +2372,62 @@ impl Shell {
             }
         };
 
-        // A bounty on this list already exists — typically a timed-out
-        // submit the server finished anyway. The server never dedupes. Only
+        // A bounty on this new list already exists — typically a timed-out
+        // submit the server finished anyway. The server never dedupes.
+        // Existing-list mode skips this: adding to a list is the point. Only
         // as good as the last list read: the form stays locked until the
         // reply to the read sent on the unknown outcome (or a later one)
         // lands. A create the server finishes after that read still slips
         // by, and a BountiesFailed unlocks against the old list.
-        let coordinate = nostr_sdk::prelude::PublicKey::from_hex(&pubkey)
-            .map(|pk| events::header_coordinate(&pk, &events::header_dtag(&singular)))
-            .ok();
-        if let (Load::Ready(bounties), Some(coordinate)) = (&self.bounties, &coordinate)
-            && bounties.iter().any(|b| {
-                &b.list_coordinate == coordinate && b.effective_status() == "open"
-            })
+        let coordinate = if existing_list.is_some() {
+            None
+        } else {
+            nostr_sdk::prelude::PublicKey::from_hex(&pubkey)
+                .map(|pk| events::header_coordinate(&pk, &events::header_dtag(&singular)))
+                .ok()
+        };
+        if let Some(coordinate) = &coordinate
+            && list_has_open_bounty(self.known_bounties(), coordinate)
         {
             fail = fail.or(Some((
                 "This list already has an open bounty. Pick it from the list instead.",
                 F_SINGULAR,
             )));
         }
+        // Existing-list mode: after an unknown outcome on this list, refuse
+        // when a bounty the timed-out submit did not know has appeared on it,
+        // from any form instance. Only as good as the last list read, the
+        // same as above.
+        // Shown only when no earlier check failed: that is the warning seen.
+        let refused = fail.is_none()
+            && existing_list.as_deref().is_some_and(|list| {
+                new_bounty_since_submit(&self.unknown_create, self.known_bounties(), list)
+            });
+        if refused {
+            fail = Some((
+                "A new bounty showed up on this list after the last try timed out. It is probably that try. Pick it from the list instead.",
+                F_CRITERIA,
+            ));
+        }
 
         if let Some((message, field)) = fail {
             if let Some(form) = &mut self.bounty_form {
                 form.error = Some(message.to_string());
+            }
+            if refused
+                && let Some(list) = &existing_list
+                && let Some(unknown) = self.unknown_create.get_mut(list)
+            {
+                unknown.refused = true;
             }
             self.focus_bounty_field(field, window, cx);
             cx.notify();
             return;
         }
 
-        self.pending_bounty = Some(CreateBounty {
-            // Filled in when DListPublished comes back with the coordinate.
+        let mut req = CreateBounty {
+            // Normal mode: filled in when DListPublished comes back with the
+            // coordinate. Existing-list mode: set below.
             list_coordinate: String::new(),
             amount_sats: amount.unwrap_or(0),
             criteria,
@@ -2263,17 +2438,33 @@ impl Shell {
             max_rewards_per_npub: Some(1),
             auto_pay: true,
             auto_pay_min_rank: min_rank,
-        });
-        let _ = self.commands.unbounded_send(Command::PublishDList {
-            pubkey,
-            singular,
-            plural,
-            description: if description.is_empty() {
-                None
-            } else {
-                Some(description)
-            },
-        });
+        };
+        if let Some(list_coordinate) = existing_list {
+            // The list is already published: create straight away.
+            let ids_before = self
+                .known_bounties()
+                .filter(|b| b.list_coordinate == list_coordinate)
+                .map(|b| b.id.clone())
+                .collect();
+            self.list_submit = Some((list_coordinate.clone(), ids_before));
+            req.list_coordinate = list_coordinate;
+            self.submitted_bounty = Some(req.clone());
+            let _ = self
+                .commands
+                .unbounded_send(Command::CreateBounty { pubkey, req });
+        } else {
+            self.pending_bounty = Some(req);
+            let _ = self.commands.unbounded_send(Command::PublishDList {
+                pubkey,
+                singular,
+                plural,
+                description: if description.is_empty() {
+                    None
+                } else {
+                    Some(description)
+                },
+            });
+        }
         if let Some(form) = &mut self.bounty_form {
             form.error = None;
             form.submitting = true;
@@ -3104,13 +3295,150 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        BalanceCheck, RANK_NOTE, RemoveAction, claim_notice, click_remove, fold_checks,
-        form_locked, next_bounties_read, on_outcome_unknown, pick_active, relay_address_gap,
-        remove_click, still_checking_list,
+        BalanceCheck, RANK_NOTE, RemoveAction, UnknownCreate, can_post_on_list, claim_notice,
+        click_remove, fold_checks, form_locked, list_has_open_bounty, new_bounty_since_submit,
+        next_bounties_read, on_bounty_form_closed, on_list_create_unknown, on_list_created,
+        on_outcome_unknown, pick_active, relay_address_gap, remove_click, still_checking_list,
     };
-    use std::collections::HashMap;
+    use magic_carpet_chat::api::Bounty;
+    use std::collections::{HashMap, HashSet};
 
     use magic_carpet_chat::nostr::{Command, Update};
+
+    #[test]
+    fn new_bounty_on_list_shows_for_the_issuer_and_open_checks_the_list() {
+        let row = |status: &str| -> Bounty {
+            serde_json::from_value(serde_json::json!({
+                "id": "b",
+                "issuer_pubkey": "aa",
+                "list_coordinate": "39998:aa:us-city",
+                "amount_sats": 100,
+                "status": status,
+            }))
+            .unwrap()
+        };
+        let (open, mut done) = (row("open"), row("fulfilled"));
+        // Another bounty on the list: a fulfilled copy of "b" would mask it.
+        done.id = "done".into();
+        let coord = "39998:aa:us-city";
+
+        // The button: the issuer only, open bounties on the list or not.
+        assert!(can_post_on_list(Some("aa"), &open));
+        assert!(can_post_on_list(Some("aa"), &done));
+        assert!(!can_post_on_list(Some("bb"), &open));
+        assert!(!can_post_on_list(None, &open));
+
+        // The new-list duplicate guard.
+        let mut other_list = row("open");
+        other_list.list_coordinate = "39998:aa:other".into();
+        assert!(!list_has_open_bounty([&done, &other_list], coord));
+        assert!(list_has_open_bounty([&done, &open], coord));
+        // The same id, open in a stale detail and fulfilled in the list.
+        let mut stale = open.clone();
+        stale.id = "old".into();
+        let mut settled = stale.clone();
+        settled.status = Some("fulfilled".into());
+        assert!(!list_has_open_bounty([&settled, &stale], coord));
+        assert!(!list_has_open_bounty([&stale, &settled], coord));
+    }
+
+    #[test]
+    fn resubmit_on_list_after_unknown_outcome_refuses_a_new_bounty() {
+        let row = |id: &str| -> Bounty {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "issuer_pubkey": "aa",
+                "list_coordinate": "39998:aa:us-city",
+                "amount_sats": 100,
+                "status": "open",
+            }))
+            .unwrap()
+        };
+        let (old, new) = (row("old"), row("new"));
+        let coord = "39998:aa:us-city";
+        let seen = &HashMap::from([(
+            coord.to_string(),
+            UnknownCreate {
+                ids_before: ["old".to_string()].into(),
+                refused: false,
+            },
+        )]);
+
+        // No unknown outcome: nothing to guard.
+        assert!(!new_bounty_since_submit(&HashMap::new(), [&old, &new], coord));
+        // Same ids as at the submit.
+        assert!(!new_bounty_since_submit(seen, [&old], coord));
+        // A new id on the list after the unknown outcome.
+        assert!(new_bounty_since_submit(seen, [&old, &new], coord));
+        // A new id on another list does not count.
+        let mut other = row("new");
+        other.list_coordinate = "39998:aa:other".into();
+        assert!(!new_bounty_since_submit(seen, [&old, &other], coord));
+        // A guard for another list does not apply here.
+        assert!(!new_bounty_since_submit(seen, [&old, &other], "39998:aa:other"));
+    }
+
+    #[test]
+    fn unknown_create_guard_survives_a_form_reopen() {
+        let (a, b) = ("39998:aa:us-city", "39998:aa:other");
+        let mut in_flight = Some((a.to_string(), HashSet::from(["old".to_string()])));
+        let mut unknown = HashMap::new();
+
+        // The create times out: its snapshot becomes the guard.
+        on_list_create_unknown(&mut unknown, &mut in_flight);
+        assert_eq!(in_flight, None);
+        assert_eq!(
+            unknown.get(a),
+            Some(&UnknownCreate {
+                ids_before: ["old".to_string()].into(),
+                refused: false,
+            })
+        );
+        // No create out: nothing to promote, the guard stays.
+        on_list_create_unknown(&mut unknown, &mut in_flight);
+        assert!(unknown.contains_key(a));
+
+        // esc before any refusal: the guard survives the reopen.
+        on_bounty_form_closed(&mut unknown, a);
+        assert!(unknown.contains_key(a));
+
+        // A timeout on list B keeps A's guard: a resubmit on A is still
+        // refused.
+        let mut in_flight = Some((b.to_string(), HashSet::new()));
+        on_list_create_unknown(&mut unknown, &mut in_flight);
+        assert!(unknown.contains_key(a) && unknown.contains_key(b));
+        let row = |id: &str| -> Bounty {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "issuer_pubkey": "aa",
+                "list_coordinate": a,
+                "amount_sats": 100,
+                "status": "open",
+            }))
+            .unwrap()
+        };
+        let (old, new) = (row("old"), row("new"));
+        assert!(new_bounty_since_submit(&unknown, [&old, &new], a));
+
+        // A create on list B leaves A's guard.
+        on_list_created(&mut unknown, b);
+        assert!(unknown.contains_key(a) && !unknown.contains_key(b));
+
+        // After a refusal, closing B's form leaves A's; closing A's ends it.
+        if let Some(u) = unknown.get_mut(a) {
+            u.refused = true;
+        }
+        on_bounty_form_closed(&mut unknown, b);
+        assert!(unknown.contains_key(a));
+        on_bounty_form_closed(&mut unknown, a);
+        assert!(unknown.is_empty());
+
+        // A create on the same list ends it, refused or not.
+        let mut in_flight = Some((a.to_string(), HashSet::new()));
+        on_list_create_unknown(&mut unknown, &mut in_flight);
+        on_list_created(&mut unknown, a);
+        assert!(unknown.is_empty());
+    }
 
     /// The community stale-reply guard, exercised the way
     /// `apply_community` uses it: look the panel up by pubkey, hand its

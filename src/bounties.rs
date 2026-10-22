@@ -15,7 +15,7 @@ use magic_carpet_chat::api::{Bounty, Claim};
 
 use crate::dashboard::{MONO, count_badge};
 use crate::palette::*;
-use crate::shell::{BOUNTY_FIELD_DEFS, Load, RANK_NOTE, Shell, short_id};
+use crate::shell::{BOUNTY_FIELD_DEFS, F_CRITERIA, Load, RANK_NOTE, Shell, short_id};
 use crate::timefmt;
 
 /// The human end of a list coordinate: `39998:<pk>:us-city` → `us-city`.
@@ -381,7 +381,7 @@ fn fact(label: &'static str, value: String) -> AnyElement {
         .into_any_element()
 }
 
-fn detail_pane(shell: &Shell) -> AnyElement {
+fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let Some(selected) = shell.selected.as_deref() else {
         return div()
             .flex_1()
@@ -403,6 +403,7 @@ fn detail_pane(shell: &Shell) -> AnyElement {
             .into_any_element();
     };
 
+    let can_post = shell.can_post_on_list(bounty);
     let status = bounty.effective_status().to_string();
     let mut facts: Vec<AnyElement> = vec![fact(
         "REWARD",
@@ -506,6 +507,26 @@ fn detail_pane(shell: &Shell) -> AnyElement {
             },
         )
         .child(h_flex().gap(px(22.)).items_start().children(facts))
+        .when(can_post, |this| {
+            let coordinate = bounty.list_coordinate.clone();
+            this.child(
+                div()
+                    .id("new-bounty-on-list")
+                    .self_start()
+                    .px(px(14.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(BORDER_3))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("New bounty on this list")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_bounty_form(Some(coordinate.clone()), window, cx)
+                    })),
+            )
+        })
         .child(
             h_flex()
                 .gap(px(8.))
@@ -609,15 +630,35 @@ fn labeled_input(label: &'static str, input: AnyElement) -> AnyElement {
 
 fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
     if let Some(form) = &shell.bounty_form {
-        let rows: Vec<AnyElement> = BOUNTY_FIELD_DEFS
+        // Existing-list mode hides the list fields (every field before the criteria).
+        let hidden = if form.existing_list.is_some() {
+            F_CRITERIA
+        } else {
+            0
+        };
+        let mut rows: Vec<AnyElement> = form
+            .existing_list
             .iter()
-            .zip(&form.fields)
-            .map(|((label, _, _), field)| {
-                labeled_input(label, Input::new(field).into_any_element())
+            .map(|coordinate| {
+                labeled_input(
+                    "List",
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(SharedString::from(coordinate_dtag(coordinate).to_string()))
+                        .into_any_element(),
+                )
             })
             .collect();
+        rows.extend(BOUNTY_FIELD_DEFS.iter().zip(&form.fields).skip(hidden).map(
+            |((label, _, _), field)| labeled_input(label, Input::new(field).into_any_element()),
+        ));
         return Some(form_card(
-            "New DList + bounty".into(),
+            if form.existing_list.is_some() {
+                "New bounty on this list".into()
+            } else {
+                "New DList + bounty".into()
+            },
             rows,
             form.error.clone(),
             if form.checking_list.is_some() {
@@ -625,7 +666,11 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             } else {
                 form.submitting.then_some("Publishing…")
             },
-            "Enter moves to the next field. Enter on the last field publishes the list and creates the auto-pay bounty, which commits sats. esc cancels.",
+            if form.existing_list.is_some() {
+                "Enter moves to the next field. Enter on the last field creates the auto-pay bounty, which commits sats. esc cancels."
+            } else {
+                "Enter moves to the next field. Enter on the last field publishes the list and creates the auto-pay bounty, which commits sats. esc cancels."
+            },
             cx,
         ));
     }
@@ -733,6 +778,6 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                 .gap(px(16.))
                 .items_stretch()
                 .child(list_pane(shell, cx))
-                .child(detail_pane(shell)),
+                .child(detail_pane(shell, cx)),
         )
 }

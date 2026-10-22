@@ -62,7 +62,7 @@ pub const HOUSE_ISSUER_HEX: &str =
 const ROWLESS_GRACE_SECS: u64 = 600;
 
 /// `derivedStatus` values after which a bounty can never pay again.
-const TERMINAL_STATUSES: [&str; 3] = ["fulfilled", "expired", "cancelled"];
+pub const TERMINAL_STATUSES: [&str; 3] = ["fulfilled", "expired", "cancelled"];
 
 /// `MC_RELAY_URL` overrides the prod relay, for rehearsals.
 pub fn relay_url() -> String {

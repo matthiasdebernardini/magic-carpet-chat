@@ -267,9 +267,9 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 
 **In one line.** cmd-N: the issuer's seven-field "New DList + bounty" form or the claimant's one-field claim form; Enter advances and submits.
 
-**What it does.** Issuer fields: item singular, items plural, list description, bounty criteria, reward per item (100), bounty cap (400), auto-pay minimum rank (2). Five are checked before anything publishes, because the DList goes out first and cannot be unpublished; plural and description are optional. Claimant field: the item name for the selected bounty.
+**What it does.** Issuer fields: item singular, items plural, list description, bounty criteria, reward per item (100), bounty cap (400), auto-pay minimum rank (2). Five are checked before anything publishes, because the DList goes out first and cannot be unpublished; plural and description are optional. Existing-list mode: the issuer's own bounty's detail pane has a "New bounty on this list" button (issuer only) that opens the same form on that list's coordinate, with the three list fields hidden; it creates a bounty on a list that is already published. Claimant field: the item name for the selected bounty.
 
-**How it's built.** `new_item` (`shell.rs:1157-1177`): keyless account opens the sidebar key input instead; else go to Bounties and open by role. `submit_bounty_form` (`shell.rs:1253-1366`) validates singular, criteria, reward, cap and rank, parks a `CreateBounty` in `pending_bounty` with `reward_per_item: true`, `max_rewards_per_npub: 1`, `auto_pay: true` hardcoded, and sends `PublishDList`. `DListPublished` fills the coordinate and sends `CreateBounty`; `BountyCreated` closes the form, selects the id, builds the optimistic card, sends `WatchBounty` and `FetchBounties`. The claim form snapshots bounty id and coordinate and sends `PublishClaim` (`shell.rs:1368-1428`). A form-scoped Error re-enables the form with the message.
+**How it's built.** `new_item` (`shell.rs:1157-1177`): keyless account opens the sidebar key input instead; else go to Bounties and open by role. `submit_bounty_form` (`shell.rs:1253-1366`) validates singular, criteria, reward, cap and rank, parks a `CreateBounty` in `pending_bounty` with `reward_per_item: true`, `max_rewards_per_npub: 1`, `auto_pay: true` hardcoded, and sends `PublishDList`. `DListPublished` fills the coordinate and sends `CreateBounty`; `BountyCreated` closes the form, selects the id, builds the optimistic card, sends `WatchBounty` and `FetchBounties`. The claim form snapshots bounty id and coordinate and sends `PublishClaim` (`shell.rs:1368-1428`). A form-scoped Error re-enables the form with the message. Existing-list mode (`open_bounty_form(Some(coordinate))`) skips `PublishDList` and the open-bounty duplicate guard and sends `CreateBounty` straight away, recording the bounty ids known on the list. An unknown outcome turns that record into that list's entry in `Shell.unknown_create`, a map keyed by list coordinate, so it survives esc, a reopen and a timeout on another list: any later submit on that list is refused while a new id has appeared on it since (`new_bounty_since_submit`), only as good as the last list read. A `BountyCreated` on that list or closing that list's form after the refusal was shown clears its entry. An account switch keeps them: the coordinate carries the issuer's key.
 
 **Steps in execution.**
 
@@ -278,7 +278,8 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 3. **Validate** — Empty singular or criteria, non-positive sats, cap below reward, bad rank: caret returns to the field.
 4. **Publish DList** — PublishDList; the bounty half waits in pending_bounty.
 5. **Create bounty** — On DListPublished: CreateBounty with the coordinate.
-6. **Claim** — One field, Enter sends PublishClaim; a sticky toast explains the rank gate.
+6. **Existing list** — From the detail pane: CreateBounty straight away on that coordinate, no PublishDList; after a timeout, any resubmit on that list, from this form or a reopened one, is refused if a new bounty showed up on it.
+7. **Claim** — One field, Enter sends PublishClaim; a sticky toast explains the rank gate.
 
 **Questions.**
 

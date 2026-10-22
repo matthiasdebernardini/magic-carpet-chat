@@ -868,6 +868,47 @@ async def scenario_q(sc):
     sc.check("the disabled publish sent no Brainstorm request", not posts, posts)
 
 
+# ---------------------------------------------------------------- S
+async def scenario_s(sc):
+    coord = "39998:%s:post-city" % sc.suite.keys["house"]["pub"]
+    sc.box.start_fake({"create": "ok", "dup_coordinate": coord})
+    sc.box.launch("S", sc.suite.run_id)
+    ok = await sc.step(Step("Show the Bounties screen with the house issuer selected and its open bounty's detail pane open.",
+                            [HOUSE, BOUNTIES], "The Bounties screen is shown and the detail pane has a 'New bounty on this list' button.",
+                            settle=2, cues=HOUSE_CUES + ("New bounty on this list",)), label="house on bounties")
+    if not (ok and sc.check_screen("issuer sees the button", ["New bounty on this list"], ["Submit a bounty claim"])):
+        return
+    await sc.step(Step("Open the form from the detail pane's button.",
+                       [Cand("click-new-on-list", "Click the 'New bounty on this list' button in the detail pane.",
+                             [FOCUS, ("click_text", "New bounty on this list"), ("wait", 1), PARK])],
+                       "A form titled 'New bounty on this list' is open with a 'Bounty criteria' field and no 'Item (singular)', 'Items (plural)' or 'List description' field.",
+                       settle=2, cues=("New bounty on this list", "Item (singular)", "Bounty criteria", "Cancel")), label="open list form")
+    # The issuer's header button always reads "+ New DList + bounty (⌘N)",
+    # and "List" alone matches it, so check the fields themselves.
+    sc.check_screen("existing-list form: criteria, no list fields", ["New bounty on this list", "Bounty criteria", "Cancel (esc)"],
+                    ["Item (singular)", "Items (plural)", "List description"])
+    sc.box.mark("S submit")
+    for kind, arg in [("type", "A post city name, one per claim"), ("key", "Return"), ("wait", 0.4),
+                      ("key", "ctrl+a"), ("type", "100"), ("key", "Return"), ("wait", 0.4),
+                      ("key", "ctrl+a"), ("type", "200"), ("key", "Return"), ("wait", 0.4),
+                      ("key", "ctrl+a"), ("type", "2"), ("key", "Return")]:
+        await sc.suite.driver.act(kind, arg)
+    await asyncio.sleep(4)
+    await sc.see("after create on the existing list")
+    lines = sc.log_after("S submit")
+    posts = [l for l in lines if l.startswith("POST /api/bounties")]
+    sc.check("exactly one create, on the existing list", len(posts) == 1 and posts[0].endswith("coord=post-city"), posts)
+    pubs = [l for l in lines if l.startswith("POST strfry/publish")]
+    sc.check("no list publish reached the server", not pubs, pubs)
+    # The new bounty's detail pane shows "New bounty on this list" again, so
+    # look for phrases only the form shows.
+    sc.check_screen("form closed after the create", [], ["Cancel (esc)", "Bounty criteria"])
+    await sc.step(Step("Select the next account (the claimant) and show the Bounties screen.", [NEXT_ACCOUNT],
+                       "The header button reads 'Submit a bounty claim'.", settle=2, cues=HOUSE_CUES + ("New bounty on this list",)),
+                  label="claimant selected")
+    sc.check_screen("non-issuer has no button", ["Submit a bounty claim"], ["New bounty on this list"])
+
+
 SCENARIOS = {
     "A": ("submit lock while a create hangs", scenario_a),
     "B": ("502 on create: hint and refetch", scenario_b),
@@ -882,6 +923,7 @@ SCENARIOS = {
     "N": ("trust: inconclusive contact read refuses", scenario_n),
     "O": ("trust: graperank 429/403/503 wording and retries", scenario_o),
     "Q": ("trust: /setup 404 keeps publish disabled", scenario_q),
+    "S": ("issuer posts a new bounty on an existing list", scenario_s),
     "P": ("paid: real bounty, claim, settle", scenario_p),
     "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),
 }
