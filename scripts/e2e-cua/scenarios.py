@@ -873,9 +873,11 @@ async def scenario_s(sc):
     coord = "39998:%s:post-city" % sc.suite.keys["house"]["pub"]
     sc.box.start_fake({"create": "ok", "dup_coordinate": coord})
     sc.box.launch("S", sc.suite.run_id)
-    ok = await sc.step(Step("Show the Bounties screen with the house issuer selected and its open bounty's detail pane open.",
-                            [HOUSE, BOUNTIES], "The Bounties screen is shown and the detail pane has a 'New bounty on this list' button.",
-                            settle=2, cues=HOUSE_CUES + ("New bounty on this list",)), label="house on bounties")
+    # The goal needs only the header button, as in H and R; the first bounty
+    # is auto-selected, so its detail pane follows and the check below reads it.
+    ok = await sc.step(Step("Show the Bounties screen with the house issuer selected (its header button reads 'New DList + bounty').",
+                            [HOUSE, BOUNTIES], "The Bounties screen is shown and its header button reads 'New DList + bounty'.",
+                            settle=2, cues=HOUSE_CUES + ("New bounty on this list",)), must_act=True, label="house on bounties")
     if not (ok and sc.check_screen("issuer sees the button", ["New bounty on this list"], ["Submit a bounty claim"])):
         return
     await sc.step(Step("Open the form from the detail pane's button.",
