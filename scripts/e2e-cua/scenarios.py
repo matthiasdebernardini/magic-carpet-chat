@@ -955,6 +955,8 @@ async def scenario_t(sc):
                        cues=("Submit a bounty claim", "New DList + bounty")), label="claimant")
     if not sc.check_screen("claimant selected, Eligible tab shown", ["Submit a bounty claim", "Eligible for me to claim"]):
         return
+    # Before the step: its super+] sends the house read.
+    sc.box.mark("T switch")
     # One candidate: the switch must land while the claimant's 8 s GET is held.
     await sc.step(Step("Open the 'Eligible for me to claim' tab, then switch to the house account while its list is still loading.",
                        [Cand("tab-then-switch", "Click the 'Eligible for me to claim' tab, then press super+] for the next account.",
@@ -962,7 +964,6 @@ async def scenario_t(sc):
                        "The header button reads 'New DList + bounty' (the house is selected).", tries=1, settle=1,
                        cues=("New DList + bounty", "Submit a bounty claim", "Eligible for me to claim")),
                   must_act=True, label="tab then switch")
-    sc.box.mark("T switch")
     await asyncio.sleep(max(0, sc.stamps.get("tab", time.time()) + 12 - time.time()))
     await sc.see("after the held claimant reply")
     sc.check_screen("house sees its own eligible list only", ["eligible-house", "you qualify", "New DList + bounty"],
@@ -984,11 +985,13 @@ async def scenario_t(sc):
                     ["eligible-house"], screen=screen)
     sc.check("a second claimant read went out", (claimant[:8], claimant[:8]) in eligible_gets(sc.log_after("T back")),
              sc.log_after("T back"))
-    # Nothing left to claim: the empty line.
+    # Nothing left to claim: the empty line, and the detail pane lets go of
+    # the row (the fake still answers its detail with the real coordinate).
     sc.box.set_mode({"eligible": {claimant: []}})
     await sc.suite.driver.act("key", "super+r")
     screen = await sc.wait_for(["No open bounties match"], timeout=20, every=3, label="empty list")
-    sc.check_screen("empty eligible list says so", ["No open bounties match"], ["eligible-claimant"], screen=screen)
+    sc.check_screen("empty eligible list says so, no stale detail", ["No open bounties match", "Select a bounty"],
+                    ["eligible-claimant"], screen=screen)
     sc.check("app still running", sc.box.app_alive())
 
 

@@ -676,6 +676,19 @@ fn find_bounty<'a>(
     optimistic.filter(|b| b.id == id)
 }
 
+/// The selection once `shown` is the list on screen: kept while that list
+/// holds it, else the list's first row, else none (the list is loading,
+/// failed or empty).
+fn selection_for(selected: Option<&str>, shown: &Load<Vec<Bounty>>) -> Option<String> {
+    let Load::Ready(list) = shown else {
+        return None;
+    };
+    list.iter()
+        .find(|b| Some(b.id.as_str()) == selected)
+        .or(list.first())
+        .map(|b| b.id.clone())
+}
+
 /// Which list the Bounties screen shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BountyTab {
@@ -1070,19 +1083,31 @@ impl Shell {
         let _ = self.commands.unbounded_send(read);
     }
 
-    /// A tab click: the Eligible tab re-reads its list, and the first row of
-    /// the tab's list is selected.
+    /// A tab click: the Eligible tab re-reads its list, and the selection
+    /// follows the tab's list.
     pub(crate) fn set_bounty_tab(&mut self, tab: BountyTab, cx: &mut Context<Self>) {
         self.bounty_tab = tab;
         if tab == BountyTab::Eligible {
             self.fetch_eligible();
         }
-        if let Load::Ready(list) = self.shown_list()
-            && let Some(first) = list.first()
-        {
-            self.select(first.id.clone());
-        }
+        self.reconcile_selection();
         cx.notify();
+    }
+
+    /// Keep the selection on a row the shown list holds ([`selection_for`]),
+    /// so the detail pane and ⌘N never act on a bounty this account or tab
+    /// does not show. A cleared selection takes an idle claim form with it.
+    fn reconcile_selection(&mut self) {
+        match selection_for(self.selected.as_deref(), self.shown_list()) {
+            Some(id) if self.selected.as_deref() == Some(id.as_str()) => {}
+            Some(id) => self.select(id),
+            None => {
+                self.selected = None;
+                if self.claim_form.as_ref().is_some_and(|f| !f.submitting) {
+                    self.claim_form = None;
+                }
+            }
+        }
     }
 
     pub(crate) fn selected_bounty(&self) -> Option<&Bounty> {
@@ -1184,6 +1209,7 @@ impl Shell {
                 if self.active != was_active {
                     self.send_inputs.clear(window, cx);
                     self.fetch_eligible();
+                    self.reconcile_selection();
                 }
                 let first_load = !self.first_screen_decided;
                 self.first_screen_decided = true;
@@ -1465,15 +1491,8 @@ impl Shell {
             Update::Eligible { pubkey, seq, list } => {
                 if land_eligible(self.eligible.as_mut(), &pubkey, seq, Ok(list))
                     && self.bounty_tab == BountyTab::Eligible
-                    && let Load::Ready(list) = self.eligible_list()
-                    && !list
-                        .iter()
-                        .any(|b| self.selected.as_deref() == Some(b.id.as_str()))
-                    && let Some(first) = list.first()
                 {
-                    // The tab was opened (or the account switched) before
-                    // the list arrived: its first row takes the selection.
-                    self.select(first.id.clone());
+                    self.reconcile_selection();
                 }
             }
             Update::EligibleFailed {
@@ -1487,6 +1506,9 @@ impl Shell {
                         format!("Eligible bounties didn't load: {message}"),
                         now,
                     );
+                    if self.bounty_tab == BountyTab::Eligible {
+                        self.reconcile_selection();
+                    }
                 }
             }
             Update::BountyDetail(detail) => {
@@ -1748,6 +1770,7 @@ impl Shell {
                 pubkey: pubkey.to_string(),
             });
             self.fetch_eligible();
+            self.reconcile_selection();
         }
         self.sync_balance_poll(cx);
         cx.notify();
@@ -3483,7 +3506,9 @@ mod tests {
         next_bounties_read, on_bounty_form_closed, on_list_create_unknown, on_list_created,
         on_outcome_unknown, pick_active, relay_address_gap, remove_click, still_checking_list,
     };
-    use super::{EligibleSlot, Load, find_bounty, land_eligible, next_eligible_read, takes};
+    use super::{
+        EligibleSlot, Load, find_bounty, land_eligible, next_eligible_read, selection_for, takes,
+    };
     use magic_carpet_chat::api::Bounty;
     use std::collections::{HashMap, HashSet};
 
@@ -3574,6 +3599,19 @@ mod tests {
         let (_, b7) = sent(next_eligible_read(&mut slot, &mut seq, "b"));
         assert!(land_eligible(slot.as_mut(), "b", b7, Err("down".into())));
         assert!(matches!(&slot, Some(EligibleSlot { list: Load::Failed(m), .. }) if m == "down"));
+    }
+
+    #[test]
+    fn the_selection_stays_on_a_row_the_shown_list_holds() {
+        let list = Load::Ready(vec![eligible_row("a", "x"), eligible_row("b", "x")]);
+        // Held: kept. Gone or none: the first row.
+        assert_eq!(selection_for(Some("b"), &list).as_deref(), Some("b"));
+        assert_eq!(selection_for(Some("zz"), &list).as_deref(), Some("a"));
+        assert_eq!(selection_for(None, &list).as_deref(), Some("a"));
+        // Loading, failed or empty: cleared, never left on the old row.
+        assert_eq!(selection_for(Some("b"), &Load::Loading), None);
+        assert_eq!(selection_for(Some("b"), &Load::Failed("down".into())), None);
+        assert_eq!(selection_for(Some("b"), &Load::Ready(Vec::new())), None);
     }
 
     #[test]

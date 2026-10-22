@@ -1009,9 +1009,10 @@ async fn ensure_login(session: &mut Session) -> Result<(), ApiError> {
 }
 
 /// Log in (dropping a stale `logged_in` first when `relogin`) under the
-/// account's lock, then hand back a clone of its `Api`. The clone shares the
-/// cookie jar, so the GET that follows runs on the session without holding
-/// the lock behind a slow create.
+/// account's lock, then hand back a clone of its `Api`. The login waits for
+/// the lock like any other session work; the clone shares the cookie jar, so
+/// the GET that follows runs without the lock and a create never waits
+/// behind a slow eligible read.
 async fn logged_in_api(session: &TokioMutex<Session>, relogin: bool) -> Result<Api, ApiError> {
     let mut session = session.lock().await;
     if relogin {

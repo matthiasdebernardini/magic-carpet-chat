@@ -12,7 +12,8 @@ The mode lives in $E2E_DIR/mode.json and is re-read on every request:
 GET /api/bounties/eligible needs the sid cookie login-user set: 401 without
 one, 403 when ?viewer= is not the session pubkey, like
 magic-carpet-v2/src/api/bounties.js:294-320. A null auto_pay_min_rank is a
-manual-pay row.
+manual-pay row. GET /api/bounties/<id> answers an id the eligible route
+served with that row, even after the mode drops it.
 Writing the mode file resets the create counter. Every request is appended to
 $E2E_DIR/server.log; the suite reads that log for its request checks.
 
@@ -30,7 +31,8 @@ from urllib.parse import urlparse, parse_qs
 DIR = os.environ.get("E2E_DIR", "/tmp/e2e")
 MODE = os.path.join(DIR, "mode.json")
 LOG = os.path.join(DIR, "server.log")
-state = {"mtime": None, "creates": 0, "made": {}, "grape": []}   # made: bounties created here, by id
+state = {"mtime": None, "creates": 0, "made": {}, "grape": [],   # made: bounties created here, by id
+         "eligible_seen": {}}   # eligible rows served, by id, without issuerRank (the detail route has none)
 SESSIONS = {}   # sid cookie -> the pubkey that logged in with it
 
 BS_PORT = int(os.environ.get("BS_PORT", "8788"))
@@ -115,7 +117,10 @@ class H(BaseHTTPRequestHandler):
         if u.path.startswith("/api/bounties/"):
             bid = u.path.rsplit("/", 1)[1]
             log("GET /api/bounties/%s" % bid)
-            made = state["made"].get(bid) or bounty(bid, m["dup_coordinate"] or "39998:00:x")
+            # An id the eligible route served answers with its own coordinate
+            # and issuer, even after the mode drops it from the list.
+            made = (state["made"].get(bid) or state["eligible_seen"].get(bid)
+                    or bounty(bid, m["dup_coordinate"] or "39998:00:x"))
             return self.send(200, {"success": True, "bounty": made, "claims": []})
         if u.path == "/api/strfry/scan":
             f = q.get("filter", [""])[0]
@@ -147,6 +152,8 @@ class H(BaseHTTPRequestHandler):
         rows = (m.get("eligible") or {}).get(viewer, [])
         bs = [bounty(bid, coord, criteria=crit, issuerRank=rank, auto_pay=apm is not None, auto_pay_min_rank=apm)
               for bid, coord, rank, apm, crit in rows]
+        for b in bs:
+            state["eligible_seen"][b["id"]] = {k: v for k, v in b.items() if k != "issuerRank"}
         log("GET /api/bounties/eligible viewer=%s session=%s -> %d" % (viewer[:8], who[:8], len(bs)))
         d = float((m.get("eligible_delay") or {}).get(viewer) or 0)
         if d > 0:

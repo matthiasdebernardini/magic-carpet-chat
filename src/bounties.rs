@@ -310,7 +310,10 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                     div()
                         .text_size(px(12.5))
                         .text_color(rgb(RED))
-                        .child(SharedString::from(format!("Bounties didn't load: {message} Click Retry."))),
+                        .child(SharedString::from(format!(
+                            "{} didn't load: {message} Click Retry.",
+                            if eligible { "Eligible bounties" } else { "Bounties" }
+                        ))),
                 )
                 .child(
                     div()
@@ -324,6 +327,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                         .text_size(px(11.5))
                         .text_color(rgb(ACCENT_LIGHT))
                         .child("Retry (⌘R)")
+                        // refresh re-reads both lists, the eligible one too.
                         .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                 )
                 .into_any_element(),
