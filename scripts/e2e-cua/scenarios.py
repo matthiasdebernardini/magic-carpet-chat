@@ -227,6 +227,7 @@ async def scenario_f(sc):
 
 
 # ---------------------------------------------------------------- G
+BOUNTIES_XY = (150, 250)  # the "Bounties" sidebar row (window at 0,0, 1280x960)
 CHIP_XY = (135, 116)  # the account name at the top of the sidebar
 REMOVE_LINK_XY = (143, 155)  # "Remove this account" under the chip (window at 0,0, 1280x960); fixed, so no OCR pass
 IDENTITY = Step("Open the Identity & keys tab of the active account's page.",
@@ -948,9 +949,12 @@ async def scenario_t(sc):
     sc.box.start_fake({"eligible": lists, "eligible_delay": {claimant: 8}})
     sc.box.mark("T launch")
     sc.box.launch("T", sc.suite.run_id)
-    await sc.step(Step("Select the claimant account and show Bounties (the claimant's header button reads 'Submit a bounty claim').",
-                       [Cand("claimant-avatar", "Click the second avatar in the left rail, then press super+2 for Bounties.",
-                             [FOCUS, ("avatar", "claimant"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])],
+    # The claimant is already active at launch. The search box holds the focus
+    # then and eats super+2, and click_text "Bounties" can hit the search
+    # placeholder: click the sidebar row by its fixed point instead.
+    await sc.step(Step("Show the Bounties screen for the claimant (the claimant's header button reads 'Submit a bounty claim').",
+                       [Cand("click-bounties", "Click 'Bounties' in the left sidebar.",
+                             [FOCUS, ("click", BOUNTIES_XY), ("wait", 1), PARK])],
                        "The Bounties screen shows the 'Eligible for me to claim' tab and the header button reads 'Submit a bounty claim'.", settle=3,
                        cues=("Submit a bounty claim", "New DList + bounty", "Eligible for me to claim")),
                   must_act=True, label="claimant")
@@ -989,7 +993,10 @@ async def scenario_t(sc):
     # Nothing left to claim: the empty line, and the detail pane lets go of
     # the row (the fake still answers its detail with the real coordinate).
     sc.box.set_mode({"eligible": {claimant: []}})
-    await sc.suite.driver.act("key", "super+r")
+    # xfwm4 grabs Super+r on the box, so XTEST never delivers the app's refresh
+    # chord. Clicking the tab that is already open re-reads the list the same way.
+    for act in ELIGIBLE_TAB.do:
+        await sc.suite.driver.act(*act)
     screen = await sc.wait_for(["No open bounties match"], timeout=20, every=3, label="empty list")
     sc.check_screen("empty eligible list says so, no stale detail", ["No open bounties match", "Select a bounty"],
                     ["eligible-claimant"], screen=screen)
