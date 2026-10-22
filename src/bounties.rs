@@ -235,7 +235,7 @@ fn tab(
             }
         })
         .child(SharedString::from(label))
-        .on_click(cx.listener(move |this, _, _, cx| this.set_bounty_tab(tab, cx)))
+        .on_click(cx.listener(move |this, _, window, cx| this.set_bounty_tab(tab, window, cx)))
         .into_any_element()
 }
 

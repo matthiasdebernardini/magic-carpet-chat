@@ -677,9 +677,17 @@ fn find_bounty<'a>(
 }
 
 /// The selection once `shown` is the list on screen: kept while that list
-/// holds it, else the list's first row, else none (the list is loading,
-/// failed or empty).
-fn selection_for(selected: Option<&str>, shown: &Load<Vec<Bounty>>) -> Option<String> {
+/// or `pending` (the just-created card the list does not carry yet) holds
+/// it, else the list's first row, else none (the list is loading, failed or
+/// empty).
+fn selection_for(
+    selected: Option<&str>,
+    shown: &Load<Vec<Bounty>>,
+    pending: Option<&str>,
+) -> Option<String> {
+    if let Some(id) = selected.filter(|id| pending == Some(*id)) {
+        return Some(id.to_string());
+    }
     let Load::Ready(list) = shown else {
         return None;
     };
@@ -687,6 +695,15 @@ fn selection_for(selected: Option<&str>, shown: &Load<Vec<Bounty>>) -> Option<St
         .find(|b| Some(b.id.as_str()) == selected)
         .or(list.first())
         .map(|b| b.id.clone())
+}
+
+/// A house list reply picks its first row only while nothing is selected
+/// and the House tab is showing: on the Eligible tab a cleared selection
+/// means that list has nothing to show.
+fn house_reply_pick(tab: BountyTab, selected: Option<&str>, list: &[Bounty]) -> Option<String> {
+    (tab == BountyTab::House && selected.is_none())
+        .then(|| list.first().map(|b| b.id.clone()))
+        .flatten()
 }
 
 /// Which list the Bounties screen shows.
@@ -1085,28 +1102,44 @@ impl Shell {
 
     /// A tab click: the Eligible tab re-reads its list, and the selection
     /// follows the tab's list.
-    pub(crate) fn set_bounty_tab(&mut self, tab: BountyTab, cx: &mut Context<Self>) {
+    pub(crate) fn set_bounty_tab(
+        &mut self,
+        tab: BountyTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.bounty_tab = tab;
         if tab == BountyTab::Eligible {
             self.fetch_eligible();
         }
-        self.reconcile_selection();
+        self.reconcile_selection(window, cx);
         cx.notify();
     }
 
     /// Keep the selection on a row the shown list holds ([`selection_for`]),
     /// so the detail pane and ⌘N never act on a bounty this account or tab
-    /// does not show. A cleared selection takes an idle claim form with it.
-    fn reconcile_selection(&mut self) {
-        match selection_for(self.selected.as_deref(), self.shown_list()) {
+    /// does not show. On the House tab the just-created card counts as
+    /// shown. An idle claim form aimed at another bounty than the new
+    /// selection closes rather than retargets, so Enter never claims a row
+    /// nobody picked; a submitting one is left alone.
+    fn reconcile_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = match self.bounty_tab {
+            BountyTab::House => self.optimistic.as_ref().map(|b| b.id.as_str()),
+            BountyTab::Eligible => None,
+        };
+        let next = selection_for(self.selected.as_deref(), self.shown_list(), pending);
+        if self
+            .claim_form
+            .as_ref()
+            .is_some_and(|f| !f.submitting && next.as_deref() != Some(f.bounty_id.as_str()))
+        {
+            self.claim_form = None;
+            self.focus.focus(window, cx);
+        }
+        match next {
             Some(id) if self.selected.as_deref() == Some(id.as_str()) => {}
             Some(id) => self.select(id),
-            None => {
-                self.selected = None;
-                if self.claim_form.as_ref().is_some_and(|f| !f.submitting) {
-                    self.claim_form = None;
-                }
-            }
+            None => self.selected = None,
         }
     }
 
@@ -1209,7 +1242,7 @@ impl Shell {
                 if self.active != was_active {
                     self.send_inputs.clear(window, cx);
                     self.fetch_eligible();
-                    self.reconcile_selection();
+                    self.reconcile_selection(window, cx);
                 }
                 let first_load = !self.first_screen_decided;
                 self.first_screen_decided = true;
@@ -1461,10 +1494,11 @@ impl Shell {
                 }
             }
             Update::Bounties { list, .. } => {
-                if self.selected.is_none()
-                    && let Some(first) = list.first() {
-                        self.select(first.id.clone());
-                    }
+                if let Some(first) =
+                    house_reply_pick(self.bounty_tab, self.selected.as_deref(), &list)
+                {
+                    self.select(first);
+                }
                 // The server list now carries the just-created bounty: the
                 // optimistic copy has done its job.
                 if let Some(bounty) = &self.optimistic
@@ -1492,7 +1526,7 @@ impl Shell {
                 if land_eligible(self.eligible.as_mut(), &pubkey, seq, Ok(list))
                     && self.bounty_tab == BountyTab::Eligible
                 {
-                    self.reconcile_selection();
+                    self.reconcile_selection(window, cx);
                 }
             }
             Update::EligibleFailed {
@@ -1507,7 +1541,7 @@ impl Shell {
                         now,
                     );
                     if self.bounty_tab == BountyTab::Eligible {
-                        self.reconcile_selection();
+                        self.reconcile_selection(window, cx);
                     }
                 }
             }
@@ -1770,7 +1804,7 @@ impl Shell {
                 pubkey: pubkey.to_string(),
             });
             self.fetch_eligible();
-            self.reconcile_selection();
+            self.reconcile_selection(window, cx);
         }
         self.sync_balance_poll(cx);
         cx.notify();
@@ -3507,7 +3541,8 @@ mod tests {
         on_outcome_unknown, pick_active, relay_address_gap, remove_click, still_checking_list,
     };
     use super::{
-        EligibleSlot, Load, find_bounty, land_eligible, next_eligible_read, selection_for, takes,
+        BountyTab, EligibleSlot, Load, find_bounty, house_reply_pick, land_eligible,
+        next_eligible_read, selection_for, takes,
     };
     use magic_carpet_chat::api::Bounty;
     use std::collections::{HashMap, HashSet};
@@ -3605,13 +3640,46 @@ mod tests {
     fn the_selection_stays_on_a_row_the_shown_list_holds() {
         let list = Load::Ready(vec![eligible_row("a", "x"), eligible_row("b", "x")]);
         // Held: kept. Gone or none: the first row.
-        assert_eq!(selection_for(Some("b"), &list).as_deref(), Some("b"));
-        assert_eq!(selection_for(Some("zz"), &list).as_deref(), Some("a"));
-        assert_eq!(selection_for(None, &list).as_deref(), Some("a"));
+        assert_eq!(selection_for(Some("b"), &list, None).as_deref(), Some("b"));
+        assert_eq!(selection_for(Some("zz"), &list, None).as_deref(), Some("a"));
+        assert_eq!(selection_for(None, &list, None).as_deref(), Some("a"));
         // Loading, failed or empty: cleared, never left on the old row.
-        assert_eq!(selection_for(Some("b"), &Load::Loading), None);
-        assert_eq!(selection_for(Some("b"), &Load::Failed("down".into())), None);
-        assert_eq!(selection_for(Some("b"), &Load::Ready(Vec::new())), None);
+        assert_eq!(selection_for(Some("b"), &Load::Loading, None), None);
+        assert_eq!(
+            selection_for(Some("b"), &Load::Failed("down".into()), None),
+            None
+        );
+        assert_eq!(
+            selection_for(Some("b"), &Load::Ready(Vec::new()), None),
+            None
+        );
+        // The just-created card keeps its selection before the list has it.
+        assert_eq!(
+            selection_for(Some("new"), &list, Some("new")).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            selection_for(Some("new"), &Load::Loading, Some("new")).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            selection_for(Some("zz"), &list, Some("new")).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn a_house_reply_selects_only_on_the_house_tab_with_nothing_selected() {
+        let list = [eligible_row("h", "x")];
+        assert_eq!(
+            house_reply_pick(BountyTab::House, None, &list).as_deref(),
+            Some("h")
+        );
+        assert_eq!(house_reply_pick(BountyTab::House, Some("e"), &list), None);
+        assert_eq!(house_reply_pick(BountyTab::House, None, &[]), None);
+        // An empty or failed Eligible list cleared the selection: a house
+        // reply landing after it must not fill the detail pane.
+        assert_eq!(house_reply_pick(BountyTab::Eligible, None, &list), None);
     }
 
     #[test]
