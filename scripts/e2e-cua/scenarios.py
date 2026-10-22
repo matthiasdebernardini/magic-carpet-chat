@@ -911,6 +911,87 @@ async def scenario_s(sc):
     sc.check_screen("non-issuer has no button", ["Submit a bounty claim"], ["New bounty on this list"])
 
 
+# ---------------------------------------------------------------- T
+ELIGIBLE_TAB = Cand("eligible-tab", "Click the 'Eligible for me to claim' tab above the bounty list.",
+                    [FOCUS, ("click_text", "Eligible for me to claim"), ("wait", 1), PARK])
+
+
+def eligible_gets(lines):
+    """(viewer, session) of each eligible GET line in the fake's log."""
+    out = []
+    for l in lines:
+        if l.startswith("GET /api/bounties/eligible"):
+            f = dict(p.split("=", 1) for p in l.split() if "=" in p)
+            out.append((f.get("viewer"), f.get("session")))
+    return out
+
+
+def logged_in_first(lines, who):
+    """`who` (8-char prefix) logged in before its first eligible GET."""
+    login = next((i for i, l in enumerate(lines) if l == f"POST login-user pubkey={who}"), None)
+    get = next((i for i, l in enumerate(lines)
+                if l.startswith(f"GET /api/bounties/eligible viewer={who} session={who}")), None)
+    return login is not None and get is not None and login < get
+
+
+async def scenario_t(sc):
+    house, claimant = sc.suite.keys["house"]["pub"], sc.suite.keys["claimant"]["pub"]
+    other = "e" * 64
+    lists = {
+        claimant: [["elig-c", f"39998:{other}:eligible-claimant", 3, 3, "e2e"]],
+        # The house's own bounty (rank 100 for self) and a rank-2 row on a
+        # min-3 auto-pay bounty: the server sends both, the app hides both.
+        house: [["elig-h", f"39998:{other}:eligible-house", 2, None, "e2e"],
+                ["elig-own", f"39998:{house}:eligible-own", 100, 2, "e2e"],
+                ["elig-gated", f"39998:{other}:eligible-gated", 2, 3, "e2e"]],
+    }
+    sc.box.start_fake({"eligible": lists, "eligible_delay": {claimant: 8}})
+    sc.box.mark("T launch")
+    sc.box.launch("T", sc.suite.run_id)
+    await sc.step(Step("Select the claimant account and show Bounties (the claimant's header button reads 'Submit a bounty claim').",
+                       [Cand("claimant-avatar", "Click the second avatar in the left rail, then press super+2 for Bounties.",
+                             [FOCUS, ("avatar", "claimant"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])],
+                       "The Bounties header button reads 'Submit a bounty claim'.", settle=3,
+                       cues=("Submit a bounty claim", "New DList + bounty")), label="claimant")
+    if not sc.check_screen("claimant selected, Eligible tab shown", ["Submit a bounty claim", "Eligible for me to claim"]):
+        return
+    # One candidate: the switch must land while the claimant's 8 s GET is held.
+    await sc.step(Step("Open the 'Eligible for me to claim' tab, then switch to the house account while its list is still loading.",
+                       [Cand("tab-then-switch", "Click the 'Eligible for me to claim' tab, then press super+] for the next account.",
+                             ELIGIBLE_TAB.do + [("stamp", "tab"), ("key", "super+bracketright"), ("wait", 1)])],
+                       "The header button reads 'New DList + bounty' (the house is selected).", tries=1, settle=1,
+                       cues=("New DList + bounty", "Submit a bounty claim", "Eligible for me to claim")),
+                  must_act=True, label="tab then switch")
+    sc.box.mark("T switch")
+    await asyncio.sleep(max(0, sc.stamps.get("tab", time.time()) + 12 - time.time()))
+    await sc.see("after the held claimant reply")
+    sc.check_screen("house sees its own eligible list only", ["eligible-house", "you qualify", "New DList + bounty"],
+                    ["eligible-claimant", "eligible-own", "eligible-gated"])
+    lines = sc.log_after("T launch")
+    gets = eligible_gets(lines)
+    sc.check("every eligible GET is for the session's own account", gets and all(v == s for v, s in gets), gets)
+    sc.check("the claimant and the house each read their list",
+             (claimant[:8], claimant[:8]) in gets and (house[:8], house[:8]) in gets, gets)
+    sc.check("each account logged in before its first eligible read",
+             logged_in_first(lines, claimant[:8]) and logged_in_first(lines, house[:8]), lines)
+    sc.check("the house read went out after the switch", (house[:8], house[:8]) in eligible_gets(sc.log_after("T switch")),
+             sc.log_after("T switch"))
+    # Back to the claimant: its list is read again and shows.
+    sc.box.mark("T back")
+    await sc.suite.driver.act("key", "super+bracketright")
+    screen = await sc.wait_for(["eligible-claimant"], timeout=20, every=3, label="claimant list")
+    sc.check_screen("the claimant's list shows after switching back", ["eligible-claimant", "Submit a bounty claim"],
+                    ["eligible-house"], screen=screen)
+    sc.check("a second claimant read went out", (claimant[:8], claimant[:8]) in eligible_gets(sc.log_after("T back")),
+             sc.log_after("T back"))
+    # Nothing left to claim: the empty line.
+    sc.box.set_mode({"eligible": {claimant: []}})
+    await sc.suite.driver.act("key", "super+r")
+    screen = await sc.wait_for(["No open bounties match"], timeout=20, every=3, label="empty list")
+    sc.check_screen("empty eligible list says so", ["No open bounties match"], ["eligible-claimant"], screen=screen)
+    sc.check("app still running", sc.box.app_alive())
+
+
 SCENARIOS = {
     "A": ("submit lock while a create hangs", scenario_a),
     "B": ("502 on create: hint and refetch", scenario_b),
@@ -926,6 +1007,7 @@ SCENARIOS = {
     "O": ("trust: graperank 429/403/503 wording and retries", scenario_o),
     "Q": ("trust: /setup 404 keeps publish disabled", scenario_q),
     "S": ("issuer posts a new bounty on an existing list", scenario_s),
+    "T": ("eligible list survives an account switch mid-request", scenario_t),
     "P": ("paid: real bounty, claim, settle", scenario_p),
     "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),
 }

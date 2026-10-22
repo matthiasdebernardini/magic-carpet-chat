@@ -19,7 +19,7 @@ use gpui_kit::component::{
     v_flex,
 };
 
-use magic_carpet_chat::api::{Bounty, BountyDetail, CreateBounty};
+use magic_carpet_chat::api::{Bounty, BountyDetail, CreateBounty, claimable_by};
 use magic_carpet_chat::coinos;
 use magic_carpet_chat::events;
 use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated};
@@ -655,6 +655,96 @@ fn can_post_on_list(active: Option<&str>, bounty: &Bounty) -> bool {
     active == Some(bounty.issuer_pubkey.as_str())
 }
 
+/// The bounty by id, from the freshest source that has it: the detail
+/// snapshot, then the loaded lists in order, then the optimistic copy.
+fn find_bounty<'a>(
+    details: &'a HashMap<String, BountyDetail>,
+    lists: [&'a Load<Vec<Bounty>>; 2],
+    optimistic: Option<&'a Bounty>,
+    id: &str,
+) -> Option<&'a Bounty> {
+    if let Some(detail) = details.get(id) {
+        return Some(&detail.bounty);
+    }
+    for list in lists {
+        if let Load::Ready(list) = list
+            && let Some(bounty) = list.iter().find(|b| b.id == id)
+        {
+            return Some(bounty);
+        }
+    }
+    optimistic.filter(|b| b.id == id)
+}
+
+/// Which list the Bounties screen shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BountyTab {
+    /// The house issuer's bounties (`FetchBounties`).
+    House,
+    /// The active account's eligible list (`FetchEligible`).
+    Eligible,
+}
+
+/// The eligible list for one account, with the reads it answers to.
+pub(crate) struct EligibleSlot {
+    pub pubkey: String,
+    /// The first `FetchEligible` seq sent for this account since it became
+    /// active: a reply from an earlier stint (A → B → A) is older.
+    since: u64,
+    /// The seq of the last reply folded in, so an older reply that lands
+    /// late never overwrites a newer list.
+    applied: u64,
+    pub list: Load<Vec<Bounty>>,
+}
+
+/// Whether a `FetchEligible` reply belongs in `slot`: the same account, a
+/// read sent since it became active, and newer than the reply already shown.
+fn takes(slot: &EligibleSlot, pubkey: &str, seq: u64) -> bool {
+    pubkey == slot.pubkey && seq >= slot.since && seq > slot.applied
+}
+
+/// The next eligible read for `pubkey`. A new account gets a fresh slot
+/// starting at this read; the same account keeps its list on screen.
+fn next_eligible_read(slot: &mut Option<EligibleSlot>, seq: &mut u64, pubkey: &str) -> Command {
+    *seq += 1;
+    if slot.as_ref().is_none_or(|s| s.pubkey != pubkey) {
+        *slot = Some(EligibleSlot {
+            pubkey: pubkey.to_string(),
+            since: *seq,
+            applied: 0,
+            list: Load::Loading,
+        });
+    }
+    Command::FetchEligible {
+        pubkey: pubkey.to_string(),
+        seq: *seq,
+    }
+}
+
+/// Fold an `Eligible` (Ok) or `EligibleFailed` (Err) reply into `slot`.
+/// The list is filtered to what `pubkey` can claim; a failure keeps a list
+/// already on screen and fails only a first load. False when stale.
+fn land_eligible(
+    slot: Option<&mut EligibleSlot>,
+    pubkey: &str,
+    seq: u64,
+    result: Result<Vec<Bounty>, String>,
+) -> bool {
+    let Some(slot) = slot.filter(|s| takes(s, pubkey, seq)) else {
+        return false;
+    };
+    slot.applied = seq;
+    match result {
+        Ok(list) => slot.list = Load::Ready(claimable_by(list, pubkey)),
+        Err(message) => {
+            if !matches!(slot.list, Load::Ready(_)) {
+                slot.list = Load::Failed(message);
+            }
+        }
+    }
+    true
+}
+
 /// The claimant's one-field claim form for the selected bounty.
 pub(crate) struct ClaimForm {
     pub bounty_id: String,
@@ -676,6 +766,12 @@ pub struct Shell {
     pub(crate) relay_connected: bool,
     pub(crate) activity: Vec<ActivityItem>,
     pub(crate) bounties: Load<Vec<Bounty>>,
+    /// The Bounties screen's tab. Eligible only while an account is active.
+    pub(crate) bounty_tab: BountyTab,
+    /// The active account's eligible list; `None` in read-only mode.
+    pub(crate) eligible: Option<EligibleSlot>,
+    /// The last `FetchEligible` sequence number sent.
+    eligible_seq: u64,
     /// The bounty the detail pane (and the auto-pay pill) is about.
     pub(crate) selected: Option<String>,
     /// Latest full snapshot per watched bounty, straight from the runtime.
@@ -838,6 +934,9 @@ impl Shell {
             relay_connected: false,
             activity: Vec::new(),
             bounties: Load::Loading,
+            bounty_tab: BountyTab::House,
+            eligible: None,
+            eligible_seq: 0,
             selected: None,
             details: HashMap::new(),
             optimistic: None,
@@ -927,15 +1026,63 @@ impl Shell {
     /// wins; the optimistic copy only fills the gap between BountyCreated and
     /// the first list/detail that includes it.
     fn bounty(&self, id: &str) -> Option<&Bounty> {
-        if let Some(detail) = self.details.get(id) {
-            return Some(&detail.bounty);
+        find_bounty(
+            &self.details,
+            [&self.bounties, self.eligible_list()],
+            self.optimistic.as_ref(),
+            id,
+        )
+    }
+
+    /// The active account's eligible list, `Loading` when there is none.
+    fn eligible_list(&self) -> &Load<Vec<Bounty>> {
+        self.eligible
+            .as_ref()
+            .map_or(&Load::Loading, |slot| &slot.list)
+    }
+
+    /// The eligible row for `id`: the only copy that carries `issuerRank`
+    /// (the detail snapshot does not).
+    pub(crate) fn eligible_bounty(&self, id: &str) -> Option<&Bounty> {
+        match self.eligible_list() {
+            Load::Ready(list) => list.iter().find(|b| b.id == id),
+            _ => None,
         }
-        if let Load::Ready(list) = &self.bounties
-            && let Some(bounty) = list.iter().find(|b| b.id == id)
+    }
+
+    /// The list the Bounties screen shows on its current tab.
+    pub(crate) fn shown_list(&self) -> &Load<Vec<Bounty>> {
+        match self.bounty_tab {
+            BountyTab::House => &self.bounties,
+            BountyTab::Eligible => self.eligible_list(),
+        }
+    }
+
+    /// Asks for the active account's eligible list. Read-only mode has none,
+    /// and the Eligible tab goes with it.
+    fn fetch_eligible(&mut self) {
+        let Some(pubkey) = self.active.clone() else {
+            self.eligible = None;
+            self.bounty_tab = BountyTab::House;
+            return;
+        };
+        let read = next_eligible_read(&mut self.eligible, &mut self.eligible_seq, &pubkey);
+        let _ = self.commands.unbounded_send(read);
+    }
+
+    /// A tab click: the Eligible tab re-reads its list, and the first row of
+    /// the tab's list is selected.
+    pub(crate) fn set_bounty_tab(&mut self, tab: BountyTab, cx: &mut Context<Self>) {
+        self.bounty_tab = tab;
+        if tab == BountyTab::Eligible {
+            self.fetch_eligible();
+        }
+        if let Load::Ready(list) = self.shown_list()
+            && let Some(first) = list.first()
         {
-            return Some(bounty);
+            self.select(first.id.clone());
         }
-        self.optimistic.as_ref().filter(|b| b.id == id)
+        cx.notify();
     }
 
     pub(crate) fn selected_bounty(&self) -> Option<&Bounty> {
@@ -1036,6 +1183,7 @@ impl Shell {
                 }
                 if self.active != was_active {
                     self.send_inputs.clear(window, cx);
+                    self.fetch_eligible();
                 }
                 let first_load = !self.first_screen_decided;
                 self.first_screen_decided = true;
@@ -1128,6 +1276,7 @@ impl Shell {
                 // Read-only mode ends with the first account.
                 if self.active.is_none() {
                     self.active = Some(pubkey.clone());
+                    self.fetch_eligible();
                 }
                 // The create path continues straight into the wallet: the
                 // view exists now, so its panel can show the spinner.
@@ -1313,6 +1462,33 @@ impl Shell {
                 }
                 self.push_activity(RED, format!("Bounties didn't load: {message}"), now);
             }
+            Update::Eligible { pubkey, seq, list } => {
+                if land_eligible(self.eligible.as_mut(), &pubkey, seq, Ok(list))
+                    && self.bounty_tab == BountyTab::Eligible
+                    && let Load::Ready(list) = self.eligible_list()
+                    && !list
+                        .iter()
+                        .any(|b| self.selected.as_deref() == Some(b.id.as_str()))
+                    && let Some(first) = list.first()
+                {
+                    // The tab was opened (or the account switched) before
+                    // the list arrived: its first row takes the selection.
+                    self.select(first.id.clone());
+                }
+            }
+            Update::EligibleFailed {
+                pubkey,
+                seq,
+                message,
+            } => {
+                if land_eligible(self.eligible.as_mut(), &pubkey, seq, Err(message.clone())) {
+                    self.push_activity(
+                        RED,
+                        format!("Eligible bounties didn't load: {message}"),
+                        now,
+                    );
+                }
+            }
             Update::BountyDetail(detail) => {
                 if self.optimistic.as_ref().is_some_and(|b| b.id == detail.bounty.id) {
                     self.optimistic = None;
@@ -1346,6 +1522,8 @@ impl Shell {
                 self.list_submit = None;
                 self.focus.focus(window, cx);
                 self.selected = Some(id.clone());
+                // The new bounty is on the house list; show that list.
+                self.bounty_tab = BountyTab::House;
                 // The detail pane shows the submitted values immediately; the
                 // watch's first snapshot (or the refreshed list) replaces them.
                 if let Some(req) = self.submitted_bounty.take() {
@@ -1388,6 +1566,8 @@ impl Shell {
                 let _ = self
                     .commands
                     .unbounded_send(Command::WatchBounty { id: bounty_id });
+                // The claim may have used the account's last slot.
+                self.fetch_eligible();
             }
             Update::PaymentState {
                 bounty_id,
@@ -1567,6 +1747,7 @@ impl Shell {
             let _ = self.commands.unbounded_send(Command::SetActive {
                 pubkey: pubkey.to_string(),
             });
+            self.fetch_eligible();
         }
         self.sync_balance_poll(cx);
         cx.notify();
@@ -2081,6 +2262,7 @@ impl Shell {
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.fetch_bounties();
+        self.fetch_eligible();
         let _ = self.commands.unbounded_send(Command::LoadAccounts);
         // LoadAccounts re-reads every kind-0; a failed one is pending again.
         for (_, view) in &mut self.views {
@@ -2122,7 +2304,7 @@ impl Shell {
         if self.screen != Screen::Bounties {
             return;
         }
-        let Load::Ready(list) = &self.bounties else {
+        let Load::Ready(list) = self.shown_list() else {
             return;
         };
         if list.is_empty() {
@@ -3207,6 +3389,7 @@ fn optimistic_bounty(id: &str, req: CreateBounty, now: u64) -> Bounty {
         auto_pay_min_rank: req.auto_pay_min_rank,
         derived_status: Some("open".into()),
         payment_state: None,
+        issuer_rank: None,
     }
 }
 
@@ -3300,10 +3483,111 @@ mod tests {
         next_bounties_read, on_bounty_form_closed, on_list_create_unknown, on_list_created,
         on_outcome_unknown, pick_active, relay_address_gap, remove_click, still_checking_list,
     };
+    use super::{EligibleSlot, Load, find_bounty, land_eligible, next_eligible_read, takes};
     use magic_carpet_chat::api::Bounty;
     use std::collections::{HashMap, HashSet};
 
     use magic_carpet_chat::nostr::{Command, Update};
+
+    fn eligible_row(id: &str, issuer: &str) -> Bounty {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "issuer_pubkey": issuer,
+            "list_coordinate": "39998:aa:us-city",
+            "amount_sats": 100,
+            "status": "open",
+            "issuerRank": 2,
+        }))
+        .unwrap()
+    }
+
+    fn ready_ids(slot: &Option<EligibleSlot>) -> Option<Vec<String>> {
+        match &slot.as_ref()?.list {
+            Load::Ready(list) => Some(list.iter().map(|b| b.id.clone()).collect()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn eligible_replies_land_only_for_the_account_and_read_on_screen() {
+        let (mut slot, mut seq) = (None, 0);
+        let sent = |command: Command| match command {
+            Command::FetchEligible { pubkey, seq } => (pubkey, seq),
+            _ => panic!("not an eligible read"),
+        };
+
+        // A → B → A: each switch sends a read and starts a fresh slot.
+        let (_, a1) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        let (_, b2) = sent(next_eligible_read(&mut slot, &mut seq, "b"));
+        let (to, a3) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        assert_eq!((to.as_str(), a1, b2, a3), ("a", 1, 2, 3));
+        let Some(current) = &slot else {
+            panic!("no slot")
+        };
+        // Another account's reply, and A's reply from its first stint.
+        assert!(!takes(current, "b", b2));
+        assert!(!takes(current, "a", a1));
+        assert!(takes(current, "a", a3));
+        assert!(!land_eligible(
+            slot.as_mut(),
+            "b",
+            b2,
+            Ok(vec![eligible_row("b1", "x")])
+        ));
+        assert!(!land_eligible(
+            slot.as_mut(),
+            "a",
+            a1,
+            Ok(vec![eligible_row("old", "x")])
+        ));
+        assert_eq!(ready_ids(&slot), None, "still loading");
+
+        // ⌘R on the same account keeps the slot; the newer reply wins and an
+        // older one that lands after it is dropped.
+        let (_, a4) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        assert!(land_eligible(
+            slot.as_mut(),
+            "a",
+            a4,
+            Ok(vec![eligible_row("new", "x")])
+        ));
+        assert!(!land_eligible(
+            slot.as_mut(),
+            "a",
+            a3,
+            Ok(vec![eligible_row("stale", "x")])
+        ));
+        assert_eq!(ready_ids(&slot), Some(vec!["new".to_string()]));
+
+        // The list is filtered to what A can claim: its own bounty goes.
+        let (_, a5) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        let list = vec![eligible_row("mine", "a"), eligible_row("theirs", "x")];
+        assert!(land_eligible(slot.as_mut(), "a", a5, Ok(list)));
+        assert_eq!(ready_ids(&slot), Some(vec!["theirs".to_string()]));
+
+        // A failure keeps the list on screen.
+        let (_, a6) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        assert!(land_eligible(slot.as_mut(), "a", a6, Err("down".into())));
+        assert_eq!(ready_ids(&slot), Some(vec!["theirs".to_string()]));
+
+        // A failed first load fails visibly.
+        let (_, b7) = sent(next_eligible_read(&mut slot, &mut seq, "b"));
+        assert!(land_eligible(slot.as_mut(), "b", b7, Err("down".into())));
+        assert!(matches!(&slot, Some(EligibleSlot { list: Load::Failed(m), .. }) if m == "down"));
+    }
+
+    #[test]
+    fn a_bounty_only_on_the_eligible_list_is_still_found() {
+        let house = Load::Ready(vec![eligible_row("h", "x")]);
+        let eligible = Load::Ready(vec![eligible_row("e", "y")]);
+        let details = HashMap::new();
+        let found = |id| find_bounty(&details, [&house, &eligible], None, id).map(|b| &b.id);
+        assert_eq!(found("h").map(String::as_str), Some("h"));
+        assert_eq!(found("e").map(String::as_str), Some("e"));
+        assert_eq!(found("zz"), None);
+        let loading = Load::Loading;
+        assert!(find_bounty(&details, [&house, &loading], None, "e").is_none());
+    }
 
     #[test]
     fn new_bounty_on_list_shows_for_the_issuer_and_open_checks_the_list() {
