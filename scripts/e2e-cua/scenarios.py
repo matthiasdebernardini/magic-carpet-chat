@@ -951,8 +951,9 @@ async def scenario_t(sc):
     await sc.step(Step("Select the claimant account and show Bounties (the claimant's header button reads 'Submit a bounty claim').",
                        [Cand("claimant-avatar", "Click the second avatar in the left rail, then press super+2 for Bounties.",
                              [FOCUS, ("avatar", "claimant"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])],
-                       "The Bounties header button reads 'Submit a bounty claim'.", settle=3,
-                       cues=("Submit a bounty claim", "New DList + bounty")), label="claimant")
+                       "The Bounties screen shows the 'Eligible for me to claim' tab and the header button reads 'Submit a bounty claim'.", settle=3,
+                       cues=("Submit a bounty claim", "New DList + bounty", "Eligible for me to claim")),
+                  must_act=True, label="claimant")
     if not sc.check_screen("claimant selected, Eligible tab shown", ["Submit a bounty claim", "Eligible for me to claim"]):
         return
     # Before the step: its super+] sends the house read.
