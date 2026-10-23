@@ -896,8 +896,9 @@ async def scenario_s(sc):
                       ("key", "ctrl+a"), ("type", "200"), ("key", "Return"), ("wait", 0.4),
                       ("key", "ctrl+a"), ("type", "2"), ("key", "Return")]:
         await sc.suite.driver.act(kind, arg)
-    await asyncio.sleep(4)
-    await sc.see("after create on the existing list")
+    # The box can lag the keystrokes by several seconds: a fixed sleep once
+    # caught the untouched form before Enter landed. Wait for the second row.
+    await sc.wait_for(["House bounties (2)"], timeout=30, label="after create on the existing list")
     lines = sc.log_after("S submit")
     posts = [l for l in lines if l.startswith("POST /api/bounties")]
     sc.check("exactly one create, on the existing list", len(posts) == 1 and posts[0].endswith("coord=post-city"), posts)
