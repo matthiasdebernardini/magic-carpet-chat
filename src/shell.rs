@@ -307,6 +307,19 @@ fn form_locked(submitting: bool, checking_list: Option<u64>) -> bool {
     submitting || checking_list.is_some()
 }
 
+/// Opening the bounty form on `requested` (None: a new list) is refused
+/// while a claim's request is out, or while an open bounty form in the
+/// other mode is locked ([`form_locked`]). `open` is the open bounty
+/// form's list and lock; one in the same mode is only refocused, so it
+/// never refuses.
+fn bounty_form_refused(
+    claim_submitting: bool,
+    open: Option<(Option<&str>, bool)>,
+    requested: Option<&str>,
+) -> bool {
+    claim_submitting || open.is_some_and(|(list, locked)| list != requested && locked)
+}
+
 /// Where the armed remove's balance read stands. The second click waits
 /// while it is `Checking`, so a fast double-click cannot skip the warning.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -708,8 +721,9 @@ fn house_reply_pick(tab: BountyTab, selected: Option<&str>, list: &[Bounty]) -> 
 
 /// ⌘N and the Bounties header button open a claim rather than the bounty
 /// form: always for a claimant, and for the issuer while the Bounties
-/// screen shows its Eligible tab and no bounty form is open — an open one
-/// is refocused, never swapped for a claim.
+/// screen shows its Eligible tab and no bounty form is open. An open one,
+/// new-list or existing-list, is refocused as it is ([`Shell::new_item`]),
+/// never swapped for a claim or for the other mode.
 pub(crate) fn opens_claim(
     is_issuer: bool,
     screen: Screen,
@@ -2398,6 +2412,7 @@ impl Shell {
     /// cmd-N: as the issuer, a new DList+bounty; as anyone else, or as the
     /// issuer on the Eligible tab, a claim on the selected bounty
     /// ([`opens_claim`]). From any screen — it navigates to Bounties first.
+    /// An open bounty form, in either mode, is refocused, never replaced.
     pub(crate) fn new_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // No account: the honest response is the account screen, not a form
         // whose submit can only fail.
@@ -2417,13 +2432,37 @@ impl Shell {
         if claim {
             self.open_claim_form(window, cx)
         } else {
+            // Keep whichever mode is open, so typed criteria survive.
+            let list = self
+                .bounty_form
+                .as_ref()
+                .and_then(|f| f.existing_list.clone());
+            if self.bounty_form_refused(list.as_deref()) {
+                self.hold_for_submit();
+                cx.notify();
+                return;
+            }
             // The bounty form belongs to the House tab: leaving Eligible
             // showing would offer a claim over a half-typed bounty.
             if self.bounty_tab != BountyTab::House {
                 self.set_bounty_tab(BountyTab::House, window, cx);
             }
-            self.open_bounty_form(None, window, cx)
+            self.open_bounty_form(list, window, cx)
         }
+    }
+
+    /// [`bounty_form_refused`] over the open forms.
+    fn bounty_form_refused(&self, requested: Option<&str>) -> bool {
+        bounty_form_refused(
+            self.claim_form.as_ref().is_some_and(|f| f.submitting),
+            self.bounty_form.as_ref().map(|f| {
+                (
+                    f.existing_list.as_deref(),
+                    form_locked(f.submitting, f.checking_list),
+                )
+            }),
+            requested,
+        )
     }
 
     /// A bounty or claim request is out and unanswered, or the list read
@@ -2488,8 +2527,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         // The issuer can hold a claim form too (Eligible tab): one whose
-        // request is out stays, so its reply has a form to land on.
-        if self.claim_form.as_ref().is_some_and(|f| f.submitting) {
+        // request is out stays, so its reply has a form to land on; so does
+        // a bounty form in the other mode whose request is out.
+        if self.bounty_form_refused(existing_list.as_deref()) {
             self.hold_for_submit();
             cx.notify();
             return;
@@ -2500,19 +2540,16 @@ impl Shell {
         } else {
             F_SINGULAR
         };
-        if let Some(form) = &self.bounty_form {
-            if form.existing_list == existing_list {
-                // Already open: just put the caret back on the first field.
-                self.focus_bounty_field(first, window, cx);
-                cx.notify();
-                return;
-            }
-            // The other mode is open: replace it, unless its request is out.
-            if form_locked(form.submitting, form.checking_list) {
-                self.hold_for_submit();
-                cx.notify();
-                return;
-            }
+        // Already open: just put the caret back on the first field. An idle
+        // form in the other mode is replaced below.
+        if self
+            .bounty_form
+            .as_ref()
+            .is_some_and(|form| form.existing_list == existing_list)
+        {
+            self.focus_bounty_field(first, window, cx);
+            cx.notify();
+            return;
         }
 
         let fields: Vec<Entity<InputState>> = BOUNTY_FIELD_DEFS
@@ -3584,7 +3621,8 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        BalanceCheck, RANK_NOTE, RemoveAction, UnknownCreate, can_post_on_list, claim_notice,
+        BalanceCheck, RANK_NOTE, RemoveAction, UnknownCreate, bounty_form_refused,
+        can_post_on_list, claim_notice,
         click_remove, fold_checks, form_locked, list_has_open_bounty, new_bounty_since_submit,
         next_bounties_read, on_bounty_form_closed, on_list_create_unknown, on_list_created,
         on_outcome_unknown, pick_active, relay_address_gap, remove_click, still_checking_list,
@@ -3752,6 +3790,24 @@ mod tests {
         assert!(!opens_claim(true, Bounties, BountyTab::Eligible, true));
         // A claimant never gets the bounty form.
         assert!(opens_claim(false, Bounties, BountyTab::Eligible, true));
+    }
+
+    #[test]
+    fn cmd_n_refocuses_the_open_bounty_form_in_either_mode() {
+        let list = Some("39998:pk:post-city");
+        // new_item passes the open form's own list: an idle or a sending
+        // form in either mode is refocused, not refused or replaced.
+        assert!(!bounty_form_refused(false, Some((list, false)), list));
+        assert!(!bounty_form_refused(false, Some((list, true)), list));
+        assert!(!bounty_form_refused(false, Some((None, true)), None));
+        assert!(!bounty_form_refused(false, None, None));
+        // A claim whose request is out refuses before any tab switch.
+        assert!(bounty_form_refused(true, None, None));
+        assert!(bounty_form_refused(true, Some((list, false)), list));
+        // The detail pane's button asks for the other mode: an idle form
+        // gives way, a sending one does not.
+        assert!(!bounty_form_refused(false, Some((None, false)), list));
+        assert!(bounty_form_refused(false, Some((None, true)), list));
     }
 
     #[test]
