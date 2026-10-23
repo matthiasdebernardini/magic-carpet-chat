@@ -706,6 +706,13 @@ fn house_reply_pick(tab: BountyTab, selected: Option<&str>, list: &[Bounty]) -> 
         .flatten()
 }
 
+/// ⌘N and the Bounties header button open a claim rather than the bounty
+/// form: always for a claimant, and for the issuer while the Bounties
+/// screen shows its Eligible tab.
+pub(crate) fn opens_claim(is_issuer: bool, screen: Screen, tab: BountyTab) -> bool {
+    !is_issuer || (screen == Screen::Bounties && tab == BountyTab::Eligible)
+}
+
 /// Which list the Bounties screen shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BountyTab {
@@ -1038,8 +1045,8 @@ impl Shell {
             .chain(self.details.values().map(|d| &d.bounty))
     }
 
-    /// The active account IS the issuer: ⌘N opens the bounty form, not a
-    /// claim.
+    /// The active account IS the issuer: ⌘N opens the bounty form, except
+    /// on the Bounties screen's Eligible tab ([`opens_claim`]).
     pub(crate) fn is_active_issuer(&self) -> bool {
         self.active.as_deref().is_some_and(nostr::is_issuer)
     }
@@ -2382,8 +2389,9 @@ impl Shell {
 
     // ----------------------------------------------------------------- forms
 
-    /// cmd-N: as the issuer, a new DList+bounty; as anyone else, a claim on
-    /// the selected bounty. From any screen — it navigates to Bounties first.
+    /// cmd-N: as the issuer, a new DList+bounty; as anyone else, or as the
+    /// issuer on the Eligible tab, a claim on the selected bounty
+    /// ([`opens_claim`]). From any screen — it navigates to Bounties first.
     pub(crate) fn new_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // No account: the honest response is the account screen, not a form
         // whose submit can only fail.
@@ -2391,13 +2399,14 @@ impl Shell {
             self.open_account_setup(false, window, cx);
             return;
         }
+        let claim = opens_claim(self.is_active_issuer(), self.screen, self.bounty_tab);
         if self.screen != Screen::Bounties {
             self.go(Screen::Bounties, window, cx);
         }
-        if self.is_active_issuer() {
-            self.open_bounty_form(None, window, cx)
-        } else {
+        if claim {
             self.open_claim_form(window, cx)
+        } else {
+            self.open_bounty_form(None, window, cx)
         }
     }
 
@@ -2462,6 +2471,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The issuer can hold a claim form too (Eligible tab): one whose
+        // request is out stays, so its reply has a form to land on.
+        if self.claim_form.as_ref().is_some_and(|f| f.submitting) {
+            self.hold_for_submit();
+            cx.notify();
+            return;
+        }
         self.claim_form = None;
         let first = if existing_list.is_some() {
             F_CRITERIA
@@ -2712,7 +2728,20 @@ impl Shell {
     }
 
     fn open_claim_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.bounty_form = None;
+        // The issuer's bounty form gives way to a claim (Eligible tab), but
+        // not while its request is out: a dropped form invites a second
+        // bounty.
+        if let Some(form) = &self.bounty_form {
+            if form_locked(form.submitting, form.checking_list) {
+                self.hold_for_submit();
+                cx.notify();
+                return;
+            }
+            if let Some(list) = form.existing_list.as_deref() {
+                on_bounty_form_closed(&mut self.unknown_create, list);
+            }
+            self.bounty_form = None;
+        }
         if let Some(form) = &self.claim_form {
             form.name.update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
@@ -3541,8 +3570,8 @@ mod tests {
         on_outcome_unknown, pick_active, relay_address_gap, remove_click, still_checking_list,
     };
     use super::{
-        BountyTab, EligibleSlot, Load, find_bounty, house_reply_pick, land_eligible,
-        next_eligible_read, selection_for, takes,
+        BountyTab, EligibleSlot, Load, Screen, find_bounty, house_reply_pick, land_eligible,
+        next_eligible_read, opens_claim, selection_for, takes,
     };
     use magic_carpet_chat::api::Bounty;
     use std::collections::{HashMap, HashSet};
@@ -3680,6 +3709,19 @@ mod tests {
         // An empty or failed Eligible list cleared the selection: a house
         // reply landing after it must not fill the detail pane.
         assert_eq!(house_reply_pick(BountyTab::Eligible, None, &list), None);
+    }
+
+    #[test]
+    fn the_issuer_claims_only_from_the_eligible_tab() {
+        use Screen::{Bounties, Dashboard};
+        assert!(opens_claim(true, Bounties, BountyTab::Eligible));
+        assert!(!opens_claim(true, Bounties, BountyTab::House));
+        // Off the Bounties screen the issuer's ⌘N stays the bounty form,
+        // whichever tab Bounties last showed.
+        assert!(!opens_claim(true, Dashboard, BountyTab::Eligible));
+        assert!(opens_claim(false, Bounties, BountyTab::House));
+        assert!(opens_claim(false, Bounties, BountyTab::Eligible));
+        assert!(opens_claim(false, Dashboard, BountyTab::House));
     }
 
     #[test]

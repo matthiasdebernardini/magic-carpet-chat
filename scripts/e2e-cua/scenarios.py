@@ -966,13 +966,15 @@ async def scenario_t(sc):
     await sc.step(Step("Open the 'Eligible for me to claim' tab, then switch to the house account while its list is still loading.",
                        [Cand("tab-then-switch", "Click the 'Eligible for me to claim' tab, then press super+] for the next account.",
                              ELIGIBLE_TAB.do + [("stamp", "tab"), ("key", "super+bracketright"), ("wait", 1)])],
-                       "The header button reads 'New DList + bounty' (the house is selected).", tries=1, settle=1,
-                       cues=("New DList + bounty", "Submit a bounty claim", "Eligible for me to claim")),
+                       "The eligible list shows a row on 'eligible-house' (the house is selected; on this tab its header button reads 'Submit a bounty claim').",
+                       tries=1, settle=1, cues=("eligible-house", "Submit a bounty claim", "Eligible for me to claim")),
                   must_act=True, label="tab then switch")
     await asyncio.sleep(max(0, sc.stamps.get("tab", time.time()) + 12 - time.time()))
     await sc.see("after the held claimant reply")
-    sc.check_screen("house sees its own eligible list only", ["eligible-house", "you qualify", "New DList + bounty"],
-                    ["eligible-claimant", "eligible-own", "eligible-gated"])
+    # On the Eligible tab the house claims too, so its header button reads
+    # "Submit a bounty claim"; only the house's eligible row marks the house.
+    sc.check_screen("house sees its own eligible list only", ["eligible-house", "you qualify", "Submit a bounty claim"],
+                    ["eligible-claimant", "eligible-own", "eligible-gated", "New DList + bounty"])
     lines = sc.log_after("T launch")
     gets = eligible_gets(lines)
     sc.check("every eligible GET is for the session's own account", gets and all(v == s for v, s in gets), gets)
