@@ -6,7 +6,7 @@
 //! channel and drains [`Update`]s from the other into the fields here, using
 //! the same task-held-in-`self` pattern as the chat's streaming reply.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
@@ -19,7 +19,7 @@ use gpui_kit::component::{
     v_flex,
 };
 
-use magic_carpet_chat::api::{Bounty, BountyDetail, CreateBounty};
+use magic_carpet_chat::api::{Bounty, BountyDetail, CreateBounty, claimable_by};
 use magic_carpet_chat::coinos;
 use magic_carpet_chat::events;
 use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated};
@@ -307,6 +307,19 @@ fn form_locked(submitting: bool, checking_list: Option<u64>) -> bool {
     submitting || checking_list.is_some()
 }
 
+/// Opening the bounty form on `requested` (None: a new list) is refused
+/// while a claim's request is out, or while an open bounty form in the
+/// other mode is locked ([`form_locked`]). `open` is the open bounty
+/// form's list and lock; one in the same mode is only refocused, so it
+/// never refuses.
+fn bounty_form_refused(
+    claim_submitting: bool,
+    open: Option<(Option<&str>, bool)>,
+    requested: Option<&str>,
+) -> bool {
+    claim_submitting || open.is_some_and(|(list, locked)| list != requested && locked)
+}
+
 /// Where the armed remove's balance read stands. The second click waits
 /// while it is `Checking`, so a fast double-click cannot skip the warning.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -551,7 +564,7 @@ pub(crate) const BOUNTY_FIELD_DEFS: [(&str, &str, &str); 7] = [
 const F_SINGULAR: usize = 0;
 const F_PLURAL: usize = 1;
 const F_DESCRIPTION: usize = 2;
-const F_CRITERIA: usize = 3;
+pub(crate) const F_CRITERIA: usize = 3;
 const F_AMOUNT: usize = 4;
 const F_CAP: usize = 5;
 const F_RANK: usize = 6;
@@ -559,8 +572,13 @@ const F_RANK: usize = 6;
 /// The issuer's "New DList + bounty" form. Enter advances through the fields
 /// and submits from the last one; the flow it starts is
 /// PublishDList → DListPublished → CreateBounty → BountyCreated.
+/// Opened from the detail pane's "New bounty on this list" it is the
+/// existing-list mode: no list fields, CreateBounty straight away.
 pub(crate) struct BountyForm {
     pub fields: Vec<Entity<InputState>>,
+    /// Set: post on this existing list's coordinate. The list header is not
+    /// republished and the three list fields are hidden and unvalidated.
+    pub existing_list: Option<String>,
     pub error: Option<String>,
     pub submitting: bool,
     /// The create's outcome is unknown and a list read is out: the form
@@ -568,6 +586,220 @@ pub(crate) struct BountyForm {
     /// bounty the server may have made.
     pub checking_list: Option<u64>,
     _subs: Vec<Subscription>,
+}
+
+/// Whether any bounty on the list is still open (the server never dedupes).
+/// `known` is every bounty the app has seen, not just the loaded list (see
+/// `Shell::known_bounties`): the list may not have caught up.
+fn list_has_open_bounty<'a>(known: impl IntoIterator<Item = &'a Bounty>, coordinate: &str) -> bool {
+    let known: Vec<&Bounty> = known.into_iter().collect();
+    // Terminal is final, so it beats a stale "open" copy of the same id
+    // (details are never pruned).
+    known.iter().any(|b| {
+        b.list_coordinate == coordinate
+            && b.effective_status() == "open"
+            && !known
+                .iter()
+                .any(|t| t.id == b.id && nostr::TERMINAL_STATUSES.contains(&t.effective_status()))
+    })
+}
+
+/// A create on an existing list whose outcome is unknown (timed out or lost
+/// its reply). It lives on the shell, keyed by the list coordinate, not on
+/// the form, so closing and reopening the form cannot drop it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct UnknownCreate {
+    /// The bounty ids known on the list when that create went out.
+    ids_before: HashSet<String>,
+    /// A resubmit was refused, so the user has seen the warning.
+    refused: bool,
+}
+
+/// After an unknown outcome on `coordinate`: a bounty id on the list that
+/// was not there at that submit is most likely the one the server
+/// finished, so a resubmit would pay twice.
+fn new_bounty_since_submit<'a>(
+    unknown: &HashMap<String, UnknownCreate>,
+    known: impl IntoIterator<Item = &'a Bounty>,
+    coordinate: &str,
+) -> bool {
+    let Some(unknown) = unknown.get(coordinate) else {
+        return false;
+    };
+    known
+        .into_iter()
+        .any(|b| b.list_coordinate == coordinate && !unknown.ids_before.contains(&b.id))
+}
+
+/// The in-flight existing-list create's outcome is unknown: its snapshot
+/// becomes the resubmit guard for its list. Guards on other lists stay.
+fn on_list_create_unknown(
+    unknown: &mut HashMap<String, UnknownCreate>,
+    in_flight: &mut Option<(String, HashSet<String>)>,
+) {
+    if let Some((coordinate, ids_before)) = in_flight.take() {
+        unknown.insert(
+            coordinate,
+            UnknownCreate {
+                ids_before,
+                refused: false,
+            },
+        );
+    }
+}
+
+/// A bounty was created on `coordinate`: the guard for that list is done.
+fn on_list_created(unknown: &mut HashMap<String, UnknownCreate>, coordinate: &str) {
+    unknown.remove(coordinate);
+}
+
+/// The form on `coordinate` closed. After a refusal there the user has seen
+/// the warning, so a deliberate reopen-and-type is a real new bounty;
+/// before one, the guard stays. Other lists' guards are untouched.
+fn on_bounty_form_closed(unknown: &mut HashMap<String, UnknownCreate>, coordinate: &str) {
+    if unknown.get(coordinate).is_some_and(|u| u.refused) {
+        unknown.remove(coordinate);
+    }
+}
+
+/// "New bounty on this list" shows for the bounty's own issuer, whatever
+/// the list's other bounties are doing.
+fn can_post_on_list(active: Option<&str>, bounty: &Bounty) -> bool {
+    active == Some(bounty.issuer_pubkey.as_str())
+}
+
+/// The bounty by id, from the freshest source that has it: the detail
+/// snapshot, then the loaded lists in order, then the optimistic copy.
+fn find_bounty<'a>(
+    details: &'a HashMap<String, BountyDetail>,
+    lists: [&'a Load<Vec<Bounty>>; 2],
+    optimistic: Option<&'a Bounty>,
+    id: &str,
+) -> Option<&'a Bounty> {
+    if let Some(detail) = details.get(id) {
+        return Some(&detail.bounty);
+    }
+    for list in lists {
+        if let Load::Ready(list) = list
+            && let Some(bounty) = list.iter().find(|b| b.id == id)
+        {
+            return Some(bounty);
+        }
+    }
+    optimistic.filter(|b| b.id == id)
+}
+
+/// The selection once `shown` is the list on screen: kept while that list
+/// or `pending` (the just-created card the list does not carry yet) holds
+/// it, else the list's first row, else none (the list is loading, failed or
+/// empty).
+fn selection_for(
+    selected: Option<&str>,
+    shown: &Load<Vec<Bounty>>,
+    pending: Option<&str>,
+) -> Option<String> {
+    if let Some(id) = selected.filter(|id| pending == Some(*id)) {
+        return Some(id.to_string());
+    }
+    let Load::Ready(list) = shown else {
+        return None;
+    };
+    list.iter()
+        .find(|b| Some(b.id.as_str()) == selected)
+        .or(list.first())
+        .map(|b| b.id.clone())
+}
+
+/// A house list reply picks its first row only while nothing is selected
+/// and the House tab is showing: on the Eligible tab a cleared selection
+/// means that list has nothing to show.
+fn house_reply_pick(tab: BountyTab, selected: Option<&str>, list: &[Bounty]) -> Option<String> {
+    (tab == BountyTab::House && selected.is_none())
+        .then(|| list.first().map(|b| b.id.clone()))
+        .flatten()
+}
+
+/// ⌘N and the Bounties header button open a claim rather than the bounty
+/// form: always for a claimant, and for the issuer while the Bounties
+/// screen shows its Eligible tab and no bounty form is open. An open one,
+/// new-list or existing-list, is refocused as it is ([`Shell::new_item`]),
+/// never swapped for a claim or for the other mode.
+pub(crate) fn opens_claim(
+    is_issuer: bool,
+    screen: Screen,
+    tab: BountyTab,
+    bounty_form_open: bool,
+) -> bool {
+    !is_issuer || (screen == Screen::Bounties && tab == BountyTab::Eligible && !bounty_form_open)
+}
+
+/// Which list the Bounties screen shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BountyTab {
+    /// The house issuer's bounties (`FetchBounties`).
+    House,
+    /// The active account's eligible list (`FetchEligible`).
+    Eligible,
+}
+
+/// The eligible list for one account, with the reads it answers to.
+pub(crate) struct EligibleSlot {
+    pub pubkey: String,
+    /// The first `FetchEligible` seq sent for this account since it became
+    /// active: a reply from an earlier stint (A → B → A) is older.
+    since: u64,
+    /// The seq of the last reply folded in, so an older reply that lands
+    /// late never overwrites a newer list.
+    applied: u64,
+    pub list: Load<Vec<Bounty>>,
+}
+
+/// Whether a `FetchEligible` reply belongs in `slot`: the same account, a
+/// read sent since it became active, and newer than the reply already shown.
+fn takes(slot: &EligibleSlot, pubkey: &str, seq: u64) -> bool {
+    pubkey == slot.pubkey && seq >= slot.since && seq > slot.applied
+}
+
+/// The next eligible read for `pubkey`. A new account gets a fresh slot
+/// starting at this read; the same account keeps its list on screen.
+fn next_eligible_read(slot: &mut Option<EligibleSlot>, seq: &mut u64, pubkey: &str) -> Command {
+    *seq += 1;
+    if slot.as_ref().is_none_or(|s| s.pubkey != pubkey) {
+        *slot = Some(EligibleSlot {
+            pubkey: pubkey.to_string(),
+            since: *seq,
+            applied: 0,
+            list: Load::Loading,
+        });
+    }
+    Command::FetchEligible {
+        pubkey: pubkey.to_string(),
+        seq: *seq,
+    }
+}
+
+/// Fold an `Eligible` (Ok) or `EligibleFailed` (Err) reply into `slot`.
+/// The list is filtered to what `pubkey` can claim; a failure keeps a list
+/// already on screen and fails only a first load. False when stale.
+fn land_eligible(
+    slot: Option<&mut EligibleSlot>,
+    pubkey: &str,
+    seq: u64,
+    result: Result<Vec<Bounty>, String>,
+) -> bool {
+    let Some(slot) = slot.filter(|s| takes(s, pubkey, seq)) else {
+        return false;
+    };
+    slot.applied = seq;
+    match result {
+        Ok(list) => slot.list = Load::Ready(claimable_by(list, pubkey)),
+        Err(message) => {
+            if !matches!(slot.list, Load::Ready(_)) {
+                slot.list = Load::Failed(message);
+            }
+        }
+    }
+    true
 }
 
 /// The claimant's one-field claim form for the selected bounty.
@@ -591,6 +823,12 @@ pub struct Shell {
     pub(crate) relay_connected: bool,
     pub(crate) activity: Vec<ActivityItem>,
     pub(crate) bounties: Load<Vec<Bounty>>,
+    /// The Bounties screen's tab. Eligible only while an account is active.
+    pub(crate) bounty_tab: BountyTab,
+    /// The active account's eligible list; `None` in read-only mode.
+    pub(crate) eligible: Option<EligibleSlot>,
+    /// The last `FetchEligible` sequence number sent.
+    eligible_seq: u64,
     /// The bounty the detail pane (and the auto-pay pill) is about.
     pub(crate) selected: Option<String>,
     /// Latest full snapshot per watched bounty, straight from the runtime.
@@ -612,6 +850,15 @@ pub struct Shell {
     /// The request as it went to the server (coordinate filled in), kept so
     /// `BountyCreated` can build the optimistic card from real values.
     submitted_bounty: Option<CreateBounty>,
+    /// The existing-list create that is out: its coordinate and the bounty
+    /// ids known on that list when it went out. One at most: the only
+    /// bounty form stays locked while its request is out.
+    list_submit: Option<(String, HashSet<String>)>,
+    /// The resubmit guards after existing-list creates' unknown outcomes,
+    /// by list coordinate. An entry is cleared by a create on that list or
+    /// a close of that list's form after a refusal. An account switch
+    /// keeps them: the coordinate carries the issuer's key.
+    unknown_create: HashMap<String, UnknownCreate>,
     /// Scrolls the bounty list; `scroll_to` is the id to bring into view once
     /// the list containing it arrives.
     pub(crate) bounty_list_scroll: ScrollHandle,
@@ -744,6 +991,9 @@ impl Shell {
             relay_connected: false,
             activity: Vec::new(),
             bounties: Load::Loading,
+            bounty_tab: BountyTab::House,
+            eligible: None,
+            eligible_seq: 0,
             selected: None,
             details: HashMap::new(),
             optimistic: None,
@@ -753,6 +1003,8 @@ impl Shell {
             first_screen_decided: false,
             pending_bounty: None,
             submitted_bounty: None,
+            list_submit: None,
+            unknown_create: HashMap::new(),
             bounty_list_scroll: ScrollHandle::new(),
             scroll_to: None,
             commands,
@@ -795,8 +1047,26 @@ impl Shell {
         self.views.iter().map(|(_, v)| v)
     }
 
-    /// The active account IS the issuer: ⌘N opens the bounty form, not a
-    /// claim.
+    /// Whether the detail pane offers "New bounty on this list" for `bounty`.
+    pub(crate) fn can_post_on_list(&self, bounty: &Bounty) -> bool {
+        can_post_on_list(self.active.as_deref(), bounty)
+    }
+
+    /// The loaded list, the just-created card and the watched details: a new
+    /// bounty can live in only one of them until the list refetch lands.
+    fn known_bounties(&self) -> impl Iterator<Item = &Bounty> {
+        let loaded = match &self.bounties {
+            Load::Ready(bounties) => bounties.as_slice(),
+            _ => &[],
+        };
+        loaded
+            .iter()
+            .chain(self.optimistic.as_ref())
+            .chain(self.details.values().map(|d| &d.bounty))
+    }
+
+    /// The active account IS the issuer: ⌘N opens the bounty form, except
+    /// on the Bounties screen's Eligible tab ([`opens_claim`]).
     pub(crate) fn is_active_issuer(&self) -> bool {
         self.active.as_deref().is_some_and(nostr::is_issuer)
     }
@@ -813,15 +1083,91 @@ impl Shell {
     /// wins; the optimistic copy only fills the gap between BountyCreated and
     /// the first list/detail that includes it.
     fn bounty(&self, id: &str) -> Option<&Bounty> {
-        if let Some(detail) = self.details.get(id) {
-            return Some(&detail.bounty);
+        find_bounty(
+            &self.details,
+            [&self.bounties, self.eligible_list()],
+            self.optimistic.as_ref(),
+            id,
+        )
+    }
+
+    /// The active account's eligible list, `Loading` when there is none.
+    fn eligible_list(&self) -> &Load<Vec<Bounty>> {
+        self.eligible
+            .as_ref()
+            .map_or(&Load::Loading, |slot| &slot.list)
+    }
+
+    /// The eligible row for `id`: the only copy that carries `issuerRank`
+    /// (the detail snapshot does not).
+    pub(crate) fn eligible_bounty(&self, id: &str) -> Option<&Bounty> {
+        match self.eligible_list() {
+            Load::Ready(list) => list.iter().find(|b| b.id == id),
+            _ => None,
         }
-        if let Load::Ready(list) = &self.bounties
-            && let Some(bounty) = list.iter().find(|b| b.id == id)
+    }
+
+    /// The list the Bounties screen shows on its current tab.
+    pub(crate) fn shown_list(&self) -> &Load<Vec<Bounty>> {
+        match self.bounty_tab {
+            BountyTab::House => &self.bounties,
+            BountyTab::Eligible => self.eligible_list(),
+        }
+    }
+
+    /// Asks for the active account's eligible list. Read-only mode has none,
+    /// and the Eligible tab goes with it.
+    fn fetch_eligible(&mut self) {
+        let Some(pubkey) = self.active.clone() else {
+            self.eligible = None;
+            self.bounty_tab = BountyTab::House;
+            return;
+        };
+        let read = next_eligible_read(&mut self.eligible, &mut self.eligible_seq, &pubkey);
+        let _ = self.commands.unbounded_send(read);
+    }
+
+    /// A tab click: the Eligible tab re-reads its list, and the selection
+    /// follows the tab's list.
+    pub(crate) fn set_bounty_tab(
+        &mut self,
+        tab: BountyTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.bounty_tab = tab;
+        if tab == BountyTab::Eligible {
+            self.fetch_eligible();
+        }
+        self.reconcile_selection(window, cx);
+        cx.notify();
+    }
+
+    /// Keep the selection on a row the shown list holds ([`selection_for`]),
+    /// so the detail pane and ⌘N never act on a bounty this account or tab
+    /// does not show. On the House tab the just-created card counts as
+    /// shown. An idle claim form aimed at another bounty than the new
+    /// selection closes rather than retargets, so Enter never claims a row
+    /// nobody picked; a submitting one is left alone.
+    fn reconcile_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = match self.bounty_tab {
+            BountyTab::House => self.optimistic.as_ref().map(|b| b.id.as_str()),
+            BountyTab::Eligible => None,
+        };
+        let next = selection_for(self.selected.as_deref(), self.shown_list(), pending);
+        if self
+            .claim_form
+            .as_ref()
+            .is_some_and(|f| !f.submitting && next.as_deref() != Some(f.bounty_id.as_str()))
         {
-            return Some(bounty);
+            self.claim_form = None;
+            self.focus.focus(window, cx);
         }
-        self.optimistic.as_ref().filter(|b| b.id == id)
+        match next {
+            Some(id) if self.selected.as_deref() == Some(id.as_str()) => {}
+            Some(id) => self.select(id),
+            None => self.selected = None,
+        }
     }
 
     pub(crate) fn selected_bounty(&self) -> Option<&Bounty> {
@@ -922,6 +1268,8 @@ impl Shell {
                 }
                 if self.active != was_active {
                     self.send_inputs.clear(window, cx);
+                    self.fetch_eligible();
+                    self.reconcile_selection(window, cx);
                 }
                 let first_load = !self.first_screen_decided;
                 self.first_screen_decided = true;
@@ -1014,6 +1362,7 @@ impl Shell {
                 // Read-only mode ends with the first account.
                 if self.active.is_none() {
                     self.active = Some(pubkey.clone());
+                    self.fetch_eligible();
                 }
                 // The create path continues straight into the wallet: the
                 // view exists now, so its panel can show the spinner.
@@ -1172,10 +1521,11 @@ impl Shell {
                 }
             }
             Update::Bounties { list, .. } => {
-                if self.selected.is_none()
-                    && let Some(first) = list.first() {
-                        self.select(first.id.clone());
-                    }
+                if let Some(first) =
+                    house_reply_pick(self.bounty_tab, self.selected.as_deref(), &list)
+                {
+                    self.select(first);
+                }
                 // The server list now carries the just-created bounty: the
                 // optimistic copy has done its job.
                 if let Some(bounty) = &self.optimistic
@@ -1198,6 +1548,29 @@ impl Shell {
                     self.bounties = Load::Failed(message.clone());
                 }
                 self.push_activity(RED, format!("Bounties didn't load: {message}"), now);
+            }
+            Update::Eligible { pubkey, seq, list } => {
+                if land_eligible(self.eligible.as_mut(), &pubkey, seq, Ok(list))
+                    && self.bounty_tab == BountyTab::Eligible
+                {
+                    self.reconcile_selection(window, cx);
+                }
+            }
+            Update::EligibleFailed {
+                pubkey,
+                seq,
+                message,
+            } => {
+                if land_eligible(self.eligible.as_mut(), &pubkey, seq, Err(message.clone())) {
+                    self.push_activity(
+                        RED,
+                        format!("Eligible bounties didn't load: {message}"),
+                        now,
+                    );
+                    if self.bounty_tab == BountyTab::Eligible {
+                        self.reconcile_selection(window, cx);
+                    }
+                }
             }
             Update::BountyDetail(detail) => {
                 if self.optimistic.as_ref().is_some_and(|b| b.id == detail.bounty.id) {
@@ -1229,11 +1602,15 @@ impl Shell {
                 );
                 self.bounty_form = None;
                 self.pending_bounty = None;
+                self.list_submit = None;
                 self.focus.focus(window, cx);
                 self.selected = Some(id.clone());
+                // The new bounty is on the house list; show that list.
+                self.bounty_tab = BountyTab::House;
                 // The detail pane shows the submitted values immediately; the
                 // watch's first snapshot (or the refreshed list) replaces them.
                 if let Some(req) = self.submitted_bounty.take() {
+                    on_list_created(&mut self.unknown_create, &req.list_coordinate);
                     self.optimistic = Some(optimistic_bounty(&id, req, now));
                 }
                 self.scroll_to = Some(id.clone());
@@ -1272,6 +1649,8 @@ impl Shell {
                 let _ = self
                     .commands
                     .unbounded_send(Command::WatchBounty { id: bounty_id });
+                // The claim may have used the account's last slot.
+                self.fetch_eligible();
             }
             Update::PaymentState {
                 bounty_id,
@@ -1331,6 +1710,10 @@ impl Shell {
                                 self.pending_bounty = None;
                                 self.submitted_bounty = None;
                                 if source == ErrorSource::BountyOutcomeUnknown {
+                                    on_list_create_unknown(
+                                        &mut self.unknown_create,
+                                        &mut self.list_submit,
+                                    );
                                     // A timeout or dropped reply says nothing
                                     // about whether the server created it.
                                     form.error = Some(format!(
@@ -1342,6 +1725,7 @@ impl Shell {
                                     );
                                     let _ = self.commands.unbounded_send(read);
                                 }
+                                self.list_submit = None;
                             }
                     }
                     ErrorSource::Claim => {
@@ -1446,6 +1830,8 @@ impl Shell {
             let _ = self.commands.unbounded_send(Command::SetActive {
                 pubkey: pubkey.to_string(),
             });
+            self.fetch_eligible();
+            self.reconcile_selection(window, cx);
         }
         self.sync_balance_poll(cx);
         cx.notify();
@@ -1960,6 +2346,7 @@ impl Shell {
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.fetch_bounties();
+        self.fetch_eligible();
         let _ = self.commands.unbounded_send(Command::LoadAccounts);
         // LoadAccounts re-reads every kind-0; a failed one is pending again.
         for (_, view) in &mut self.views {
@@ -2001,7 +2388,7 @@ impl Shell {
         if self.screen != Screen::Bounties {
             return;
         }
-        let Load::Ready(list) = &self.bounties else {
+        let Load::Ready(list) = self.shown_list() else {
             return;
         };
         if list.is_empty() {
@@ -2022,8 +2409,10 @@ impl Shell {
 
     // ----------------------------------------------------------------- forms
 
-    /// cmd-N: as the issuer, a new DList+bounty; as anyone else, a claim on
-    /// the selected bounty. From any screen — it navigates to Bounties first.
+    /// cmd-N: as the issuer, a new DList+bounty; as anyone else, or as the
+    /// issuer on the Eligible tab, a claim on the selected bounty
+    /// ([`opens_claim`]). From any screen — it navigates to Bounties first.
+    /// An open bounty form, in either mode, is refocused, never replaced.
     pub(crate) fn new_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // No account: the honest response is the account screen, not a form
         // whose submit can only fail.
@@ -2031,14 +2420,49 @@ impl Shell {
             self.open_account_setup(false, window, cx);
             return;
         }
+        let claim = opens_claim(
+            self.is_active_issuer(),
+            self.screen,
+            self.bounty_tab,
+            self.bounty_form.is_some(),
+        );
         if self.screen != Screen::Bounties {
             self.go(Screen::Bounties, window, cx);
         }
-        if self.is_active_issuer() {
-            self.open_bounty_form(window, cx)
-        } else {
+        if claim {
             self.open_claim_form(window, cx)
+        } else {
+            // Keep whichever mode is open, so typed criteria survive.
+            let list = self
+                .bounty_form
+                .as_ref()
+                .and_then(|f| f.existing_list.clone());
+            if self.bounty_form_refused(list.as_deref()) {
+                self.hold_for_submit();
+                cx.notify();
+                return;
+            }
+            // The bounty form belongs to the House tab: leaving Eligible
+            // showing would offer a claim over a half-typed bounty.
+            if self.bounty_tab != BountyTab::House {
+                self.set_bounty_tab(BountyTab::House, window, cx);
+            }
+            self.open_bounty_form(list, window, cx)
         }
+    }
+
+    /// [`bounty_form_refused`] over the open forms.
+    fn bounty_form_refused(&self, requested: Option<&str>) -> bool {
+        bounty_form_refused(
+            self.claim_form.as_ref().is_some_and(|f| f.submitting),
+            self.bounty_form.as_ref().map(|f| {
+                (
+                    f.existing_list.as_deref(),
+                    form_locked(f.submitting, f.checking_list),
+                )
+            }),
+            requested,
+        )
     }
 
     /// A bounty or claim request is out and unanswered, or the list read
@@ -2072,6 +2496,13 @@ impl Shell {
             return;
         }
         if self.bounty_form.is_some() || self.claim_form.is_some() {
+            if let Some(list) = self
+                .bounty_form
+                .as_ref()
+                .and_then(|f| f.existing_list.as_deref())
+            {
+                on_bounty_form_closed(&mut self.unknown_create, list);
+            }
             self.bounty_form = None;
             self.claim_form = None;
             self.pending_bounty = None;
@@ -2087,11 +2518,36 @@ impl Shell {
             }
     }
 
-    fn open_bounty_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the bounty form: the normal new-list mode, or (with a list
+    /// coordinate) the existing-list mode.
+    pub(crate) fn open_bounty_form(
+        &mut self,
+        existing_list: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The issuer can hold a claim form too (Eligible tab): one whose
+        // request is out stays, so its reply has a form to land on; so does
+        // a bounty form in the other mode whose request is out.
+        if self.bounty_form_refused(existing_list.as_deref()) {
+            self.hold_for_submit();
+            cx.notify();
+            return;
+        }
         self.claim_form = None;
-        if self.bounty_form.is_some() {
-            // Already open: just put the caret back on the first field.
-            self.focus_bounty_field(F_SINGULAR, window, cx);
+        let first = if existing_list.is_some() {
+            F_CRITERIA
+        } else {
+            F_SINGULAR
+        };
+        // Already open: just put the caret back on the first field. An idle
+        // form in the other mode is replaced below.
+        if self
+            .bounty_form
+            .as_ref()
+            .is_some_and(|form| form.existing_list == existing_list)
+        {
+            self.focus_bounty_field(first, window, cx);
             cx.notify();
             return;
         }
@@ -2123,12 +2579,13 @@ impl Shell {
 
         self.bounty_form = Some(BountyForm {
             fields,
+            existing_list,
             error: None,
             submitting: false,
             checking_list: None,
             _subs: subs,
         });
-        self.focus_bounty_field(F_SINGULAR, window, cx);
+        self.focus_bounty_field(first, window, cx);
         cx.notify();
     }
 
@@ -2156,6 +2613,7 @@ impl Shell {
         let value =
             |ix: usize| -> String { form.fields[ix].read(cx).value().trim().to_string() };
 
+        let existing_list = form.existing_list.clone();
         let singular = value(F_SINGULAR);
         let plural = value(F_PLURAL);
         let description = value(F_DESCRIPTION);
@@ -2168,7 +2626,7 @@ impl Shell {
         // positive) must be caught here, not by the server.
         // (message, field to put the caret back on)
         let mut fail: Option<(&str, usize)> = None;
-        if singular.is_empty() {
+        if existing_list.is_none() && singular.is_empty() {
             fail = Some(("Add an item name (singular).", F_SINGULAR));
         } else if criteria.is_empty() {
             fail = Some(("Add bounty criteria.", F_CRITERIA));
@@ -2222,37 +2680,62 @@ impl Shell {
             }
         };
 
-        // A bounty on this list already exists — typically a timed-out
-        // submit the server finished anyway. The server never dedupes. Only
+        // A bounty on this new list already exists — typically a timed-out
+        // submit the server finished anyway. The server never dedupes.
+        // Existing-list mode skips this: adding to a list is the point. Only
         // as good as the last list read: the form stays locked until the
         // reply to the read sent on the unknown outcome (or a later one)
         // lands. A create the server finishes after that read still slips
         // by, and a BountiesFailed unlocks against the old list.
-        let coordinate = nostr_sdk::prelude::PublicKey::from_hex(&pubkey)
-            .map(|pk| events::header_coordinate(&pk, &events::header_dtag(&singular)))
-            .ok();
-        if let (Load::Ready(bounties), Some(coordinate)) = (&self.bounties, &coordinate)
-            && bounties.iter().any(|b| {
-                &b.list_coordinate == coordinate && b.effective_status() == "open"
-            })
+        let coordinate = if existing_list.is_some() {
+            None
+        } else {
+            nostr_sdk::prelude::PublicKey::from_hex(&pubkey)
+                .map(|pk| events::header_coordinate(&pk, &events::header_dtag(&singular)))
+                .ok()
+        };
+        if let Some(coordinate) = &coordinate
+            && list_has_open_bounty(self.known_bounties(), coordinate)
         {
             fail = fail.or(Some((
                 "This list already has an open bounty. Pick it from the list instead.",
                 F_SINGULAR,
             )));
         }
+        // Existing-list mode: after an unknown outcome on this list, refuse
+        // when a bounty the timed-out submit did not know has appeared on it,
+        // from any form instance. Only as good as the last list read, the
+        // same as above.
+        // Shown only when no earlier check failed: that is the warning seen.
+        let refused = fail.is_none()
+            && existing_list.as_deref().is_some_and(|list| {
+                new_bounty_since_submit(&self.unknown_create, self.known_bounties(), list)
+            });
+        if refused {
+            fail = Some((
+                "A new bounty showed up on this list after the last try timed out. It is probably that try. Pick it from the list instead.",
+                F_CRITERIA,
+            ));
+        }
 
         if let Some((message, field)) = fail {
             if let Some(form) = &mut self.bounty_form {
                 form.error = Some(message.to_string());
+            }
+            if refused
+                && let Some(list) = &existing_list
+                && let Some(unknown) = self.unknown_create.get_mut(list)
+            {
+                unknown.refused = true;
             }
             self.focus_bounty_field(field, window, cx);
             cx.notify();
             return;
         }
 
-        self.pending_bounty = Some(CreateBounty {
-            // Filled in when DListPublished comes back with the coordinate.
+        let mut req = CreateBounty {
+            // Normal mode: filled in when DListPublished comes back with the
+            // coordinate. Existing-list mode: set below.
             list_coordinate: String::new(),
             amount_sats: amount.unwrap_or(0),
             criteria,
@@ -2263,17 +2746,33 @@ impl Shell {
             max_rewards_per_npub: Some(1),
             auto_pay: true,
             auto_pay_min_rank: min_rank,
-        });
-        let _ = self.commands.unbounded_send(Command::PublishDList {
-            pubkey,
-            singular,
-            plural,
-            description: if description.is_empty() {
-                None
-            } else {
-                Some(description)
-            },
-        });
+        };
+        if let Some(list_coordinate) = existing_list {
+            // The list is already published: create straight away.
+            let ids_before = self
+                .known_bounties()
+                .filter(|b| b.list_coordinate == list_coordinate)
+                .map(|b| b.id.clone())
+                .collect();
+            self.list_submit = Some((list_coordinate.clone(), ids_before));
+            req.list_coordinate = list_coordinate;
+            self.submitted_bounty = Some(req.clone());
+            let _ = self
+                .commands
+                .unbounded_send(Command::CreateBounty { pubkey, req });
+        } else {
+            self.pending_bounty = Some(req);
+            let _ = self.commands.unbounded_send(Command::PublishDList {
+                pubkey,
+                singular,
+                plural,
+                description: if description.is_empty() {
+                    None
+                } else {
+                    Some(description)
+                },
+            });
+        }
         if let Some(form) = &mut self.bounty_form {
             form.error = None;
             form.submitting = true;
@@ -2282,13 +2781,30 @@ impl Shell {
     }
 
     fn open_claim_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.bounty_form = None;
+        // The claim needs the list coordinate, so a bounty must be selected;
+        // without one nothing changes.
+        if self.selected_bounty().is_none() {
+            return;
+        }
+        // The issuer's bounty form gives way to a claim (Eligible tab), but
+        // not while its request is out: a dropped form invites a second
+        // bounty.
+        if let Some(form) = &self.bounty_form {
+            if form_locked(form.submitting, form.checking_list) {
+                self.hold_for_submit();
+                cx.notify();
+                return;
+            }
+            if let Some(list) = form.existing_list.as_deref() {
+                on_bounty_form_closed(&mut self.unknown_create, list);
+            }
+            self.bounty_form = None;
+        }
         if let Some(form) = &self.claim_form {
             form.name.update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
             return;
         }
-        // The claim needs the list coordinate, so a bounty must be selected.
         let Some(bounty) = self.selected_bounty() else {
             return;
         };
@@ -3016,6 +3532,7 @@ fn optimistic_bounty(id: &str, req: CreateBounty, now: u64) -> Bounty {
         auto_pay_min_rank: req.auto_pay_min_rank,
         derived_status: Some("open".into()),
         payment_state: None,
+        issuer_rank: None,
     }
 }
 
@@ -3104,13 +3621,342 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::{
-        BalanceCheck, RANK_NOTE, RemoveAction, claim_notice, click_remove, fold_checks,
-        form_locked, next_bounties_read, on_outcome_unknown, pick_active, relay_address_gap,
-        remove_click, still_checking_list,
+        BalanceCheck, RANK_NOTE, RemoveAction, UnknownCreate, bounty_form_refused,
+        can_post_on_list, claim_notice,
+        click_remove, fold_checks, form_locked, list_has_open_bounty, new_bounty_since_submit,
+        next_bounties_read, on_bounty_form_closed, on_list_create_unknown, on_list_created,
+        on_outcome_unknown, pick_active, relay_address_gap, remove_click, still_checking_list,
     };
-    use std::collections::HashMap;
+    use super::{
+        BountyTab, EligibleSlot, Load, Screen, find_bounty, house_reply_pick, land_eligible,
+        next_eligible_read, opens_claim, selection_for, takes,
+    };
+    use magic_carpet_chat::api::Bounty;
+    use std::collections::{HashMap, HashSet};
 
     use magic_carpet_chat::nostr::{Command, Update};
+
+    fn eligible_row(id: &str, issuer: &str) -> Bounty {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "issuer_pubkey": issuer,
+            "list_coordinate": "39998:aa:us-city",
+            "amount_sats": 100,
+            "status": "open",
+            "issuerRank": 2,
+        }))
+        .unwrap()
+    }
+
+    fn ready_ids(slot: &Option<EligibleSlot>) -> Option<Vec<String>> {
+        match &slot.as_ref()?.list {
+            Load::Ready(list) => Some(list.iter().map(|b| b.id.clone()).collect()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn eligible_replies_land_only_for_the_account_and_read_on_screen() {
+        let (mut slot, mut seq) = (None, 0);
+        let sent = |command: Command| match command {
+            Command::FetchEligible { pubkey, seq } => (pubkey, seq),
+            _ => panic!("not an eligible read"),
+        };
+
+        // A → B → A: each switch sends a read and starts a fresh slot.
+        let (_, a1) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        let (_, b2) = sent(next_eligible_read(&mut slot, &mut seq, "b"));
+        let (to, a3) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        assert_eq!((to.as_str(), a1, b2, a3), ("a", 1, 2, 3));
+        let Some(current) = &slot else {
+            panic!("no slot")
+        };
+        // Another account's reply, and A's reply from its first stint.
+        assert!(!takes(current, "b", b2));
+        assert!(!takes(current, "a", a1));
+        assert!(takes(current, "a", a3));
+        assert!(!land_eligible(
+            slot.as_mut(),
+            "b",
+            b2,
+            Ok(vec![eligible_row("b1", "x")])
+        ));
+        assert!(!land_eligible(
+            slot.as_mut(),
+            "a",
+            a1,
+            Ok(vec![eligible_row("old", "x")])
+        ));
+        assert_eq!(ready_ids(&slot), None, "still loading");
+
+        // ⌘R on the same account keeps the slot; the newer reply wins and an
+        // older one that lands after it is dropped.
+        let (_, a4) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        assert!(land_eligible(
+            slot.as_mut(),
+            "a",
+            a4,
+            Ok(vec![eligible_row("new", "x")])
+        ));
+        assert!(!land_eligible(
+            slot.as_mut(),
+            "a",
+            a3,
+            Ok(vec![eligible_row("stale", "x")])
+        ));
+        assert_eq!(ready_ids(&slot), Some(vec!["new".to_string()]));
+
+        // The list is filtered to what A can claim: its own bounty goes.
+        let (_, a5) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        let list = vec![eligible_row("mine", "a"), eligible_row("theirs", "x")];
+        assert!(land_eligible(slot.as_mut(), "a", a5, Ok(list)));
+        assert_eq!(ready_ids(&slot), Some(vec!["theirs".to_string()]));
+
+        // A failure keeps the list on screen.
+        let (_, a6) = sent(next_eligible_read(&mut slot, &mut seq, "a"));
+        assert!(land_eligible(slot.as_mut(), "a", a6, Err("down".into())));
+        assert_eq!(ready_ids(&slot), Some(vec!["theirs".to_string()]));
+
+        // A failed first load fails visibly.
+        let (_, b7) = sent(next_eligible_read(&mut slot, &mut seq, "b"));
+        assert!(land_eligible(slot.as_mut(), "b", b7, Err("down".into())));
+        assert!(matches!(&slot, Some(EligibleSlot { list: Load::Failed(m), .. }) if m == "down"));
+    }
+
+    #[test]
+    fn the_selection_stays_on_a_row_the_shown_list_holds() {
+        let list = Load::Ready(vec![eligible_row("a", "x"), eligible_row("b", "x")]);
+        // Held: kept. Gone or none: the first row.
+        assert_eq!(selection_for(Some("b"), &list, None).as_deref(), Some("b"));
+        assert_eq!(selection_for(Some("zz"), &list, None).as_deref(), Some("a"));
+        assert_eq!(selection_for(None, &list, None).as_deref(), Some("a"));
+        // Loading, failed or empty: cleared, never left on the old row.
+        assert_eq!(selection_for(Some("b"), &Load::Loading, None), None);
+        assert_eq!(
+            selection_for(Some("b"), &Load::Failed("down".into()), None),
+            None
+        );
+        assert_eq!(
+            selection_for(Some("b"), &Load::Ready(Vec::new()), None),
+            None
+        );
+        // The just-created card keeps its selection before the list has it.
+        assert_eq!(
+            selection_for(Some("new"), &list, Some("new")).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            selection_for(Some("new"), &Load::Loading, Some("new")).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            selection_for(Some("zz"), &list, Some("new")).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn a_house_reply_selects_only_on_the_house_tab_with_nothing_selected() {
+        let list = [eligible_row("h", "x")];
+        assert_eq!(
+            house_reply_pick(BountyTab::House, None, &list).as_deref(),
+            Some("h")
+        );
+        assert_eq!(house_reply_pick(BountyTab::House, Some("e"), &list), None);
+        assert_eq!(house_reply_pick(BountyTab::House, None, &[]), None);
+        // An empty or failed Eligible list cleared the selection: a house
+        // reply landing after it must not fill the detail pane.
+        assert_eq!(house_reply_pick(BountyTab::Eligible, None, &list), None);
+    }
+
+    #[test]
+    fn the_issuer_claims_only_from_the_eligible_tab() {
+        use Screen::{Bounties, Dashboard};
+        assert!(opens_claim(true, Bounties, BountyTab::Eligible, false));
+        assert!(!opens_claim(true, Bounties, BountyTab::House, false));
+        // Off the Bounties screen the issuer's ⌘N stays the bounty form,
+        // whichever tab Bounties last showed.
+        assert!(!opens_claim(true, Dashboard, BountyTab::Eligible, false));
+        assert!(opens_claim(false, Bounties, BountyTab::House, false));
+        assert!(opens_claim(false, Bounties, BountyTab::Eligible, false));
+        assert!(opens_claim(false, Dashboard, BountyTab::House, false));
+    }
+
+    #[test]
+    fn an_open_bounty_form_is_refocused_not_swapped_for_a_claim() {
+        use Screen::Bounties;
+        // The issuer clicked Eligible with the bounty form open: ⌘N and the
+        // header keep that form.
+        assert!(!opens_claim(true, Bounties, BountyTab::Eligible, true));
+        // A claimant never gets the bounty form.
+        assert!(opens_claim(false, Bounties, BountyTab::Eligible, true));
+    }
+
+    #[test]
+    fn cmd_n_refocuses_the_open_bounty_form_in_either_mode() {
+        let list = Some("39998:pk:post-city");
+        // new_item passes the open form's own list: an idle or a sending
+        // form in either mode is refocused, not refused or replaced.
+        assert!(!bounty_form_refused(false, Some((list, false)), list));
+        assert!(!bounty_form_refused(false, Some((list, true)), list));
+        assert!(!bounty_form_refused(false, Some((None, true)), None));
+        assert!(!bounty_form_refused(false, None, None));
+        // A claim whose request is out refuses before any tab switch.
+        assert!(bounty_form_refused(true, None, None));
+        assert!(bounty_form_refused(true, Some((list, false)), list));
+        // The detail pane's button asks for the other mode: an idle form
+        // gives way, a sending one does not.
+        assert!(!bounty_form_refused(false, Some((None, false)), list));
+        assert!(bounty_form_refused(false, Some((None, true)), list));
+    }
+
+    #[test]
+    fn a_bounty_only_on_the_eligible_list_is_still_found() {
+        let house = Load::Ready(vec![eligible_row("h", "x")]);
+        let eligible = Load::Ready(vec![eligible_row("e", "y")]);
+        let details = HashMap::new();
+        let found = |id| find_bounty(&details, [&house, &eligible], None, id).map(|b| &b.id);
+        assert_eq!(found("h").map(String::as_str), Some("h"));
+        assert_eq!(found("e").map(String::as_str), Some("e"));
+        assert_eq!(found("zz"), None);
+        let loading = Load::Loading;
+        assert!(find_bounty(&details, [&house, &loading], None, "e").is_none());
+    }
+
+    #[test]
+    fn new_bounty_on_list_shows_for_the_issuer_and_open_checks_the_list() {
+        let row = |status: &str| -> Bounty {
+            serde_json::from_value(serde_json::json!({
+                "id": "b",
+                "issuer_pubkey": "aa",
+                "list_coordinate": "39998:aa:us-city",
+                "amount_sats": 100,
+                "status": status,
+            }))
+            .unwrap()
+        };
+        let (open, mut done) = (row("open"), row("fulfilled"));
+        // Another bounty on the list: a fulfilled copy of "b" would mask it.
+        done.id = "done".into();
+        let coord = "39998:aa:us-city";
+
+        // The button: the issuer only, open bounties on the list or not.
+        assert!(can_post_on_list(Some("aa"), &open));
+        assert!(can_post_on_list(Some("aa"), &done));
+        assert!(!can_post_on_list(Some("bb"), &open));
+        assert!(!can_post_on_list(None, &open));
+
+        // The new-list duplicate guard.
+        let mut other_list = row("open");
+        other_list.list_coordinate = "39998:aa:other".into();
+        assert!(!list_has_open_bounty([&done, &other_list], coord));
+        assert!(list_has_open_bounty([&done, &open], coord));
+        // The same id, open in a stale detail and fulfilled in the list.
+        let mut stale = open.clone();
+        stale.id = "old".into();
+        let mut settled = stale.clone();
+        settled.status = Some("fulfilled".into());
+        assert!(!list_has_open_bounty([&settled, &stale], coord));
+        assert!(!list_has_open_bounty([&stale, &settled], coord));
+    }
+
+    #[test]
+    fn resubmit_on_list_after_unknown_outcome_refuses_a_new_bounty() {
+        let row = |id: &str| -> Bounty {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "issuer_pubkey": "aa",
+                "list_coordinate": "39998:aa:us-city",
+                "amount_sats": 100,
+                "status": "open",
+            }))
+            .unwrap()
+        };
+        let (old, new) = (row("old"), row("new"));
+        let coord = "39998:aa:us-city";
+        let seen = &HashMap::from([(
+            coord.to_string(),
+            UnknownCreate {
+                ids_before: ["old".to_string()].into(),
+                refused: false,
+            },
+        )]);
+
+        // No unknown outcome: nothing to guard.
+        assert!(!new_bounty_since_submit(&HashMap::new(), [&old, &new], coord));
+        // Same ids as at the submit.
+        assert!(!new_bounty_since_submit(seen, [&old], coord));
+        // A new id on the list after the unknown outcome.
+        assert!(new_bounty_since_submit(seen, [&old, &new], coord));
+        // A new id on another list does not count.
+        let mut other = row("new");
+        other.list_coordinate = "39998:aa:other".into();
+        assert!(!new_bounty_since_submit(seen, [&old, &other], coord));
+        // A guard for another list does not apply here.
+        assert!(!new_bounty_since_submit(seen, [&old, &other], "39998:aa:other"));
+    }
+
+    #[test]
+    fn unknown_create_guard_survives_a_form_reopen() {
+        let (a, b) = ("39998:aa:us-city", "39998:aa:other");
+        let mut in_flight = Some((a.to_string(), HashSet::from(["old".to_string()])));
+        let mut unknown = HashMap::new();
+
+        // The create times out: its snapshot becomes the guard.
+        on_list_create_unknown(&mut unknown, &mut in_flight);
+        assert_eq!(in_flight, None);
+        assert_eq!(
+            unknown.get(a),
+            Some(&UnknownCreate {
+                ids_before: ["old".to_string()].into(),
+                refused: false,
+            })
+        );
+        // No create out: nothing to promote, the guard stays.
+        on_list_create_unknown(&mut unknown, &mut in_flight);
+        assert!(unknown.contains_key(a));
+
+        // esc before any refusal: the guard survives the reopen.
+        on_bounty_form_closed(&mut unknown, a);
+        assert!(unknown.contains_key(a));
+
+        // A timeout on list B keeps A's guard: a resubmit on A is still
+        // refused.
+        let mut in_flight = Some((b.to_string(), HashSet::new()));
+        on_list_create_unknown(&mut unknown, &mut in_flight);
+        assert!(unknown.contains_key(a) && unknown.contains_key(b));
+        let row = |id: &str| -> Bounty {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "issuer_pubkey": "aa",
+                "list_coordinate": a,
+                "amount_sats": 100,
+                "status": "open",
+            }))
+            .unwrap()
+        };
+        let (old, new) = (row("old"), row("new"));
+        assert!(new_bounty_since_submit(&unknown, [&old, &new], a));
+
+        // A create on list B leaves A's guard.
+        on_list_created(&mut unknown, b);
+        assert!(unknown.contains_key(a) && !unknown.contains_key(b));
+
+        // After a refusal, closing B's form leaves A's; closing A's ends it.
+        if let Some(u) = unknown.get_mut(a) {
+            u.refused = true;
+        }
+        on_bounty_form_closed(&mut unknown, b);
+        assert!(unknown.contains_key(a));
+        on_bounty_form_closed(&mut unknown, a);
+        assert!(unknown.is_empty());
+
+        // A create on the same list ends it, refused or not.
+        let mut in_flight = Some((a.to_string(), HashSet::new()));
+        on_list_create_unknown(&mut unknown, &mut in_flight);
+        on_list_created(&mut unknown, a);
+        assert!(unknown.is_empty());
+    }
 
     /// The community stale-reply guard, exercised the way
     /// `apply_community` uses it: look the panel up by pubkey, hand its

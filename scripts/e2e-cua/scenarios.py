@@ -227,6 +227,7 @@ async def scenario_f(sc):
 
 
 # ---------------------------------------------------------------- G
+BOUNTIES_XY = (150, 250)  # the "Bounties" sidebar row (window at 0,0, 1280x960)
 CHIP_XY = (135, 116)  # the account name at the top of the sidebar
 REMOVE_LINK_XY = (143, 155)  # "Remove this account" under the chip (window at 0,0, 1280x960); fixed, so no OCR pass
 IDENTITY = Step("Open the Identity & keys tab of the active account's page.",
@@ -868,6 +869,143 @@ async def scenario_q(sc):
     sc.check("the disabled publish sent no Brainstorm request", not posts, posts)
 
 
+# ---------------------------------------------------------------- S
+async def scenario_s(sc):
+    coord = "39998:%s:post-city" % sc.suite.keys["house"]["pub"]
+    sc.box.start_fake({"create": "ok", "dup_coordinate": coord})
+    sc.box.launch("S", sc.suite.run_id)
+    # The goal needs only the header button, as in H and R; the first bounty
+    # is auto-selected, so its detail pane follows and the check below reads it.
+    ok = await sc.step(Step("Show the Bounties screen with the house issuer selected (its header button reads 'New DList + bounty').",
+                            [HOUSE, BOUNTIES], "The Bounties screen is shown and its header button reads 'New DList + bounty'.",
+                            settle=2, cues=HOUSE_CUES + ("New bounty on this list",)), must_act=True, label="house on bounties")
+    if not (ok and sc.check_screen("issuer sees the button", ["New bounty on this list"], ["Submit a bounty claim"])):
+        return
+    await sc.step(Step("Open the form from the detail pane's button.",
+                       [Cand("click-new-on-list", "Click the 'New bounty on this list' button in the detail pane.",
+                             [FOCUS, ("click_text", "New bounty on this list"), ("wait", 1), PARK])],
+                       "A form titled 'New bounty on this list' is open with a 'Bounty criteria' field and no 'Item (singular)', 'Items (plural)' or 'List description' field.",
+                       settle=2, cues=("New bounty on this list", "Item (singular)", "Bounty criteria", "Cancel")), label="open list form")
+    # The issuer's header button always reads "+ New DList + bounty (⌘N)",
+    # and "List" alone matches it, so check the fields themselves.
+    sc.check_screen("existing-list form: criteria, no list fields", ["New bounty on this list", "Bounty criteria", "Cancel (esc)"],
+                    ["Item (singular)", "Items (plural)", "List description"])
+    sc.box.mark("S submit")
+    for kind, arg in [("type", "A post city name, one per claim"), ("key", "Return"), ("wait", 0.4),
+                      ("key", "ctrl+a"), ("type", "100"), ("key", "Return"), ("wait", 0.4),
+                      ("key", "ctrl+a"), ("type", "200"), ("key", "Return"), ("wait", 0.4),
+                      ("key", "ctrl+a"), ("type", "2"), ("key", "Return")]:
+        await sc.suite.driver.act(kind, arg)
+    # The box can lag the keystrokes by several seconds: a fixed sleep once
+    # caught the untouched form before Enter landed. Wait for the second row.
+    await sc.wait_for(["House bounties (2)"], timeout=30, label="after create on the existing list")
+    lines = sc.log_after("S submit")
+    posts = [l for l in lines if l.startswith("POST /api/bounties")]
+    sc.check("exactly one create, on the existing list", len(posts) == 1 and posts[0].endswith("coord=post-city"), posts)
+    pubs = [l for l in lines if l.startswith("POST strfry/publish")]
+    sc.check("no list publish reached the server", not pubs, pubs)
+    # The new bounty's detail pane shows "New bounty on this list" again, so
+    # look for phrases only the form shows.
+    sc.check_screen("form closed after the create", [], ["Cancel (esc)", "Bounty criteria"])
+    await sc.step(Step("Select the next account (the claimant) and show the Bounties screen.", [NEXT_ACCOUNT],
+                       "The header button reads 'Submit a bounty claim'.", settle=2, cues=HOUSE_CUES + ("New bounty on this list",)),
+                  label="claimant selected")
+    sc.check_screen("non-issuer has no button", ["Submit a bounty claim"], ["New bounty on this list"])
+
+
+# ---------------------------------------------------------------- T
+ELIGIBLE_TAB = Cand("eligible-tab", "Click the 'Eligible for me to claim' tab above the bounty list.",
+                    [FOCUS, ("click_text", "Eligible for me to claim"), ("wait", 1), PARK])
+
+
+def eligible_gets(lines):
+    """(viewer, session) of each eligible GET line in the fake's log."""
+    out = []
+    for l in lines:
+        if l.startswith("GET /api/bounties/eligible"):
+            f = dict(p.split("=", 1) for p in l.split() if "=" in p)
+            out.append((f.get("viewer"), f.get("session")))
+    return out
+
+
+def logged_in_first(lines, who):
+    """`who` (8-char prefix) logged in before its first eligible GET."""
+    login = next((i for i, l in enumerate(lines) if l == f"POST login-user pubkey={who}"), None)
+    get = next((i for i, l in enumerate(lines)
+                if l.startswith(f"GET /api/bounties/eligible viewer={who} session={who}")), None)
+    return login is not None and get is not None and login < get
+
+
+async def scenario_t(sc):
+    house, claimant = sc.suite.keys["house"]["pub"], sc.suite.keys["claimant"]["pub"]
+    other = "e" * 64
+    lists = {
+        claimant: [["elig-c", f"39998:{other}:eligible-claimant", 3, 3, "e2e"]],
+        # The house's own bounty (rank 100 for self) and a rank-2 row on a
+        # min-3 auto-pay bounty: the server sends both, the app hides both.
+        house: [["elig-h", f"39998:{other}:eligible-house", 2, None, "e2e"],
+                ["elig-own", f"39998:{house}:eligible-own", 100, 2, "e2e"],
+                ["elig-gated", f"39998:{other}:eligible-gated", 2, 3, "e2e"]],
+    }
+    sc.box.start_fake({"eligible": lists, "eligible_delay": {claimant: 8}})
+    sc.box.mark("T launch")
+    sc.box.launch("T", sc.suite.run_id)
+    # The claimant is already active at launch. The search box holds the focus
+    # then and eats super+2, and click_text "Bounties" can hit the search
+    # placeholder: click the sidebar row by its fixed point instead.
+    await sc.step(Step("Show the Bounties screen for the claimant (the claimant's header button reads 'Submit a bounty claim').",
+                       [Cand("click-bounties", "Click 'Bounties' in the left sidebar.",
+                             [FOCUS, ("click", BOUNTIES_XY), ("wait", 1), PARK])],
+                       "The Bounties screen shows the 'Eligible for me to claim' tab and the header button reads 'Submit a bounty claim'.", settle=3,
+                       cues=("Submit a bounty claim", "New DList + bounty", "Eligible for me to claim")),
+                  must_act=True, label="claimant")
+    if not sc.check_screen("claimant selected, Eligible tab shown", ["Submit a bounty claim", "Eligible for me to claim"]):
+        return
+    # Before the step: its super+] sends the house read.
+    sc.box.mark("T switch")
+    # One candidate: the switch must land while the claimant's 8 s GET is held.
+    await sc.step(Step("Open the 'Eligible for me to claim' tab, then switch to the house account while its list is still loading.",
+                       [Cand("tab-then-switch", "Click the 'Eligible for me to claim' tab, then press super+] for the next account.",
+                             ELIGIBLE_TAB.do + [("stamp", "tab"), ("key", "super+bracketright"), ("wait", 1)])],
+                       "The eligible list shows a row on 'eligible-house' (the house is selected; on this tab its header button reads 'Submit a bounty claim').",
+                       tries=1, settle=1, cues=("eligible-house", "Submit a bounty claim", "Eligible for me to claim")),
+                  must_act=True, label="tab then switch")
+    await asyncio.sleep(max(0, sc.stamps.get("tab", time.time()) + 12 - time.time()))
+    await sc.see("after the held claimant reply")
+    # On the Eligible tab the house claims too, so its header button reads
+    # "Submit a bounty claim"; only the house's eligible row marks the house.
+    sc.check_screen("house sees its own eligible list only", ["eligible-house", "you qualify", "Submit a bounty claim"],
+                    ["eligible-claimant", "eligible-own", "eligible-gated", "New DList + bounty"])
+    lines = sc.log_after("T launch")
+    gets = eligible_gets(lines)
+    sc.check("every eligible GET is for the session's own account", gets and all(v == s for v, s in gets), gets)
+    sc.check("the claimant and the house each read their list",
+             (claimant[:8], claimant[:8]) in gets and (house[:8], house[:8]) in gets, gets)
+    sc.check("each account logged in before its first eligible read",
+             logged_in_first(lines, claimant[:8]) and logged_in_first(lines, house[:8]), lines)
+    sc.check("the house read went out after the switch", (house[:8], house[:8]) in eligible_gets(sc.log_after("T switch")),
+             sc.log_after("T switch"))
+    # Back to the claimant: its list is read again and shows.
+    sc.box.mark("T back")
+    await sc.suite.driver.act("key", "super+bracketright")
+    screen = await sc.wait_for(["eligible-claimant"], timeout=20, every=3, label="claimant list")
+    sc.check_screen("the claimant's list shows after switching back", ["eligible-claimant", "Submit a bounty claim"],
+                    ["eligible-house"], screen=screen)
+    sc.check("a second claimant read went out", (claimant[:8], claimant[:8]) in eligible_gets(sc.log_after("T back")),
+             sc.log_after("T back"))
+    # Nothing left to claim: the empty line, and the detail pane lets go of
+    # the row (the fake still answers its detail with the real coordinate).
+    sc.box.set_mode({"eligible": {claimant: []}})
+    # xfwm4 grabs Super+r on the box, so XTEST never delivers the app's refresh
+    # chord. Clicking the tab that is already open re-reads the list the same way.
+    for act in ELIGIBLE_TAB.do:
+        await sc.suite.driver.act(*act)
+    screen = await sc.wait_for(["No open bounties match"], timeout=20, every=3, label="empty list")
+    sc.check_screen("empty eligible list says so, no stale detail", ["No open bounties match", "Select a bounty"],
+                    ["eligible-claimant"], screen=screen)
+    sc.check("app still running", sc.box.app_alive())
+
+
 SCENARIOS = {
     "A": ("submit lock while a create hangs", scenario_a),
     "B": ("502 on create: hint and refetch", scenario_b),
@@ -882,6 +1020,8 @@ SCENARIOS = {
     "N": ("trust: inconclusive contact read refuses", scenario_n),
     "O": ("trust: graperank 429/403/503 wording and retries", scenario_o),
     "Q": ("trust: /setup 404 keeps publish disabled", scenario_q),
+    "S": ("issuer posts a new bounty on an existing list", scenario_s),
+    "T": ("eligible list survives an account switch mid-request", scenario_t),
     "P": ("paid: real bounty, claim, settle", scenario_p),
     "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),
 }

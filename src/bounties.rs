@@ -1,6 +1,7 @@
 //! The Bounties screen: the issuer's live bounty list beside a detail pane
 //! with per-claim payment timelines, plus the two forms that drive the demo —
-//! the issuer's "New DList + bounty" and everyone else's claim.
+//! the issuer's "New DList + bounty" and the claim (everyone else's, and the
+//! issuer's own from the Eligible tab).
 //!
 //! Everything renders from `Shell` state fed by the nostr runtime. The whole
 //! screen is keyboard-reachable: ↑/↓ select, ⌘N opens the form for whichever
@@ -13,9 +14,12 @@ use gpui_kit::component::{h_flex, input::Input, v_flex};
 
 use magic_carpet_chat::api::{Bounty, Claim};
 
+use crate::account::Tab;
 use crate::dashboard::{MONO, count_badge};
 use crate::palette::*;
-use crate::shell::{BOUNTY_FIELD_DEFS, Load, RANK_NOTE, Shell, short_id};
+use crate::shell::{
+    BOUNTY_FIELD_DEFS, BountyTab, F_CRITERIA, Load, RANK_NOTE, Screen, Shell, opens_claim, short_id,
+};
 use crate::timefmt;
 
 /// The human end of a list coordinate: `39998:<pk>:us-city` → `us-city`.
@@ -87,7 +91,46 @@ fn timeline_row(dot: u32, text: String, meta: Option<String>) -> AnyElement {
 
 // ------------------------------------------------------------------- list
 
-fn bounty_row(bounty: &Bounty, selected: bool, cx: &mut Context<Shell>) -> AnyElement {
+/// The eligible list's chip: the issuer's rank of the viewer against the
+/// bounty's effective minimum. `None` outside the eligible list, whose rows
+/// alone carry `issuerRank`.
+fn qualify_chip(bounty: &Bounty) -> Option<String> {
+    let rank = bounty.issuer_rank?;
+    // Ranks arrive as int or float; a whole number reads without ".0".
+    let rank = if rank.fract() == 0.0 {
+        format!("{rank:.0}")
+    } else {
+        rank.to_string()
+    };
+    Some(format!(
+        "you qualify — rank {rank} ≥ {}",
+        bounty.effective_min_rank()
+    ))
+}
+
+fn qualify_pill(text: String) -> AnyElement {
+    div()
+        .self_start()
+        .mt(px(5.))
+        .px(px(8.))
+        .py(px(2.))
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(GREEN_EDGE))
+        .bg(wash(GREEN_WASH))
+        .text_size(px(10.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(GREEN))
+        .child(SharedString::from(text))
+        .into_any_element()
+}
+
+fn bounty_row(
+    bounty: &Bounty,
+    selected: bool,
+    chip: Option<String>,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
     let id = bounty.id.clone();
     let dtag = coordinate_dtag(&bounty.list_coordinate).to_string();
     let status = bounty.effective_status().to_string();
@@ -155,6 +198,7 @@ fn bounty_row(bounty: &Bounty, selected: bool, cx: &mut Context<Shell>) -> AnyEl
                     this.child(div().text_color(rgb(GREEN)).child("auto-pay"))
                 }),
         )
+        .children(chip.map(qualify_pill))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.select(id.clone());
             cx.notify();
@@ -162,8 +206,73 @@ fn bounty_row(bounty: &Bounty, selected: bool, cx: &mut Context<Shell>) -> AnyEl
         .into_any_element()
 }
 
+/// "{label} ({n})", the count only once the list is in.
+fn tab_label(label: &str, list: &Load<Vec<Bounty>>) -> String {
+    match list {
+        Load::Ready(list) => format!("{label} ({})", list.len()),
+        _ => label.to_string(),
+    }
+}
+
+fn tab(
+    id: &'static str,
+    label: String,
+    on: bool,
+    tab: BountyTab,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(px(7.))
+        .cursor_pointer()
+        .text_size(px(11.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .map(|this| {
+            if on {
+                this.bg(rgb(BG_NAV_ON)).text_color(rgb(TEXT))
+            } else {
+                this.text_color(rgb(TEXT_MUTED))
+                    .hover(|this| this.bg(rgb(BG_HOVER)))
+            }
+        })
+        .child(SharedString::from(label))
+        .on_click(cx.listener(move |this, _, window, cx| this.set_bounty_tab(tab, window, cx)))
+        .into_any_element()
+}
+
+/// The tab strip over the list. The Eligible tab needs an account to be
+/// eligible as, so read-only mode shows the house list alone.
+fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
+    let house = tab(
+        "tab-house",
+        tab_label("House bounties", &shell.bounties),
+        shell.bounty_tab == BountyTab::House,
+        BountyTab::House,
+        cx,
+    );
+    let eligible = shell.eligible.as_ref().map(|slot| {
+        tab(
+            "tab-eligible",
+            tab_label("Eligible for me to claim", &slot.list),
+            shell.bounty_tab == BountyTab::Eligible,
+            BountyTab::Eligible,
+            cx,
+        )
+    });
+    h_flex()
+        .flex_wrap()
+        .gap(px(6.))
+        .mb(px(8.))
+        .child(house)
+        .children(eligible)
+        .into_any_element()
+}
+
 fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
-    let body: Vec<AnyElement> = match &shell.bounties {
+    let eligible = shell.bounty_tab == BountyTab::Eligible;
+    let body: Vec<AnyElement> = match shell.shown_list() {
         Load::Loading => vec![
             div()
                 .py(px(20.))
@@ -172,6 +281,30 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .child("Loading bounties…")
                 .into_any_element(),
         ],
+        Load::Ready(list) if list.is_empty() && eligible => {
+            let pubkey = shell.active.clone();
+            vec![
+                v_flex()
+                    .gap(px(8.))
+                    .py(px(20.))
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_DIM))
+                    .child("No open bounties match your rank right now.")
+                    .child(
+                        div()
+                            .id("eligible-identity")
+                            .cursor_pointer()
+                            .text_color(rgb(ACCENT_LIGHT))
+                            .child("Share your npub from Identity & keys so someone can vouch for you.")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(pubkey) = &pubkey {
+                                    this.open_account(pubkey, Tab::Identity, window, cx);
+                                }
+                            })),
+                    )
+                    .into_any_element(),
+            ]
+        }
         Load::Failed(message) => vec![
             v_flex()
                 .gap(px(8.))
@@ -180,7 +313,10 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                     div()
                         .text_size(px(12.5))
                         .text_color(rgb(RED))
-                        .child(SharedString::from(format!("Bounties didn't load: {message} Click Retry."))),
+                        .child(SharedString::from(format!(
+                            "{} didn't load: {message} Click Retry.",
+                            if eligible { "Eligible bounties" } else { "Bounties" }
+                        ))),
                 )
                 .child(
                     div()
@@ -194,6 +330,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                         .text_size(px(11.5))
                         .text_color(rgb(ACCENT_LIGHT))
                         .child("Retry (⌘R)")
+                        // refresh re-reads both lists, the eligible one too.
                         .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                 )
                 .into_any_element(),
@@ -212,6 +349,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 bounty_row(
                     bounty,
                     shell.selected.as_deref() == Some(bounty.id.as_str()),
+                    qualify_chip(bounty),
                     cx,
                 )
             })
@@ -223,8 +361,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     // must stay DIRECT children so scroll_to_item's indices match the list.
     v_flex()
         .id("bounty-list")
-        .w(px(300.))
-        .flex_shrink_0()
+        .flex_1()
         .min_h(px(0.))
         .overflow_y_scroll()
         .track_scroll(&shell.bounty_list_scroll)
@@ -381,7 +518,7 @@ fn fact(label: &'static str, value: String) -> AnyElement {
         .into_any_element()
 }
 
-fn detail_pane(shell: &Shell) -> AnyElement {
+fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let Some(selected) = shell.selected.as_deref() else {
         return div()
             .flex_1()
@@ -403,6 +540,8 @@ fn detail_pane(shell: &Shell) -> AnyElement {
             .into_any_element();
     };
 
+    let can_post = shell.can_post_on_list(bounty);
+    let chip = shell.eligible_bounty(&bounty.id).and_then(qualify_chip);
     let status = bounty.effective_status().to_string();
     let mut facts: Vec<AnyElement> = vec![fact(
         "REWARD",
@@ -494,6 +633,7 @@ fn detail_pane(shell: &Shell) -> AnyElement {
                     pill("manual pay", TEXT_MUTED)
                 }),
         )
+        .children(chip.map(qualify_pill))
         .when_some(
             bounty.criteria.clone().filter(|c| !c.is_empty()),
             |this, criteria| {
@@ -506,6 +646,26 @@ fn detail_pane(shell: &Shell) -> AnyElement {
             },
         )
         .child(h_flex().gap(px(22.)).items_start().children(facts))
+        .when(can_post, |this| {
+            let coordinate = bounty.list_coordinate.clone();
+            this.child(
+                div()
+                    .id("new-bounty-on-list")
+                    .self_start()
+                    .px(px(14.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(BORDER_3))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("New bounty on this list")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_bounty_form(Some(coordinate.clone()), window, cx)
+                    })),
+            )
+        })
         .child(
             h_flex()
                 .gap(px(8.))
@@ -609,15 +769,35 @@ fn labeled_input(label: &'static str, input: AnyElement) -> AnyElement {
 
 fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
     if let Some(form) = &shell.bounty_form {
-        let rows: Vec<AnyElement> = BOUNTY_FIELD_DEFS
+        // Existing-list mode hides the list fields (every field before the criteria).
+        let hidden = if form.existing_list.is_some() {
+            F_CRITERIA
+        } else {
+            0
+        };
+        let mut rows: Vec<AnyElement> = form
+            .existing_list
             .iter()
-            .zip(&form.fields)
-            .map(|((label, _, _), field)| {
-                labeled_input(label, Input::new(field).into_any_element())
+            .map(|coordinate| {
+                labeled_input(
+                    "List",
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(SharedString::from(coordinate_dtag(coordinate).to_string()))
+                        .into_any_element(),
+                )
             })
             .collect();
+        rows.extend(BOUNTY_FIELD_DEFS.iter().zip(&form.fields).skip(hidden).map(
+            |((label, _, _), field)| labeled_input(label, Input::new(field).into_any_element()),
+        ));
         return Some(form_card(
-            "New DList + bounty".into(),
+            if form.existing_list.is_some() {
+                "New bounty on this list".into()
+            } else {
+                "New DList + bounty".into()
+            },
             rows,
             form.error.clone(),
             if form.checking_list.is_some() {
@@ -625,7 +805,11 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             } else {
                 form.submitting.then_some("Publishing…")
             },
-            "Enter moves to the next field. Enter on the last field publishes the list and creates the auto-pay bounty, which commits sats. esc cancels.",
+            if form.existing_list.is_some() {
+                "Enter moves to the next field. Enter on the last field creates the auto-pay bounty, which commits sats. esc cancels."
+            } else {
+                "Enter moves to the next field. Enter on the last field publishes the list and creates the auto-pay bounty, which commits sats. esc cancels."
+            },
             cx,
         ));
     }
@@ -676,10 +860,16 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
 // ------------------------------------------------------------------ screen
 
 pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
-    let action_label = if shell.is_active_issuer() {
-        "+ New DList + bounty (⌘N)"
-    } else {
+    let claim = opens_claim(
+        shell.is_active_issuer(),
+        Screen::Bounties,
+        shell.bounty_tab,
+        shell.bounty_form.is_some(),
+    );
+    let action_label = if claim {
         "+ Submit a bounty claim (⌘N)"
+    } else {
+        "+ New DList + bounty (⌘N)"
     };
     // No account: the CTA dims, and a click (like ⌘N) opens the account
     // screen instead of a form that cannot submit.
@@ -732,7 +922,68 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                 .min_h(px(0.))
                 .gap(px(16.))
                 .items_stretch()
-                .child(list_pane(shell, cx))
-                .child(detail_pane(shell)),
+                .child(
+                    v_flex()
+                        .w(px(300.))
+                        .flex_shrink_0()
+                        .min_h(px(0.))
+                        .child(tab_strip(shell, cx))
+                        .child(list_pane(shell, cx)),
+                )
+                .child(detail_pane(shell, cx)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Load, qualify_chip, tab_label};
+    use magic_carpet_chat::api::Bounty;
+
+    fn row(extra: serde_json::Value) -> Bounty {
+        let mut row = serde_json::json!({
+            "id": "b",
+            "issuer_pubkey": "aa",
+            "list_coordinate": "39998:aa:us-city",
+            "amount_sats": 100,
+        });
+        if let (Some(row), Some(extra)) = (row.as_object_mut(), extra.as_object()) {
+            row.extend(extra.clone());
+        }
+        serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn the_qualify_chip_names_the_rank_and_the_effective_minimum() {
+        let auto = row(serde_json::json!({"issuerRank": 4, "auto_pay": 1, "auto_pay_min_rank": 3}));
+        assert_eq!(
+            qualify_chip(&auto).as_deref(),
+            Some("you qualify — rank 4 ≥ 3")
+        );
+        let manual = row(serde_json::json!({"issuerRank": 2.5}));
+        assert_eq!(
+            qualify_chip(&manual).as_deref(),
+            Some("you qualify — rank 2.5 ≥ 2")
+        );
+        // House-list rows carry no rank, so no chip.
+        assert_eq!(qualify_chip(&row(serde_json::json!({}))), None);
+    }
+
+    #[test]
+    fn a_tab_counts_only_a_loaded_list() {
+        assert_eq!(
+            tab_label("House bounties", &Load::Loading),
+            "House bounties"
+        );
+        assert_eq!(
+            tab_label(
+                "Eligible for me to claim",
+                &Load::Ready(vec![row(serde_json::json!({}))])
+            ),
+            "Eligible for me to claim (1)"
+        );
+        assert_eq!(
+            tab_label("House bounties", &Load::Failed("x".into())),
+            "House bounties"
+        );
+    }
 }
