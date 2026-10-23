@@ -860,7 +860,12 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
 // ------------------------------------------------------------------ screen
 
 pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
-    let claim = opens_claim(shell.is_active_issuer(), Screen::Bounties, shell.bounty_tab);
+    let claim = opens_claim(
+        shell.is_active_issuer(),
+        Screen::Bounties,
+        shell.bounty_tab,
+        shell.bounty_form.is_some(),
+    );
     let action_label = if claim {
         "+ Submit a bounty claim (⌘N)"
     } else {

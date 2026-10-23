@@ -708,9 +708,15 @@ fn house_reply_pick(tab: BountyTab, selected: Option<&str>, list: &[Bounty]) -> 
 
 /// ⌘N and the Bounties header button open a claim rather than the bounty
 /// form: always for a claimant, and for the issuer while the Bounties
-/// screen shows its Eligible tab.
-pub(crate) fn opens_claim(is_issuer: bool, screen: Screen, tab: BountyTab) -> bool {
-    !is_issuer || (screen == Screen::Bounties && tab == BountyTab::Eligible)
+/// screen shows its Eligible tab and no bounty form is open — an open one
+/// is refocused, never swapped for a claim.
+pub(crate) fn opens_claim(
+    is_issuer: bool,
+    screen: Screen,
+    tab: BountyTab,
+    bounty_form_open: bool,
+) -> bool {
+    !is_issuer || (screen == Screen::Bounties && tab == BountyTab::Eligible && !bounty_form_open)
 }
 
 /// Which list the Bounties screen shows.
@@ -2399,13 +2405,23 @@ impl Shell {
             self.open_account_setup(false, window, cx);
             return;
         }
-        let claim = opens_claim(self.is_active_issuer(), self.screen, self.bounty_tab);
+        let claim = opens_claim(
+            self.is_active_issuer(),
+            self.screen,
+            self.bounty_tab,
+            self.bounty_form.is_some(),
+        );
         if self.screen != Screen::Bounties {
             self.go(Screen::Bounties, window, cx);
         }
         if claim {
             self.open_claim_form(window, cx)
         } else {
+            // The bounty form belongs to the House tab: leaving Eligible
+            // showing would offer a claim over a half-typed bounty.
+            if self.bounty_tab != BountyTab::House {
+                self.set_bounty_tab(BountyTab::House, window, cx);
+            }
             self.open_bounty_form(None, window, cx)
         }
     }
@@ -2728,6 +2744,11 @@ impl Shell {
     }
 
     fn open_claim_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The claim needs the list coordinate, so a bounty must be selected;
+        // without one nothing changes.
+        if self.selected_bounty().is_none() {
+            return;
+        }
         // The issuer's bounty form gives way to a claim (Eligible tab), but
         // not while its request is out: a dropped form invites a second
         // bounty.
@@ -2747,7 +2768,6 @@ impl Shell {
             cx.notify();
             return;
         }
-        // The claim needs the list coordinate, so a bounty must be selected.
         let Some(bounty) = self.selected_bounty() else {
             return;
         };
@@ -3714,14 +3734,24 @@ mod tests {
     #[test]
     fn the_issuer_claims_only_from_the_eligible_tab() {
         use Screen::{Bounties, Dashboard};
-        assert!(opens_claim(true, Bounties, BountyTab::Eligible));
-        assert!(!opens_claim(true, Bounties, BountyTab::House));
+        assert!(opens_claim(true, Bounties, BountyTab::Eligible, false));
+        assert!(!opens_claim(true, Bounties, BountyTab::House, false));
         // Off the Bounties screen the issuer's ⌘N stays the bounty form,
         // whichever tab Bounties last showed.
-        assert!(!opens_claim(true, Dashboard, BountyTab::Eligible));
-        assert!(opens_claim(false, Bounties, BountyTab::House));
-        assert!(opens_claim(false, Bounties, BountyTab::Eligible));
-        assert!(opens_claim(false, Dashboard, BountyTab::House));
+        assert!(!opens_claim(true, Dashboard, BountyTab::Eligible, false));
+        assert!(opens_claim(false, Bounties, BountyTab::House, false));
+        assert!(opens_claim(false, Bounties, BountyTab::Eligible, false));
+        assert!(opens_claim(false, Dashboard, BountyTab::House, false));
+    }
+
+    #[test]
+    fn an_open_bounty_form_is_refocused_not_swapped_for_a_claim() {
+        use Screen::Bounties;
+        // The issuer clicked Eligible with the bounty form open: ⌘N and the
+        // header keep that form.
+        assert!(!opens_claim(true, Bounties, BountyTab::Eligible, true));
+        // A claimant never gets the bounty form.
+        assert!(opens_claim(false, Bounties, BountyTab::Eligible, true));
     }
 
     #[test]
