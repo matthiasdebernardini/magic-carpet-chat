@@ -161,6 +161,12 @@ def accent_pills(data):
 
 def ocr_phrase_pos(data, phrase):
     """(x, y) of `phrase`'s first occurrence in the 2x OCR, or None."""
+    hits = ocr_phrase_all(data, phrase)
+    return hits[0] if hits else None
+
+
+def ocr_phrase_all(data, phrase):
+    """[(x, y)] of every line holding `phrase` in the 2x OCR, top to bottom."""
     import io
     from PIL import Image
     im = Image.open(io.BytesIO(data)).convert("L")
@@ -175,6 +181,7 @@ def ocr_phrase_pos(data, phrase):
         lines.setdefault((p[2], p[3], p[4]), []).append(
             (p[11], float(p[6]) + float(p[8]) / 2, float(p[7]) + float(p[9]) / 2))
     needle = phrase.lower()
+    out = []
     for ws in sorted(lines.values(), key=lambda ws: (min(w[2] for w in ws), min(w[1] for w in ws))):
         joined = " ".join(w[0] for w in ws).lower()
         i = joined.find(needle)
@@ -187,9 +194,9 @@ def ocr_phrase_pos(data, phrase):
             if w0 < i + len(needle) and w1 > i:
                 sel.append((cx, cy))
         if sel:
-            return (sum(x for x, _ in sel) / len(sel) / 2,
-                    sum(y for _, y in sel) / len(sel) / 2)
-    return None
+            out.append((sum(x for x, _ in sel) / len(sel) / 2,
+                        sum(y for _, y in sel) / len(sel) / 2))
+    return out
 
 
 class FineDriver(Driver):
@@ -213,12 +220,15 @@ class FineDriver(Driver):
         if kind == "click_pill":
             # arg: an OCR anchor phrase (or its prefix): the accent pill
             # nearest it — same row for "RECOMMENDED", below a step heading
-            # for the calc/publish buttons.
+            # for the calc/publish buttons. Or {"text": phrase, "below": y}:
+            # the anchor is the phrase's first line below window y.
             data = shot_bytes(await self.sb.screenshot())
             pills = accent_pills(data)
             if not pills:
                 raise RuntimeError("click_pill: no accent pill on screen")
-            pos = ocr_phrase_pos(data, arg)
+            text = arg["text"] if isinstance(arg, dict) else arg
+            below = arg.get("below", -1) if isinstance(arg, dict) else -1
+            pos = next((p for p in ocr_phrase_all(data, text) if p[1] > below), None)
             if pos is None:
                 raise RuntimeError(f"click_pill: anchor {arg!r} not on screen")
             ax, ay = pos

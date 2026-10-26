@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -678,6 +679,28 @@ struct Session {
     /// A graperank run was accepted for this account this session — the
     /// gate `PublishMap` checks, since a new process cannot know.
     graperank_ok: bool,
+    /// A Calculate or Recalculate is in flight for this account; held by a
+    /// [`RunGuard`] so a second one cannot spend the rate limit beside it.
+    run_busy: Arc<AtomicBool>,
+}
+
+/// Owns an account's [`Session::run_busy`] flag for one run; clears it on
+/// drop, so every exit path frees the account.
+struct RunGuard(Arc<AtomicBool>);
+
+impl RunGuard {
+    /// `None` when a run is already in flight for the account.
+    fn acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| RunGuard(flag.clone()))
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// One session per account (by pubkey hex), shareable across spawned command
@@ -1005,6 +1028,7 @@ async fn session(
         brainstorm: None,
         contact_list: None,
         graperank_ok: false,
+        run_busy: Arc::new(AtomicBool::new(false)),
     }));
     map.insert(pubkey.to_string(), session.clone());
     Ok(session)
@@ -2296,16 +2320,18 @@ async fn trust_relay_profile(pubkey_hex: &str) -> Profile {
 pub enum PastedKey {
     /// An `npub1…`, `nostr:npub1…` or `nprofile1…`; the hex pubkey.
     Public(String),
-    /// An `nsec1…` — never searched, echoed or sent.
+    /// An `nsec1…` or a bare 64-hex string (which `secrets::parse_secret`
+    /// accepts as a secret) — never searched, echoed or sent.
     Private,
 }
 
-/// Classify a search-box value; `None` means an ordinary name search. Hex is
-/// deliberately not a key here.
+/// Classify a search-box value; `None` means an ordinary name search.
+/// Prefixes match in any case (an uppercase bech32 off a QR code is common).
 pub fn parse_pasted_key(input: &str) -> Option<PastedKey> {
-    let text = input.trim();
-    let text = text.strip_prefix("nostr:").unwrap_or(text);
-    if text.starts_with("nsec1") {
+    let lower = input.trim().to_ascii_lowercase();
+    let text = lower.strip_prefix("nostr:").unwrap_or(&lower);
+    let is_hex = text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit());
+    if text.starts_with("nsec1") || is_hex {
         return Some(PastedKey::Private);
     }
     let public = if text.starts_with("npub1") {
@@ -2520,17 +2546,22 @@ async fn current_contact_list(session: &Arc<TokioMutex<Session>>, pubkey: &str) 
 }
 
 const LOGIN_REFUSED: &str = "Brainstorm refused the login. Try again, or visit brainstorm.world.";
+const RUN_IN_FLIGHT: &str = "A calculation is already running for this account. Wait for it to finish.";
+const RUN_UNREADABLE: &str = "Couldn't read the run's progress from Brainstorm. Try again later.";
 
 /// What Calculate and Recalculate share: login, POST the kind-3 unless it
 /// is the list Brainstorm last accepted (remembered in the account store),
 /// then POST graperank once. A 401 mints one fresh token and retries that
-/// one call; a 403 or 429 is never retried. `Ok` is the token that worked,
-/// for the caller's reads.
+/// one call; a 403 or 429 is never retried. Refused while another run for
+/// the account is in flight. `Ok` is the token that worked, for the caller's
+/// reads, and the guard that keeps the account busy until it is dropped.
 async fn request_run(
     session: &Arc<TokioMutex<Session>>,
     pubkey: &str,
     event: &Event,
-) -> Result<Secret, String> {
+) -> Result<(Secret, RunGuard), String> {
+    let flag = session.lock().await.run_busy.clone();
+    let guard = RunGuard::acquire(&flag).ok_or_else(|| RUN_IN_FLIGHT.to_string())?;
     let mut token = brainstorm_token(session, false).await?;
     let event_id = event.id.to_hex();
     // A store that cannot be read counts as "never sent": one extra POST
@@ -2566,7 +2597,7 @@ async fn request_run(
     match outcome {
         Ok(()) => {
             session.lock().await.graperank_ok = true;
-            Ok(token)
+            Ok((token, guard))
         }
         Err(brainstorm::Fail::Unauthorized) => Err(LOGIN_REFUSED.into()),
         Err(brainstorm::Fail::Text(message)) => Err(message.into()),
@@ -2619,7 +2650,8 @@ const RECALC_PATIENCE: Duration = Duration::from_secs(4 * 3_600);
 
 /// `Command::Recalculate`: [`request_run`], then the `graperankResult` poll
 /// every [`recalc_poll`] until done or failed, then `/user/history`. A
-/// missed read just waits for the next tick; nothing is POSTed again.
+/// missed read waits for the next tick; three in a row end the run, as does
+/// a second 401 or the account's removal. Nothing is POSTed again.
 async fn recalculate(
     sessions: SharedSessions,
     pubkey: String,
@@ -2645,33 +2677,57 @@ async fn recalculate(
     let Some(event) = event else {
         return send(CommunityPart::Recalc(Err(brainstorm::FOLLOW_FIRST.into())));
     };
-    let mut token = match request_run(&session, &pubkey, &event).await {
-        Ok(token) => token,
+    let (mut token, _guard) = match request_run(&session, &pubkey, &event).await {
+        Ok(run) => run,
         Err(message) => return send(CommunityPart::Recalc(Err(message))),
     };
 
     let started = tokio::time::Instant::now();
     let interval = recalc_poll();
     let mut first = true;
+    let mut relogged = false;
+    let mut failed_reads = 0;
     loop {
         if !first {
             tokio::time::sleep(interval).await;
         }
         first = false;
+        // A removed account (or a re-added one, with a new session) is no
+        // longer this run's to watch.
+        let current = sessions.lock().await.get(&pubkey).cloned();
+        if !current.is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+            return;
+        }
         let read = match brainstorm::get_graperank_result(&token).await {
-            Err(brainstorm::Fail::Unauthorized) => match brainstorm_token(&session, true).await {
-                Ok(fresh) => {
-                    token = fresh;
-                    brainstorm::get_graperank_result(&token).await
+            // One fresh login per run; a second 401 ends it.
+            Err(brainstorm::Fail::Unauthorized) if !relogged => {
+                relogged = true;
+                match brainstorm_token(&session, true).await {
+                    Ok(fresh) => {
+                        token = fresh;
+                        brainstorm::get_graperank_result(&token).await
+                    }
+                    Err(_) => Err(brainstorm::Fail::Unauthorized),
                 }
-                Err(_) => Err(brainstorm::Fail::Unauthorized),
-            },
+            }
             other => other,
         };
-        if let Ok(Some(state)) = read {
-            send(CommunityPart::Recalc(Ok(state)));
-            if state.is_final() {
-                break;
+        match read {
+            Ok(Some(state)) => {
+                failed_reads = 0;
+                send(CommunityPart::Recalc(Ok(state)));
+                if state.is_final() {
+                    break;
+                }
+            }
+            Err(brainstorm::Fail::Unauthorized) if relogged => {
+                return send(CommunityPart::Recalc(Err(LOGIN_REFUSED.into())));
+            }
+            _ => {
+                failed_reads += 1;
+                if failed_reads >= 3 {
+                    return send(CommunityPart::Recalc(Err(RUN_UNREADABLE.into())));
+                }
             }
         }
         if started.elapsed() >= RECALC_PATIENCE {
@@ -3190,7 +3246,19 @@ mod tests {
         let nsec = keys.secret_key().to_bech32().unwrap();
         assert_eq!(parse_pasted_key(&nsec), Some(PastedKey::Private));
         assert_eq!(parse_pasted_key(&format!("nostr:{nsec}")), Some(PastedKey::Private));
-        assert_eq!(parse_pasted_key(&hex), None);
+        let upper_nsec = nsec.to_ascii_uppercase();
+        assert_eq!(parse_pasted_key(&upper_nsec), Some(PastedKey::Private));
+        assert_eq!(
+            parse_pasted_key(&format!("NOSTR:{upper_nsec}")),
+            Some(PastedKey::Private)
+        );
+        assert_eq!(parse_pasted_key(&format!("Nostr:{npub}")), public);
+        assert_eq!(parse_pasted_key(&npub.to_ascii_uppercase()), public);
+        assert_eq!(parse_pasted_key(&hex), Some(PastedKey::Private));
+        assert_eq!(
+            parse_pasted_key(&keys.secret_key().to_secret_hex().to_ascii_uppercase()),
+            Some(PastedKey::Private)
+        );
         assert_eq!(parse_pasted_key("alice"), None);
         assert_eq!(parse_pasted_key("npub1notarealkey"), None);
         assert_eq!(parse_pasted_key(""), None);

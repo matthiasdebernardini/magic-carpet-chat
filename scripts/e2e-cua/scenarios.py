@@ -11,7 +11,7 @@ account for real, or publish anywhere but the fake server (P and R excepted).
 """
 import asyncio, os, time
 from agent import Step, Cand
-from suite import has, ocr_phrase_pos
+from suite import accent_pills, has, ocr_phrase_all, ocr_phrase_pos
 
 FOCUS = ("focus", "Magic Carpet")
 PARK = ("shell", "xdotool mousemove 20 740")   # hover tooltips hide the header
@@ -923,6 +923,13 @@ async def scenario_u(sc):
     if not await open_trust(sc):
         return
     short = target["npub"][:12]
+    # The box itself shows the pasted npub, so the row is only the match
+    # below it: remember where the box is before typing into it.
+    data, _ = await sc.snap("search box")
+    box = ocr_phrase_pos(data, "Search profiles")
+    if not sc.check("the search box is on screen", box is not None):
+        return
+    row_below = box[1] + 12
     if not await sc.step(Step(
             "Click the 'Search profiles to follow' box in step 1 and paste the npub.",
             [Cand("paste-npub", "Click the 'Search profiles to follow' input, then type the npub into it.",
@@ -932,11 +939,16 @@ async def scenario_u(sc):
             tries=3, settle=4, cues=(short, "No profiles match", "Searching")),
             must_act=True, label="paste npub"):
         return
-    sc.check_screen("the single row is labelled by the short npub", [short], ["No profiles match"])
+    data, _ = await sc.snap("pasted row")
+    rows = [p for p in ocr_phrase_all(data, short) if p[1] > row_below]
+    sc.check("the result row below the box is labelled by the short npub", rows, f"box y={box[1]:.0f}")
+    sc.check_screen("no 'no match' line", [], ["No profiles match"])
+    if not rows:
+        return
     if not await sc.step(Step(
             f"Click 'Follow' on the result row '{short}' (not the recommended row).",
             [Cand("follow-pasted", "Click the 'Follow' button on the result row of the pasted npub.",
-                  [FOCUS, ("click_pill", short), ("wait", 1), PARK])],
+                  [FOCUS, ("click_pill", {"text": short, "below": row_below}), ("wait", 1), PARK])],
             "A confirmation box offers 'Start a new follow list' and 'Cancel'.",
             tries=3, settle=6, cues=("Start a new follow list", "Following", "Saved on")),
             must_act=True, label="follow pasted"):
@@ -1022,16 +1034,26 @@ FOLLOW_FIRST = "Follow at least one account first so we can calculate"
 RUN_CUES = (WAITING, CALCULATING, PUBLISHING, DONE_LINE, RECALC_WAIT, FOLLOW_FIRST, "Sending your follow list")
 
 
+RECALC_REACH = 90   # px below the 'Saved on' line that the Recalculate pill sits within
+
+
 async def recalculate(sc, label):
-    """One click on the Recalculate pill right under step 1's 'Saved on' line.
+    """One click on the Recalculate pill: the only accent pill between step
+    1's 'Saved on' line and step 2's heading (step 2's Calculate pill sits
+    below that heading). A missing or ambiguous pill fails the scenario.
     Never retried: every click is one graperank request (3 per 30 min live)."""
-    try:
-        await sc.suite.driver.act(*FOCUS)
-        await sc.suite.driver.act("click_pill", "Saved on")
-        await sc.suite.driver.act(*PARK)
-    except Exception as e:
-        sc.notes.append(f"{label}: Recalculate click failed ({e})")
+    await sc.suite.driver.act(*FOCUS)
+    data, _ = await sc.snap(f"{label} before click")
+    saved = ocr_phrase_pos(data, "Saved on")
+    step2 = ocr_phrase_pos(data, "Ask Brainstorm to calculate")
+    if not sc.check(f"{label}: 'Saved on' line on screen", saved is not None):
         return False
+    floor = step2[1] if step2 is not None and step2[1] > saved[1] else saved[1] + RECALC_REACH
+    pills = [p for p in accent_pills(data) if saved[1] < p[1] < min(floor, saved[1] + RECALC_REACH)]
+    if not sc.check(f"{label}: exactly one Recalculate pill under 'Saved on'", len(pills) == 1, pills):
+        return False
+    await sc.suite.driver.sb.mouse.click(pills[0][0], pills[0][1])
+    await sc.suite.driver.act(*PARK)
     return True
 
 
@@ -1089,10 +1111,10 @@ async def scenario_v(sc):
     sc.check("the second run sent exactly one graperank", len(grapes) == 1, grapes)
 
 
-async def wait_log(sc, marker, path, timeout=25):
-    """Poll the fake log until a `path` POST shows after `marker`."""
+async def wait_log(sc, marker, path, n=1, timeout=25):
+    """Poll the fake log until `n` `path` POSTs show after `marker`."""
     end = time.time() + timeout
-    while time.time() < end and not bs_posts(sc, marker, path):
+    while time.time() < end and len(bs_posts(sc, marker, path)) < n:
         await asyncio.sleep(1)
     return bs_posts(sc, marker, path)
 
@@ -1112,21 +1134,25 @@ async def scenario_w(sc):
         return
     if not await follow_owner(sc, expect_confirm=False):
         return
-    for marker, want in [("W 429", RECALC_WAIT), ("W 403", RECALC_WAIT), ("W fail", FOLLOW_FIRST)]:
+    # Counted from the first click: 1, then 2, then 3 — a click that missed
+    # (or a stale line from the previous run) cannot pass the next round.
+    for n, (marker, want) in enumerate([("W 429", RECALC_WAIT), ("W 403", RECALC_WAIT),
+                                        ("W fail", FOLLOW_FIRST)], start=1):
         sc.box.mark(marker)
         if not await recalculate(sc, marker):
             return
-        await wait_log(sc, marker, "/user/graperank")
+        grapes = await wait_log(sc, "W 429", "/user/graperank", n=n)
+        if not sc.check(f"{marker}: graperank count is {n}", len(grapes) == n, grapes):
+            return
         screen = await sc.wait_for([want], timeout=40, every=3, label=marker)
         sc.check_screen(f"{marker}: its wording shows", [want], [DONE_LINE], screen=screen)
-        grapes = bs_posts(sc, marker, "/user/graperank")
-        sc.check(f"{marker}: exactly one graperank", len(grapes) == 1, grapes)
     sc.check("the failed run was polled",
              any(l.startswith("BS GET graperankResult -> fail") for l in sc.log_after("W fail")))
     await asyncio.sleep(6)
     grapes = bs_posts(sc, "W 429", "/user/graperank")
     sc.check("nothing retried: three graperank requests in all", len(grapes) == 3, grapes)
-    sc.check("followList posted at most once", len(bs_posts(sc, "W 429", "/user/followList")) <= 1)
+    follows = bs_posts(sc, "W 429", "/user/followList")
+    sc.check("followList posted exactly once", len(follows) == 1, follows)
 
     # A fresh key with no follow list: the Trust tab's button is disabled.
     bare = fresh_key(sc.box)
@@ -1142,11 +1168,20 @@ async def scenario_w(sc):
         await sc.suite.driver.act(*PARK)
         screen = await sc.see("scroll to web of trust")
     sc.check_screen("no follows: the follow-first line shows", ["Followed someone new", FOLLOW_FIRST], screen=screen)
+    # The follow-first line sits right under the Recalculate button. Enabled,
+    # the button is an accent pill there; disabled, it is a plain grey one.
+    data, _ = await sc.snap("disabled recalculate")
+    line = ocr_phrase_pos(data, FOLLOW_FIRST)
+    if not sc.check("the follow-first line was located", line is not None):
+        return
+    above = [p for p in accent_pills(data) if line[1] - 60 < p[1] < line[1]]
+    sc.check("the Recalculate button is drawn disabled (no accent pill above the line)", not above, above)
     sc.box.mark("W disabled")
     try:
         await sc.suite.driver.act("click_text", {"text": "Recalculate", "near": FOLLOW_FIRST})
     except Exception as e:
-        sc.notes.append(f"disabled Recalculate click found no button ({e})")
+        sc.check("the disabled Recalculate button was clicked", False, e)
+        return
     await asyncio.sleep(5)
     # A window re-activation may re-read /setup; only the run's calls count.
     sent = [l for l in sc.log_after("W disabled")

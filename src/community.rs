@@ -251,9 +251,9 @@ impl Shell {
         let sub = cx.subscribe_in(
             &search,
             window,
-            move |this: &mut Shell, _, event, _window, cx| {
+            move |this: &mut Shell, _, event, window, cx| {
                 match event {
-                    InputEvent::Change => this.community_search_changed(&key, cx),
+                    InputEvent::Change => this.community_search_changed(&key, window, cx),
                     InputEvent::Focus | InputEvent::Blur => {
                         if let Some(state) = this.community.get_mut(&key) {
                             state.search_focused = matches!(event, InputEvent::Focus);
@@ -298,7 +298,12 @@ impl Shell {
 
     /// A keystroke in the panel's search box: debounce 300 ms, then send
     /// `SearchProfiles`. Under two trimmed characters asks nothing.
-    fn community_search_changed(&mut self, pubkey: &str, cx: &mut Context<Self>) {
+    fn community_search_changed(
+        &mut self,
+        pubkey: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(state) = self.community.get_mut(pubkey) else {
             return;
         };
@@ -335,6 +340,11 @@ impl Shell {
                 state.last_query = String::new();
                 state.search_results = None;
                 state.pasted_private = true;
+                // The key must not stay on screen; `set_value` emits no
+                // Change, so the line below the box survives.
+                state
+                    .search
+                    .update(cx, |input, cx| input.set_value("", window, cx));
                 cx.notify();
                 return;
             }
@@ -439,12 +449,13 @@ impl Shell {
         cx.notify();
     }
 
-    /// "Calculate my trust scores" — the UI dims it until ≥1 follow.
+    /// "Calculate my trust scores" — the UI dims it until ≥1 follow and
+    /// while a Recalculate is in flight.
     pub(crate) fn community_calculate(&mut self, pubkey: &str, cx: &mut Context<Self>) {
         let Some(state) = self.community.get_mut(pubkey) else {
             return;
         };
-        if matches!(state.calc, Calc::Busy) {
+        if matches!(state.calc, Calc::Busy) || state.recalc.busy() {
             return;
         }
         state.calc = Calc::Busy;
@@ -545,7 +556,7 @@ impl Shell {
                 state.search_results = Some(result);
             }
             CommunityPart::ProfileName {
-                seq,
+                seq: _,
                 target,
                 name,
                 picture,
@@ -553,14 +564,29 @@ impl Shell {
                 let Some(state) = self.community.get_mut(&pubkey) else {
                     return;
                 };
-                if seq != state.search_seq {
-                    return;
-                }
+                // The kind-0 may land after the click captured the short
+                // npub, or after a follow cleared the results: update the
+                // target wherever it is held.
                 if let Some(Ok(hits)) = &mut state.search_results
                     && let Some(hit) = hits.iter_mut().find(|hit| hit.pubkey == target)
                 {
-                    hit.name = name;
-                    hit.picture = picture;
+                    hit.name = name.clone();
+                    hit.picture = picture.clone();
+                }
+                if let Some(name) = name {
+                    for (key, label) in state
+                        .pending
+                        .iter_mut()
+                        .chain(state.confirm_first.iter_mut())
+                        .chain(state.follows.iter_mut())
+                    {
+                        if *key == target {
+                            *label = name.clone();
+                        }
+                    }
+                }
+                if let Some(picture) = picture {
+                    state.pictures.insert(target, picture);
                 }
             }
             CommunityPart::Followed(result) => {
@@ -1435,6 +1461,9 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
     // ------------------------------------------------------------ step 2
 
     let key = pubkey.to_string();
+    // A Recalculate in flight holds the account's run; a second POST beside
+    // it would spend Brainstorm's rate limit.
+    let can_calc = has_follows && !state.recalc.busy();
     let calc_body: AnyElement = match &state.calc {
         Calc::Busy => h_flex()
             .gap(px(9.))
@@ -1479,7 +1508,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     .text_color(rgb(AMBER))
                     .child(SharedString::from(message.clone())),
             )
-            .child(calc_button("community-calc-retry", has_follows, cx, {
+            .child(calc_button("community-calc-retry", can_calc, cx, {
                 let key = key.clone();
                 move |this, _, cx| this.community_calculate(&key, cx)
             }))
@@ -1495,7 +1524,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 );
             }
             column
-                .child(calc_button("community-calc", has_follows, cx, move |this, _, cx| {
+                .child(calc_button("community-calc", can_calc, cx, move |this, _, cx| {
                     this.community_calculate(&key, cx)
                 }))
                 .into_any_element()
