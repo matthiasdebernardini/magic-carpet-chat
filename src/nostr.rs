@@ -214,6 +214,15 @@ pub enum Command {
         seq: u64,
         query: String,
     },
+    /// The name in `target`'s (hex pubkey) kind-0, read from the trust
+    /// relays, for a row built from a pasted key. Emits `Community` with
+    /// `CommunityPart::ProfileName`; `seq` is the search seq it belongs to.
+    FetchProfileName {
+        pubkey: String,
+        generation: u32,
+        seq: u64,
+        target: String,
+    },
     /// Append `target` (hex pubkey) to the account's kind-3 under the
     /// majority rule: a found list is merged, `allow_first_list` is the
     /// confirmed consent to start one from scratch. Emits `Community` with
@@ -439,6 +448,12 @@ pub enum CommunityPart {
     SearchResults {
         seq: u64,
         result: Result<Vec<SearchHit>, String>,
+    },
+    /// A `FetchProfileName` reply; `name` is `None` when no kind-0 was found.
+    ProfileName {
+        seq: u64,
+        target: String,
+        name: Option<String>,
     },
     /// A `Follow` outcome.
     Followed(Result<FollowOk, FollowErr>),
@@ -863,6 +878,22 @@ async fn run(
                         pubkey,
                         generation,
                         part: CommunityPart::SearchResults { seq, result },
+                    });
+                });
+            }
+            Command::FetchProfileName {
+                pubkey,
+                generation,
+                seq,
+                target,
+            } => {
+                let updates = updates.clone();
+                tokio::spawn(async move {
+                    let name = trust_relay_name(&target).await;
+                    let _ = updates.unbounded_send(Update::Community {
+                        pubkey,
+                        generation,
+                        part: CommunityPart::ProfileName { seq, target, name },
                     });
                 });
             }
@@ -2177,32 +2208,61 @@ async fn fetch_owner(updates: mpsc::UnboundedSender<Update>) {
     {
         name = parse_profile(&content).name;
     }
-    if name.is_none()
-        && let Ok(public) = PublicKey::parse(&pubkey_hex)
-    {
-        let urls = trust_relays();
-        let client = Client::default();
-        for url in &urls {
-            let _ = client.add_relay(url.as_str()).await;
-        }
-        client.connect().and_wait(Duration::from_secs(5)).await;
-        let filter = Filter::new().kind(Kind::Metadata).author(public).limit(5);
-        let results = read_per_relay(&client, &urls, filter).await;
-        client.disconnect().await;
-        let (_, events) = answered(results);
-        name = events
-            .into_iter()
-            .filter(|(_, event)| {
-                event.pubkey.to_hex() == pubkey_hex && event.verify().is_ok()
-            })
-            .max_by_key(|(_, event)| event.created_at)
-            .and_then(|(_, event)| parse_profile(&event.content).name);
+    if name.is_none() {
+        name = trust_relay_name(&pubkey_hex).await;
     }
     let _ = updates.unbounded_send(Update::Owner {
         pubkey_hex,
         npub,
         name,
     });
+}
+
+/// The name in the newest kind-0 the trust relays hold for `pubkey_hex`.
+async fn trust_relay_name(pubkey_hex: &str) -> Option<String> {
+    let public = PublicKey::parse(pubkey_hex).ok()?;
+    let urls = trust_relays();
+    let client = Client::default();
+    for url in &urls {
+        let _ = client.add_relay(url.as_str()).await;
+    }
+    client.connect().and_wait(Duration::from_secs(5)).await;
+    let filter = Filter::new().kind(Kind::Metadata).author(public).limit(5);
+    let results = read_per_relay(&client, &urls, filter).await;
+    client.disconnect().await;
+    let (_, events) = answered(results);
+    events
+        .into_iter()
+        .filter(|(_, event)| event.pubkey.to_hex() == pubkey_hex && event.verify().is_ok())
+        .max_by_key(|(_, event)| event.created_at)
+        .and_then(|(_, event)| parse_profile(&event.content).name)
+}
+
+/// What the follow panel's search box holds when it is a key and not a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PastedKey {
+    /// An `npub1…`, `nostr:npub1…` or `nprofile1…`; the hex pubkey.
+    Public(String),
+    /// An `nsec1…` — never searched, echoed or sent.
+    Private,
+}
+
+/// Classify a search-box value; `None` means an ordinary name search. Hex is
+/// deliberately not a key here.
+pub fn parse_pasted_key(input: &str) -> Option<PastedKey> {
+    let text = input.trim();
+    let text = text.strip_prefix("nostr:").unwrap_or(text);
+    if text.starts_with("nsec1") {
+        return Some(PastedKey::Private);
+    }
+    let public = if text.starts_with("npub1") {
+        PublicKey::from_bech32(text).ok()?
+    } else if text.starts_with("nprofile1") {
+        Nip19Profile::from_bech32(text).ok()?.public_key
+    } else {
+        return None;
+    };
+    Some(PastedKey::Public(public.to_hex()))
 }
 
 /// Open a throwaway client on the trust relays, then widen it to the set
@@ -2941,6 +3001,30 @@ mod tests {
         ] {
             assert!(!command.contains("token"), "leaked: {command}");
         }
+    }
+
+    #[test]
+    fn pasted_keys_parse() {
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let npub = keys.public_key().to_bech32().unwrap();
+        let nprofile = Nip19Profile::new(
+            keys.public_key(),
+            [RelayUrl::parse("wss://r.example").unwrap()],
+        )
+        .to_bech32()
+            .unwrap();
+        let public = Some(PastedKey::Public(hex.clone()));
+        assert_eq!(parse_pasted_key(&format!("  {npub}\n")), public);
+        assert_eq!(parse_pasted_key(&format!(" nostr:{npub} ")), public);
+        assert_eq!(parse_pasted_key(&format!("\t{nprofile} ")), public);
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        assert_eq!(parse_pasted_key(&nsec), Some(PastedKey::Private));
+        assert_eq!(parse_pasted_key(&format!("nostr:{nsec}")), Some(PastedKey::Private));
+        assert_eq!(parse_pasted_key(&hex), None);
+        assert_eq!(parse_pasted_key("alice"), None);
+        assert_eq!(parse_pasted_key("npub1notarealkey"), None);
+        assert_eq!(parse_pasted_key(""), None);
     }
 
     #[test]

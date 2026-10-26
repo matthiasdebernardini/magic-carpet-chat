@@ -911,6 +911,53 @@ async def scenario_s(sc):
     sc.check_screen("non-issuer has no button", ["Submit a bounty claim"], ["New bounty on this list"])
 
 
+# ---------------------------------------------------------------- U
+async def scenario_u(sc):
+    """Fresh account, no kind-3: paste an npub the fake Brainstorm search does
+    not know; the one row shows, Follow publishes a kind-3 with its p tag."""
+    acct, owner, target = fresh_key(sc.box), fresh_key(sc.box), fresh_key(sc.box)
+    sc.box.start_fake({})
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
+    sc.box.launch("U", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
+    if not await open_trust(sc):
+        return
+    short = target["npub"][:12]
+    if not await sc.step(Step(
+            "Click the 'Search profiles to follow' box in step 1 and paste the npub.",
+            [Cand("paste-npub", "Click the 'Search profiles to follow' input, then type the npub into it.",
+                  [FOCUS, ("click_text", "Search profiles"), ("wait", 0.5),
+                   ("type", target["npub"]), ("wait", 1.5), PARK])],
+            f"One result row beginning '{short}' with a 'Follow' button shows under the search box.",
+            tries=3, settle=4, cues=(short, "No profiles match", "Searching")),
+            must_act=True, label="paste npub"):
+        return
+    sc.check_screen("the single row is labelled by the short npub", [short], ["No profiles match"])
+    if not await sc.step(Step(
+            f"Click 'Follow' on the result row '{short}' (not the recommended row).",
+            [Cand("follow-pasted", "Click the 'Follow' button on the result row of the pasted npub.",
+                  [FOCUS, ("click_pill", short), ("wait", 1), PARK])],
+            "A confirmation box offers 'Start a new follow list' and 'Cancel'.",
+            tries=3, settle=6, cues=("Start a new follow list", "Following", "Saved on")),
+            must_act=True, label="follow pasted"):
+        return
+    if has(sc.screen, "Start a new follow list"):
+        if not await sc.step(Step(
+                "Approve the first follow list: click 'Start a new follow list' in the confirmation box.",
+                [Cand("confirm-first-list", "Click the 'Start a new follow list' button beside 'Cancel' in the confirmation box.",
+                      [FOCUS, ("click_pill", "cancel"), ("wait", 1), PARK])],
+                "A 'Saved on N of M Nostr servers' line is shown.",
+                tries=4, settle=8, cues=("Saved on", "Following", "Start a new follow list")),
+                must_act=True, label="confirm first list"):
+            return
+    k3 = nak_req(sc.box, 3, acct["pub"])
+    sc.check("a kind-3 on the local relay", bool(k3), f"{len(k3)} events")
+    if k3:
+        sc.check("the newest kind-3 has the pasted key's p tag",
+                 any(t[:2] == ["p", target["pub"]] for t in k3[0].get("tags", [])),
+                 f"{len(k3[0].get('tags', []))} tags")
+
+
 SCENARIOS = {
     "A": ("submit lock while a create hangs", scenario_a),
     "B": ("502 on create: hint and refetch", scenario_b),
@@ -925,6 +972,7 @@ SCENARIOS = {
     "N": ("trust: inconclusive contact read refuses", scenario_n),
     "O": ("trust: graperank 429/403/503 wording and retries", scenario_o),
     "Q": ("trust: /setup 404 keeps publish disabled", scenario_q),
+    "U": ("trust: follow a pasted npub the search does not know", scenario_u),
     "S": ("issuer posts a new bounty on an existing list", scenario_s),
     "P": ("paid: real bounty, claim, settle", scenario_p),
     "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),

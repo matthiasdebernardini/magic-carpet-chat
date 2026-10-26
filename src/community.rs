@@ -22,7 +22,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use magic_carpet_chat::brainstorm::SearchHit;
-use magic_carpet_chat::nostr::{self, Command, CommunityPart, FollowErr, FollowOk, SetupState};
+use magic_carpet_chat::nostr::{
+    self, Command, CommunityPart, FollowErr, FollowOk, PastedKey, SetupState, parse_pasted_key,
+};
 use magic_carpet_chat::trust::Designation;
 use nostr_sdk::prelude::ToBech32 as _;
 
@@ -66,6 +68,8 @@ pub(crate) struct CommunityState {
     pub search_results: Option<Result<Vec<SearchHit>, String>>,
     /// A search is in flight.
     pub searching: bool,
+    /// The box holds a private key: no row, a fixed line instead.
+    pub pasted_private: bool,
     /// Bumped per `SearchProfiles` sent; replies carry it back, stale seqs
     /// drop.
     pub search_seq: u64,
@@ -236,6 +240,7 @@ impl Shell {
                 search,
                 search_results: None,
                 searching: false,
+                pasted_private: false,
                 search_seq: 0,
                 last_query: String::new(),
                 debounce: None,
@@ -264,6 +269,43 @@ impl Shell {
             return;
         };
         let query = state.search.read(cx).value().trim().to_string();
+        state.pasted_private = false;
+        match parse_pasted_key(&query) {
+            Some(PastedKey::Public(target)) => {
+                // A pasted key skips Brainstorm: one row now, its name when
+                // the kind-0 arrives.
+                state.debounce = None;
+                state.search_seq += 1;
+                state.searching = false;
+                state.last_query = String::new();
+                state.search_results = Some(Ok(vec![SearchHit {
+                    pubkey: target.clone(),
+                    name: None,
+                    display_name: None,
+                    nip05: None,
+                    picture: None,
+                }]));
+                let _ = self.commands.unbounded_send(Command::FetchProfileName {
+                    pubkey: pubkey.to_string(),
+                    generation: state.generation,
+                    seq: state.search_seq,
+                    target,
+                });
+                cx.notify();
+                return;
+            }
+            Some(PastedKey::Private) => {
+                state.debounce = None;
+                state.search_seq += 1;
+                state.searching = false;
+                state.last_query = String::new();
+                state.search_results = None;
+                state.pasted_private = true;
+                cx.notify();
+                return;
+            }
+            None => {}
+        }
         if query.len() < 2 {
             state.debounce = None;
             state.search_results = None;
@@ -281,7 +323,7 @@ impl Shell {
                     return;
                 };
                 let query = state.search.read(cx).value().trim().to_string();
-                if query.len() < 2 {
+                if query.len() < 2 || parse_pasted_key(&query).is_some() {
                     return;
                 }
                 state.search_seq += 1;
@@ -422,6 +464,19 @@ impl Shell {
                 }
                 state.searching = false;
                 state.search_results = Some(result);
+            }
+            CommunityPart::ProfileName { seq, target, name } => {
+                let Some(state) = self.community.get_mut(&pubkey) else {
+                    return;
+                };
+                if seq != state.search_seq {
+                    return;
+                }
+                if let Some(Ok(hits)) = &mut state.search_results
+                    && let Some(hit) = hits.iter_mut().find(|hit| hit.pubkey == target)
+                {
+                    hit.name = name;
+                }
             }
             CommunityPart::Followed(result) => {
                 let mut refresh = false;
@@ -937,6 +992,10 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
             }
         }
         Some(Err(_)) => Some(muted("Search is down. Try again in a moment.", TEXT_MUTED)),
+        None if state.pasted_private => Some(muted(
+            "That's a private key. Paste an npub.",
+            TEXT_MUTED,
+        )),
         None if state.searching => Some(
             h_flex()
                 .gap(px(9.))
