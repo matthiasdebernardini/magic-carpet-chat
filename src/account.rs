@@ -767,6 +767,11 @@ fn public_identity_card(shell: &Shell, npub: &str, cx: &mut Context<Shell>) -> A
                     },
                 )),
         )
+        .child(
+            div()
+                .mt(px(12.))
+                .child(crate::qr::view(crate::qr::encode(&crate::qr::npub_link(npub)), 160.)),
+        )
         .child(div().mt(px(12.)).child(open_link(
             "identity-view-profile",
             "View this profile on Brainstorm ↗",

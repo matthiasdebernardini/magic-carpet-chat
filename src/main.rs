@@ -18,6 +18,7 @@ mod community;
 mod dashboard;
 mod icons;
 mod palette;
+mod qr;
 mod shell;
 mod timefmt;
 mod trust_state;

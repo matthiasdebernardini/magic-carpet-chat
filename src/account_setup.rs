@@ -383,6 +383,24 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
                         .child(short_npub(&summary.npub)),
                 )
                 .child(div().text_color(rgb(TEXT_DIM)).child(" · saved")),
+        )
+        .child(
+            h_flex()
+                .ml(px(42.))
+                .items_end()
+                .gap(px(12.))
+                .child(crate::qr::view(
+                    crate::qr::encode(&crate::qr::npub_link(&summary.npub)),
+                    160.,
+                ))
+                .child({
+                    let npub = summary.npub.clone();
+                    quiet_button("copy-setup-npub", "Copy npub").on_click(cx.listener(
+                        move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(npub.clone()));
+                        },
+                    ))
+                }),
         );
     if !summary.profile_found && !generated {
         // No kind-0 at all on the paste-existing-key path usually means the

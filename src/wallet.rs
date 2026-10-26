@@ -24,13 +24,14 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use qrcode::{Color, QrCode};
+use qrcode::QrCode;
 
 use magic_carpet_chat::coinos::lnurl_pay;
 use magic_carpet_chat::nostr::{self, WalletCreated};
 
 use crate::dashboard::{MONO, muted};
 use crate::palette::*;
+use crate::qr;
 use crate::shell::{AccountView, ProfileRead, Shell};
 use crate::timefmt;
 
@@ -117,7 +118,7 @@ impl WalletState {
         }
         // No LNURL means no QR and no hint, exactly as if nothing was known.
         self.qr = lnurl_pay(address).map(|lnurl| {
-            let code = QrCode::new(format!("lightning:{lnurl}").as_bytes()).ok().map(Arc::new);
+            let code = qr::encode(&format!("lightning:{lnurl}"));
             (address.to_string(), code)
         });
     }
@@ -167,8 +168,6 @@ impl SendInputs {
 
 /// The QR square's edge, including the quiet zone.
 const QR_SIZE: f32 = 220.;
-/// LUD-01 asks for a 4-module quiet zone around the code.
-const QUIET_ZONE: usize = 4;
 
 fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div> {
     let base = div()
@@ -192,44 +191,6 @@ fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div>
             .border_color(rgb(BORDER_3))
             .text_color(rgb(TEXT_MUTED))
     }
-}
-
-/// `lightning:<LNURL>` painted module by module: white square, one quad per
-/// dark module, no image crate and no asset. Modules snap to whole pixels so
-/// the grid has no hairline seams a camera could misread.
-fn qr(code: Option<Arc<QrCode>>) -> AnyElement {
-    let Some(code) = code else {
-        return muted("Could not draw the QR code.", RED);
-    };
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let width = code.width();
-            window.paint_quad(fill(bounds, rgb(0xffffff)));
-            let total = (width + 2 * QUIET_ZONE) as f32;
-            let cell = (bounds.size.width / total).floor();
-            // Centre the whole-pixel grid inside the square.
-            let inset = (bounds.size.width - cell * total) / 2.;
-            let origin = bounds.origin + point(inset, inset);
-            for y in 0..width {
-                for x in 0..width {
-                    if code[(x, y)] == Color::Dark {
-                        let corner = origin
-                            + point(
-                                cell * (x + QUIET_ZONE) as f32,
-                                cell * (y + QUIET_ZONE) as f32,
-                            );
-                        window
-                            .paint_quad(fill(Bounds::new(corner, size(cell, cell)), rgb(0x000000)));
-                    }
-                }
-            }
-        },
-    )
-    .size(px(QR_SIZE))
-    .flex_shrink_0()
-    .rounded(px(8.))
-    .into_any_element()
 }
 
 /// The tag's two words: the signed change ("+15", "−30") and "was N".
@@ -371,7 +332,7 @@ pub fn panel(
                     ),
             )
             .when_some(state.qr.as_ref().map(|(_, code)| code.clone()), |this, code| {
-                this.child(qr(code)).child(muted(
+                this.child(qr::view(code, QR_SIZE)).child(muted(
                     "Scan with Strike or any Lightning wallet to add sats.",
                     TEXT_MUTED,
                 ))
