@@ -22,7 +22,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use magic_carpet_chat::brainstorm::SearchHit;
+use magic_carpet_chat::brainstorm::{self, RunState, SearchHit};
 use magic_carpet_chat::nostr::{
     self, Command, CommunityPart, FollowErr, FollowOk, PastedKey, SetupState, parse_pasted_key,
 };
@@ -45,6 +45,29 @@ pub(crate) enum Calc {
     Busy,
     Done(SetupState),
     Failed(String),
+}
+
+/// The Recalculate button's run. `Running` holds the state the poll last
+/// read; a done or failed run is final and frees the button.
+#[derive(Debug, Clone)]
+pub(crate) enum Recalc {
+    Idle,
+    /// The POSTs are out; no run state read yet.
+    Sending,
+    Running(RunState),
+    /// The run never started (fixed wording); nothing retries it.
+    Failed(String),
+}
+
+impl Recalc {
+    /// A run is being asked for or is still going: the button is disabled.
+    pub(crate) fn busy(&self) -> bool {
+        match self {
+            Recalc::Sending => true,
+            Recalc::Running(state) => !state.is_final(),
+            Recalc::Idle | Recalc::Failed(_) => false,
+        }
+    }
 }
 
 /// The publish step's progress. A success needs no `Done` to hold: the
@@ -98,6 +121,10 @@ pub(crate) struct CommunityState {
     pub search_focused: bool,
     pub calc: Calc,
     pub map: Map,
+    pub recalc: Recalc,
+    /// When the last run finished, from `/user/history`: `None` until read,
+    /// `Some(None)` when Brainstorm has no finished run.
+    pub last_finished: Option<Option<u64>>,
     /// Keeps the search-input subscription alive.
     _sub: Subscription,
 }
@@ -258,6 +285,8 @@ impl Shell {
                 search_focused: false,
                 calc: Calc::Idle,
                 map: Map::Idle,
+                recalc: Recalc::Idle,
+                last_finished: None,
                 _sub: sub,
             },
         );
@@ -426,6 +455,37 @@ impl Shell {
         cx.notify();
     }
 
+    /// "Recalculate": one `Recalculate` command. Refused while a run is in
+    /// flight, while step 2's Calculate is, and while the account follows
+    /// no one — the UI draws the button disabled for all three.
+    pub(crate) fn community_recalculate(&mut self, pubkey: &str, cx: &mut Context<Self>) {
+        let follows = has_follows(self, pubkey);
+        let Some(state) = self.community.get_mut(pubkey) else {
+            return;
+        };
+        if !follows || state.recalc.busy() || matches!(state.calc, Calc::Busy) {
+            return;
+        }
+        state.recalc = Recalc::Sending;
+        let _ = self.commands.unbounded_send(Command::Recalculate {
+            pubkey: pubkey.to_string(),
+            generation: state.generation,
+        });
+        cx.notify();
+    }
+
+    /// Ask when the account's last run finished. The runtime only asks
+    /// Brainstorm for an account this app already sent a follow list for.
+    pub(crate) fn community_run_history(&mut self, pubkey: &str) {
+        let Some(state) = self.community.get(pubkey) else {
+            return;
+        };
+        let _ = self.commands.unbounded_send(Command::FetchRunHistory {
+            pubkey: pubkey.to_string(),
+            generation: state.generation,
+        });
+    }
+
     /// "Try again" on a missing setup answer — a plain `/setup` GET, never
     /// the rate-limited POSTs.
     pub(crate) fn community_check_setup(&mut self, pubkey: &str, cx: &mut Context<Self>) {
@@ -550,6 +610,19 @@ impl Shell {
                         Ok(setup) => Calc::Done(setup),
                         Err(message) => Calc::Failed(message),
                     };
+                }
+            }
+            CommunityPart::Recalc(result) => {
+                if let Some(state) = self.community.get_mut(&pubkey) {
+                    state.recalc = match result {
+                        Ok(run) => Recalc::Running(run),
+                        Err(message) => Recalc::Failed(message),
+                    };
+                }
+            }
+            CommunityPart::LastFinished(finished) => {
+                if let Some(state) = self.community.get_mut(&pubkey) {
+                    state.last_finished = Some(finished);
                 }
             }
             CommunityPart::SetupChecked(setup) => {
@@ -794,20 +867,133 @@ fn step(
 
 // ------------------------------------------------------------- the render
 
+/// Whether the account follows anyone: a follow made in the panel this
+/// session, or Feature 1's read already counting follows.
+pub(crate) fn has_follows(shell: &Shell, pubkey: &str) -> bool {
+    shell
+        .community
+        .get(pubkey)
+        .is_some_and(|state| !state.follows.is_empty())
+        || matches!(
+            shell.trust.get(pubkey).map(|t| t.follows.last),
+            Some(Some(Some(n))) if n > 0
+        )
+}
+
+/// The Recalculate button with the run's live state and when the last run
+/// finished — on the Trust tab, and in step 1 right after a follow. `id`
+/// keeps the two copies apart when both are on screen.
+pub(crate) fn recalc_block(
+    shell: &Shell,
+    pubkey: &str,
+    id: &'static str,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    let Some(state) = shell.community.get(pubkey) else {
+        return div().into_any_element();
+    };
+    let follows = has_follows(shell, pubkey);
+    let enabled = follows && !state.recalc.busy() && !matches!(state.calc, Calc::Busy);
+    let key = pubkey.to_string();
+    let mut column = v_flex()
+        .gap(px(8.))
+        .child(step_button(id, "Recalculate", enabled, cx, move |this, _, cx| {
+            this.community_recalculate(&key, cx)
+        }));
+    if !follows {
+        column = column.child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(TEXT_DIM))
+                .child(brainstorm::FOLLOW_FIRST),
+        );
+    }
+    let working = |text: String| {
+        h_flex()
+            .gap(px(9.))
+            .items_center()
+            .child(Spinner::new().small().color(rgb(ACCENT).into()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(SharedString::from(text)),
+            )
+            .into_any_element()
+    };
+    let failed = |text: String| {
+        div()
+            .text_size(px(12.5))
+            .text_color(rgb(AMBER))
+            .child(SharedString::from(text))
+            .into_any_element()
+    };
+    let line: Option<AnyElement> = match &state.recalc {
+        Recalc::Idle => None,
+        Recalc::Sending => Some(working(
+            "Sending your follow list to Brainstorm and asking for a recalculation…".into(),
+        )),
+        Recalc::Running(RunState::Waiting { ahead: 0 }) => Some(working(
+            "Waiting in Brainstorm's queue. Yours is next.".into(),
+        )),
+        Recalc::Running(RunState::Waiting { ahead }) => Some(working(format!(
+            "Waiting in Brainstorm's queue: {ahead} {} ahead of yours.",
+            if *ahead == 1 { "run" } else { "runs" }
+        ))),
+        Recalc::Running(RunState::Calculating) => {
+            Some(working("Calculating your scores…".into()))
+        }
+        Recalc::Running(RunState::Publishing) => Some(working(
+            "Publishing your scores so other apps can find them…".into(),
+        )),
+        Recalc::Running(RunState::Done) => Some(
+            h_flex()
+                .gap(px(4.))
+                .items_start()
+                .text_size(px(12.5))
+                .text_color(rgb(0xb7e9d0))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(GREEN))
+                        .font_weight(FontWeight::BOLD)
+                        .child("✓"),
+                )
+                .child("Done. Your scores are recalculated and published.")
+                .into_any_element(),
+        ),
+        Recalc::Running(RunState::Failed(text)) => Some(failed((*text).to_string())),
+        Recalc::Failed(text) => Some(failed(text.clone())),
+    };
+    let finished = state.last_finished.map(|finished| {
+        let text = match finished {
+            Some(at) => format!(
+                "Last run finished {} — {}, {} UTC",
+                timefmt::relative(timefmt::now_unix(), at),
+                timefmt::month_day_year(at),
+                timefmt::hhmmss_utc(at)
+            ),
+            None => "No run has finished yet.".to_string(),
+        };
+        div()
+            .text_size(px(12.))
+            .text_color(rgb(TEXT_DIM))
+            .child(SharedString::from(text))
+            .into_any_element()
+    });
+    column.children(line).children(finished).into_any_element()
+}
+
 /// The three steps and the skip line — the panel body shared by the setup
 /// card and the Trust tab's "Not located" map card.
 pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElement {
     let Some(state) = shell.community.get(pubkey) else {
         return muted("Loading setup steps…", TEXT_MUTED);
     };
-    let followed_now = !state.follows.is_empty();
-    // Step 2 also unlocks when Feature 1's read already counts follows.
-    let has_follows = followed_now
-        || matches!(
-            shell.trust.get(pubkey).map(|t| t.follows.last),
-            Some(Some(Some(n))) if n > 0
-        );
-    let step1_done = followed_now || has_follows;
+    let has_follows = has_follows(shell, pubkey);
+    let step1_done = has_follows;
 
     // ------------------------------------------------------------ step 1
 
@@ -1233,6 +1419,9 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 }
                 column.into_any_element()
             }))
+            .when(!state.follows.is_empty(), |this| {
+                this.child(recalc_block(shell, pubkey, "community-recalc", cx))
+            })
             .children(confirm_box)
             .children(state.follow_error.as_ref().map(|error| {
                 div()
@@ -1442,36 +1631,23 @@ fn calc_button(
     cx: &mut Context<Shell>,
     on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
 ) -> Stateful<Div> {
-    let button = div()
-        .id(id)
-        .self_start()
-        .px(px(16.))
-        .py(px(9.))
-        .rounded(px(9.))
-        .bg(if enabled {
-            grad(ACCENT, ACCENT_DEEP)
-        } else {
-            rgb(BG_NAV_ON).into()
-        })
-        .text_size(px(12.5))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(if enabled {
-            rgb(BG_RAIL)
-        } else {
-            rgb(TEXT_MUTED)
-        });
-    if enabled {
-        button
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
-    } else {
-        button.cursor_not_allowed()
-    }
-    .child("Calculate my trust scores")
+    step_button(id, "Calculate my trust scores", enabled, cx, on_click)
 }
 
 fn map_button(
     id: &'static str,
+    enabled: bool,
+    cx: &mut Context<Shell>,
+    on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+) -> Stateful<Div> {
+    step_button(id, "Publish my Treasure Map", enabled, cx, on_click)
+}
+
+/// A step's action button: the gradient when enabled, a dim slab with no
+/// click handler when not.
+fn step_button(
+    id: &'static str,
+    label: &'static str,
     enabled: bool,
     cx: &mut Context<Shell>,
     on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
@@ -1501,7 +1677,7 @@ fn map_button(
     } else {
         button.cursor_not_allowed()
     }
-    .child("Publish my Treasure Map")
+    .child(label)
 }
 
 /// The "Try again" link under a not-yet-ready setup answer — a `CheckSetup`

@@ -20,7 +20,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::api::{Api, ApiError, Bounty, BountyDetail, CreateBounty};
-use crate::brainstorm::{self, SearchHit};
+use crate::brainstorm::{self, RunState, SearchHit};
 use crate::coinos;
 use crate::events::{self, EventError};
 use crate::secrets::{self, Secret, SecretError};
@@ -71,6 +71,21 @@ pub fn relay_url() -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| INSTANCE_RELAY.to_string())
+}
+
+/// How often a running recalculation is polled: 15 s, or
+/// `MC_RECALC_POLL_SECS` (whole seconds, at least 1) so a scripted test need
+/// not wait out the real interval.
+fn recalc_poll() -> Duration {
+    Duration::from_secs(poll_secs_from(
+        std::env::var("MC_RECALC_POLL_SECS").ok().as_deref(),
+    ))
+}
+
+fn poll_secs_from(env: Option<&str>) -> u64 {
+    env.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs >= 1)
+        .unwrap_or(15)
 }
 
 /// `MC_TRUST_RELAYS`, comma-separated: trims each entry, skips empties,
@@ -237,6 +252,17 @@ pub enum Command {
     /// ingest, graperank, then one setup probe. Rate-limited — never re-sent
     /// for a reason. Emits `Community` with `CommunityPart::Calculated`.
     CalculateTrust { pubkey: String, generation: u32 },
+    /// The Recalculate button: login, `followList` only when the list
+    /// changed since Brainstorm last accepted one, `graperank` once (never
+    /// retried), then a `graperankResult` poll until the run is done or
+    /// failed, then `/user/history`. Emits `Community` with
+    /// `CommunityPart::Recalc` per state and `LastFinished` at the end.
+    Recalculate { pubkey: String, generation: u32 },
+    /// When the account's last run finished (`/user/history`). Asked only
+    /// for an account this app has already sent a follow list for, so
+    /// opening a page never logs anyone in to Brainstorm unasked. Emits
+    /// `Community` with `CommunityPart::LastFinished`.
+    FetchRunHistory { pubkey: String, generation: u32 },
     /// A `/setup` read ONLY — no login, nothing rate-limited. The "Try
     /// again" control. Emits `Community` with `CommunityPart::SetupChecked`.
     CheckSetup { pubkey: String, generation: u32 },
@@ -464,6 +490,12 @@ pub enum CommunityPart {
     Calculated(Result<SetupState, String>),
     /// A `CheckSetup` reply.
     SetupChecked(SetupState),
+    /// A `Recalculate` step: `Ok` is the run's state as the poll last read
+    /// it; `Err` is fixed wording for a run that never started (or a poll
+    /// that gave up). Nothing is retried after an `Err`.
+    Recalc(Result<RunState, String>),
+    /// When the last run finished, unix seconds; `None` when none has.
+    LastFinished(Option<u64>),
     /// A `PublishMap` outcome.
     MapPublished(Result<PublishOk, String>),
 }
@@ -640,11 +672,9 @@ struct Session {
     brainstorm: Option<Secret>,
     /// The newest kind-3 this session signed or read — the followList
     /// ingest input, so the calculate step does not re-read the relays.
+    /// The id Brainstorm last accepted lives in the account store
+    /// (`secrets::follow_list_sent`), so a restart never re-sends it.
     contact_list: Option<Event>,
-    /// Kind-3 event ids followList already accepted. The POST is
-    /// rate-limited (3 shared requests per 30 min), so an id once accepted
-    /// is never sent again.
-    follow_list_sent: HashSet<String>,
     /// A graperank run was accepted for this account this session — the
     /// gate `PublishMap` checks, since a new process cannot know.
     graperank_ok: bool,
@@ -926,6 +956,16 @@ async fn run(
                 let updates = updates.clone();
                 tokio::spawn(calculate_trust(sessions, pubkey, generation, updates));
             }
+            Command::Recalculate { pubkey, generation } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(recalculate(sessions, pubkey, generation, updates));
+            }
+            Command::FetchRunHistory { pubkey, generation } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(fetch_run_history(sessions, pubkey, generation, updates));
+            }
             Command::CheckSetup { pubkey, generation } => {
                 let updates = updates.clone();
                 tokio::spawn(check_setup(pubkey, generation, updates));
@@ -964,7 +1004,6 @@ async fn session(
         logged_in: false,
         brainstorm: None,
         contact_list: None,
-        follow_list_sent: HashSet::new(),
         graperank_ok: false,
     }));
     map.insert(pubkey.to_string(), session.clone());
@@ -2465,9 +2504,78 @@ async fn brainstorm_token(
     Ok(token)
 }
 
+/// The account's kind-3 to ingest: the one this session published or
+/// read, else a fresh majority-rule read. `None` when there is none.
+async fn current_contact_list(session: &Arc<TokioMutex<Session>>, pubkey: &str) -> Option<Event> {
+    if let Some(event) = session.lock().await.contact_list.clone() {
+        return Some(event);
+    }
+    let (client, urls) = community_client(pubkey).await;
+    let read = read_contacts(&client, pubkey, &urls).await;
+    client.disconnect().await;
+    match read {
+        trust::ContactRead::Found(event) => Some(event),
+        _ => None,
+    }
+}
+
+const LOGIN_REFUSED: &str = "Brainstorm refused the login. Try again, or visit brainstorm.world.";
+
+/// What Calculate and Recalculate share: login, POST the kind-3 unless it
+/// is the list Brainstorm last accepted (remembered in the account store),
+/// then POST graperank once. A 401 mints one fresh token and retries that
+/// one call; a 403 or 429 is never retried. `Ok` is the token that worked,
+/// for the caller's reads.
+async fn request_run(
+    session: &Arc<TokioMutex<Session>>,
+    pubkey: &str,
+    event: &Event,
+) -> Result<Secret, String> {
+    let mut token = brainstorm_token(session, false).await?;
+    let event_id = event.id.to_hex();
+    // A store that cannot be read counts as "never sent": one extra POST
+    // beats a recalculation that never sees the new follow.
+    let sent = secrets::follow_list_sent(pubkey).ok().flatten();
+    if sent.as_deref() != Some(event_id.as_str()) {
+        let outcome = match brainstorm::post_follow_list(&token, event).await {
+            // A token too old to be valid: mint once, retry once.
+            Err(brainstorm::Fail::Unauthorized) => {
+                token = brainstorm_token(session, true).await?;
+                brainstorm::post_follow_list(&token, event).await
+            }
+            other => other,
+        };
+        match outcome {
+            Ok(()) => {
+                // Accepted is accepted: a failed write only costs one
+                // re-send later.
+                let _ = secrets::store_follow_list_sent(pubkey, &event_id);
+            }
+            Err(brainstorm::Fail::Unauthorized) => return Err(LOGIN_REFUSED.into()),
+            Err(brainstorm::Fail::Text(message)) => return Err(message.into()),
+        }
+    }
+
+    let outcome = match brainstorm::post_graperank(&token).await {
+        Err(brainstorm::Fail::Unauthorized) => {
+            token = brainstorm_token(session, true).await?;
+            brainstorm::post_graperank(&token).await
+        }
+        other => other,
+    };
+    match outcome {
+        Ok(()) => {
+            session.lock().await.graperank_ok = true;
+            Ok(token)
+        }
+        Err(brainstorm::Fail::Unauthorized) => Err(LOGIN_REFUSED.into()),
+        Err(brainstorm::Fail::Text(message)) => Err(message.into()),
+    }
+}
+
 /// `Command::CalculateTrust`: the Brainstorm equivalent of the mock's "one
-/// click" — login, POST the kind-3 (once per event id), POST graperank
-/// (once per session), then a single `/setup` probe.
+/// click" — login, POST the kind-3 (once per event id), POST graperank,
+/// then a single `/setup` probe.
 async fn calculate_trust(
     sessions: SharedSessions,
     pubkey: String,
@@ -2487,75 +2595,14 @@ async fn calculate_trust(
     };
     let hex = session.lock().await.keys.public_key().to_hex();
 
-    // The list to ingest: the one this session published or read, else a
-    // fresh majority-rule read. There is nothing to calculate without one.
-    let event = match session.lock().await.contact_list.clone() {
-        Some(event) => Some(event),
-        None => {
-            let (client, urls) = community_client(&pubkey).await;
-            let read = read_contacts(&client, &pubkey, &urls).await;
-            client.disconnect().await;
-            match read {
-                trust::ContactRead::Found(event) => Some(event),
-                _ => None,
-            }
-        }
-    };
-    let Some(event) = event else {
+    // There is nothing to calculate without a list.
+    let Some(event) = current_contact_list(&session, &pubkey).await else {
         return send(Err(
             "Follow at least one account first, then try again.".into()
         ));
     };
-
-    let mut token = match brainstorm_token(&session, false).await {
-        Ok(token) => token,
-        Err(message) => return send(Err(message)),
-    };
-    let event_id = event.id.to_hex();
-    if !session.lock().await.follow_list_sent.contains(&event_id) {
-        let outcome = match brainstorm::post_follow_list(&token, &event).await {
-            // A token too old to be valid: mint once, retry once.
-            Err(brainstorm::Fail::Unauthorized) => {
-                match brainstorm_token(&session, true).await {
-                    Ok(fresh) => {
-                        token = fresh;
-                        brainstorm::post_follow_list(&token, &event).await
-                    }
-                    Err(message) => return send(Err(message)),
-                }
-            }
-            other => other,
-        };
-        match outcome {
-            Ok(()) => {
-                session.lock().await.follow_list_sent.insert(event_id);
-            }
-            Err(brainstorm::Fail::Unauthorized) => {
-                return send(Err(
-                    "Brainstorm refused the login. Try again, or visit brainstorm.world.".into(),
-                ));
-            }
-            Err(brainstorm::Fail::Text(message)) => return send(Err(message.into())),
-        }
-    }
-
-    let outcome = match brainstorm::post_graperank(&token).await {
-        Err(brainstorm::Fail::Unauthorized) => match brainstorm_token(&session, true).await {
-            Ok(fresh) => brainstorm::post_graperank(&fresh).await,
-            Err(message) => return send(Err(message)),
-        },
-        other => other,
-    };
-    match outcome {
-        Ok(()) => {
-            session.lock().await.graperank_ok = true;
-        }
-        Err(brainstorm::Fail::Unauthorized) => {
-            return send(Err(
-                "Brainstorm refused the login. Try again, or visit brainstorm.world.".into(),
-            ));
-        }
-        Err(brainstorm::Fail::Text(message)) => return send(Err(message.into())),
+    if let Err(message) = request_run(&session, &pubkey, &event).await {
+        return send(Err(message));
     }
 
     // The calculation is queued — the setup answer may still take a while.
@@ -2564,6 +2611,114 @@ async fn calculate_trust(
         Ok(None) => SetupState::Missing,
         Err(_) => SetupState::Unreadable,
     }));
+}
+
+/// How long a run is polled before the button gives up waiting: a queue
+/// that long means the run is better checked later than watched.
+const RECALC_PATIENCE: Duration = Duration::from_secs(4 * 3_600);
+
+/// `Command::Recalculate`: [`request_run`], then the `graperankResult` poll
+/// every [`recalc_poll`] until done or failed, then `/user/history`. A
+/// missed read just waits for the next tick; nothing is POSTed again.
+async fn recalculate(
+    sessions: SharedSessions,
+    pubkey: String,
+    generation: u32,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let send = |part: CommunityPart| {
+        let _ = updates.unbounded_send(Update::Community {
+            pubkey: pubkey.clone(),
+            generation,
+            part,
+        });
+    };
+    let session = match session(&sessions, &pubkey).await {
+        Ok(session) => session,
+        Err(e) => return send(CommunityPart::Recalc(Err(e.to_string()))),
+    };
+    // Brainstorm fails a run with no follows (NO_ELIGIBLE_USERS): refuse it
+    // here instead of spending the rate limit on it.
+    let event = current_contact_list(&session, &pubkey)
+        .await
+        .filter(|event| trust::follow_count(event, &pubkey).is_some_and(|n| n > 0));
+    let Some(event) = event else {
+        return send(CommunityPart::Recalc(Err(brainstorm::FOLLOW_FIRST.into())));
+    };
+    let mut token = match request_run(&session, &pubkey, &event).await {
+        Ok(token) => token,
+        Err(message) => return send(CommunityPart::Recalc(Err(message))),
+    };
+
+    let started = tokio::time::Instant::now();
+    let interval = recalc_poll();
+    let mut first = true;
+    loop {
+        if !first {
+            tokio::time::sleep(interval).await;
+        }
+        first = false;
+        let read = match brainstorm::get_graperank_result(&token).await {
+            Err(brainstorm::Fail::Unauthorized) => match brainstorm_token(&session, true).await {
+                Ok(fresh) => {
+                    token = fresh;
+                    brainstorm::get_graperank_result(&token).await
+                }
+                Err(_) => Err(brainstorm::Fail::Unauthorized),
+            },
+            other => other,
+        };
+        if let Ok(Some(state)) = read {
+            send(CommunityPart::Recalc(Ok(state)));
+            if state.is_final() {
+                break;
+            }
+        }
+        if started.elapsed() >= RECALC_PATIENCE {
+            return send(CommunityPart::Recalc(Err(
+                "Brainstorm is still working on it. Check back later.".into(),
+            )));
+        }
+    }
+    if let Some(finished) = last_finished(&session).await {
+        send(CommunityPart::LastFinished(finished));
+    }
+}
+
+/// `GET /user/history` with the session's token (one re-mint on a 401).
+/// `None` when it could not be read.
+async fn last_finished(session: &Arc<TokioMutex<Session>>) -> Option<Option<u64>> {
+    let token = brainstorm_token(session, false).await.ok()?;
+    match brainstorm::get_history(&token).await {
+        Err(brainstorm::Fail::Unauthorized) => {
+            let fresh = brainstorm_token(session, true).await.ok()?;
+            brainstorm::get_history(&fresh).await.ok()
+        }
+        other => other.ok(),
+    }
+}
+
+/// `Command::FetchRunHistory`: the last finished run, only for an account
+/// that already sent Brainstorm a follow list from this app.
+async fn fetch_run_history(
+    sessions: SharedSessions,
+    pubkey: String,
+    generation: u32,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    if !matches!(secrets::follow_list_sent(&pubkey), Ok(Some(_))) {
+        return;
+    }
+    let Ok(session) = session(&sessions, &pubkey).await else {
+        return;
+    };
+    if let Some(finished) = last_finished(&session).await {
+        let _ = updates.unbounded_send(Update::Community {
+            pubkey,
+            generation,
+            part: CommunityPart::LastFinished(finished),
+        });
+    }
 }
 
 /// `Command::CheckSetup`: the `/setup` read and nothing else. Never a POST —
@@ -3039,6 +3194,15 @@ mod tests {
         assert_eq!(parse_pasted_key("alice"), None);
         assert_eq!(parse_pasted_key("npub1notarealkey"), None);
         assert_eq!(parse_pasted_key(""), None);
+    }
+
+    #[test]
+    fn recalc_poll_defaults_to_15_seconds() {
+        assert_eq!(poll_secs_from(None), 15);
+        assert_eq!(poll_secs_from(Some("")), 15);
+        assert_eq!(poll_secs_from(Some("0")), 15);
+        assert_eq!(poll_secs_from(Some("soon")), 15);
+        assert_eq!(poll_secs_from(Some(" 3 ")), 3);
     }
 
     #[test]

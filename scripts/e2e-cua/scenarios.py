@@ -1013,6 +1013,147 @@ async def scenario_t(sc):
                  pic >= plain * 1.5 and pic >= plain + 6, f"picture={pic} initials={plain}")
 
 
+# ---------------------------------------------------------------- V, W
+RUN_POLL = "20"   # MC_RECALC_POLL_SECS: each run state stays up ~20 s for Jev
+WAITING, CALCULATING = "Waiting in Brainstorm's queue", "Calculating your scores"
+PUBLISHING, DONE_LINE = "Publishing your scores", "Your scores are recalculated and published"
+RECALC_WAIT = "Please wait a few minutes before recalculating"
+FOLLOW_FIRST = "Follow at least one account first so we can calculate"
+RUN_CUES = (WAITING, CALCULATING, PUBLISHING, DONE_LINE, RECALC_WAIT, FOLLOW_FIRST, "Sending your follow list")
+
+
+async def recalculate(sc, label):
+    """One click on the Recalculate pill right under step 1's 'Saved on' line.
+    Never retried: every click is one graperank request (3 per 30 min live)."""
+    try:
+        await sc.suite.driver.act(*FOCUS)
+        await sc.suite.driver.act("click_pill", "Saved on")
+        await sc.suite.driver.act(*PARK)
+    except Exception as e:
+        sc.notes.append(f"{label}: Recalculate click failed ({e})")
+        return False
+    return True
+
+
+async def judge_run(sc, label):
+    """Jev judges each live state of the run in order: waiting (with its queue
+    position), calculating, publishing, done."""
+    wait = Cand("wait-for-poll", "Wait a few seconds for the next progress update.", [("wait", 3)])
+    for name, cond in [
+            ("waiting", f"The Recalculate area says '{WAITING}' and how many runs are ahead."),
+            ("calculating", f"The Recalculate area says '{CALCULATING}'."),
+            ("publishing", f"The Recalculate area says '{PUBLISHING}'."),
+            ("done", f"The Recalculate area says 'Done. {DONE_LINE}.'")]:
+        if not await sc.step(Step(f"Watch the recalculation reach '{name}'.", [wait], cond,
+                                  tries=8, settle=1, cues=RUN_CUES), label=f"{label} {name}"):
+            return False
+    return True
+
+
+def bs_posts(sc, marker, path):
+    return [l for l in sc.log_after(marker) if l.startswith(f"BS POST {path}")]
+
+
+async def scenario_v(sc):
+    """Follow, Recalculate: waiting, calculating, publishing, done, then the
+    finished time from history. A second Recalculate on the unchanged list
+    sends graperank only, no followList."""
+    acct, owner = fresh_key(sc.box), fresh_key(sc.box)
+    sc.box.start_fake({})
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
+    sc.box.launch("V", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"], "MC_RECALC_POLL_SECS": RUN_POLL})
+    if not await open_trust(sc):
+        return
+    if not await follow_owner(sc, expect_confirm=True):
+        return
+    sc.box.mark("V first")
+    if not await recalculate(sc, "first recalculate"):
+        return
+    if not await judge_run(sc, "first run"):
+        return
+    screen = await sc.wait_for(["Last run finished"], timeout=20, every=3, label="history")
+    sc.check_screen("the finished time from history shows", ["Last run finished"], screen=screen)
+    sc.check("the first run sent the new follow list once",
+             len(bs_posts(sc, "V first", "/user/followList")) == 1, bs_posts(sc, "V first", "/user/followList"))
+    sc.check("the first run sent one graperank",
+             len(bs_posts(sc, "V first", "/user/graperank")) == 1, bs_posts(sc, "V first", "/user/graperank"))
+    sc.check("history was read", any(l.startswith("BS GET /user/history") for l in sc.log_after("V first")))
+
+    sc.box.mark("V second")
+    if not await recalculate(sc, "second recalculate"):
+        return
+    await judge_run(sc, "second run")
+    follows, grapes = bs_posts(sc, "V second", "/user/followList"), bs_posts(sc, "V second", "/user/graperank")
+    sc.check("the unchanged follow list was not sent again", not follows, follows)
+    sc.check("the second run sent exactly one graperank", len(grapes) == 1, grapes)
+
+
+async def wait_log(sc, marker, path, timeout=25):
+    """Poll the fake log until a `path` POST shows after `marker`."""
+    end = time.time() + timeout
+    while time.time() < end and not bs_posts(sc, marker, path):
+        await asyncio.sleep(1)
+    return bs_posts(sc, marker, path)
+
+
+async def scenario_w(sc):
+    """graperank 429, then 403, then a run that fails NO_ELIGIBLE_USERS: each
+    shows its wording and spends exactly one graperank. With no follows the
+    button is disabled and a click sends nothing."""
+    acct, owner, other = fresh_key(sc.box), fresh_key(sc.box), fresh_key(sc.box)
+    sc.box.start_fake({"graperank": ["429", "403", "ok"], "run": ["waiting", "fail:NO_ELIGIBLE_USERS"]})
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
+    nak_publish(sc.box, acct["sec"], 3, "", [f"p={other['pub']}"])
+    await asyncio.sleep(1)
+    sc.box.launch("W", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"], "MC_RECALC_POLL_SECS": "5"})
+    if not await open_trust(sc):
+        return
+    if not await follow_owner(sc, expect_confirm=False):
+        return
+    for marker, want in [("W 429", RECALC_WAIT), ("W 403", RECALC_WAIT), ("W fail", FOLLOW_FIRST)]:
+        sc.box.mark(marker)
+        if not await recalculate(sc, marker):
+            return
+        await wait_log(sc, marker, "/user/graperank")
+        screen = await sc.wait_for([want], timeout=40, every=3, label=marker)
+        sc.check_screen(f"{marker}: its wording shows", [want], [DONE_LINE], screen=screen)
+        grapes = bs_posts(sc, marker, "/user/graperank")
+        sc.check(f"{marker}: exactly one graperank", len(grapes) == 1, grapes)
+    sc.check("the failed run was polled",
+             any(l.startswith("BS GET graperankResult -> fail") for l in sc.log_after("W fail")))
+    await asyncio.sleep(6)
+    grapes = bs_posts(sc, "W 429", "/user/graperank")
+    sc.check("nothing retried: three graperank requests in all", len(grapes) == 3, grapes)
+    sc.check("followList posted at most once", len(bs_posts(sc, "W 429", "/user/followList")) <= 1)
+
+    # A fresh key with no follow list: the Trust tab's button is disabled.
+    bare = fresh_key(sc.box)
+    sc.box.launch("W2", sc.suite.run_id, nsecs=bare["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"], "MC_RECALC_POLL_SECS": "5"})
+    if not await open_trust(sc):
+        return
+    screen = sc.screen
+    for _ in range(8):
+        if has(screen, "Followed someone new"):
+            break
+        await sc.suite.driver.act("scroll", "down")
+        await sc.suite.driver.act(*PARK)
+        screen = await sc.see("scroll to web of trust")
+    sc.check_screen("no follows: the follow-first line shows", ["Followed someone new", FOLLOW_FIRST], screen=screen)
+    sc.box.mark("W disabled")
+    try:
+        await sc.suite.driver.act("click_text", {"text": "Recalculate", "near": FOLLOW_FIRST})
+    except Exception as e:
+        sc.notes.append(f"disabled Recalculate click found no button ({e})")
+    await asyncio.sleep(5)
+    # A window re-activation may re-read /setup; only the run's calls count.
+    sent = [l for l in sc.log_after("W disabled")
+            if l.startswith("BS POST") or "graperankResult" in l or "/user/history" in l]
+    sc.check("the disabled Recalculate sent nothing to Brainstorm", not sent, sent)
+
+
 SCENARIOS = {
     "A": ("submit lock while a create hangs", scenario_a),
     "B": ("502 on create: hint and refetch", scenario_b),
@@ -1029,6 +1170,8 @@ SCENARIOS = {
     "Q": ("trust: /setup 404 keeps publish disabled", scenario_q),
     "U": ("trust: follow a pasted npub the search does not know", scenario_u),
     "T": ("trust: search hit draws its picture, initials without one", scenario_t),
+    "V": ("trust: Recalculate shows each run state and skips an unchanged list", scenario_v),
+    "W": ("trust: Recalculate 429/403/NO_ELIGIBLE_USERS wording, disabled with no follows", scenario_w),
     "S": ("issuer posts a new bounty on an existing list", scenario_s),
     "P": ("paid: real bounty, claim, settle", scenario_p),
     "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),

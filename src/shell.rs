@@ -1647,6 +1647,8 @@ impl Shell {
         }
         // The Trust tab's "Not located" card hosts the community panel.
         self.ensure_community(pubkey, window, cx);
+        // The Trust tab's Recalculate shows when the last run finished.
+        self.community_run_history(pubkey);
         self.account_page = Some(AccountPage::new(pubkey, tab));
         self.go(Screen::Account, window, cx);
     }

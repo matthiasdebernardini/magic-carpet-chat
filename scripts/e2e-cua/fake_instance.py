@@ -6,7 +6,12 @@ The mode lives in $E2E_DIR/mode.json and is re-read on every request:
   {"create": ok|hang|502|400|401once|401always, "hang_secs": 45,
    "scan": ok|fail, "dup_coordinate": "<39998:pubkey:dtag or empty>",
    "graperank": "ok"|"429"|"403"|"503"|[answers consumed one per call],
-   "setup": "ok"|"404", "delay_secs": 0}
+   "setup": "ok"|"404", "delay_secs": 0,
+   "run": [steps of a graperank run, one per graperankResult poll]}
+A run step is "waiting", "calculating", "publishing", "done" or "fail:<CODE>"
+(an `error.code` such as NO_ELIGIBLE_USERS). The default run is waiting ->
+calculating -> publishing -> done; the last step repeats. Each accepted
+graperank POST starts the run over.
 Writing the mode file resets the create counter. Every request is appended to
 $E2E_DIR/server.log; the suite reads that log for its request checks.
 
@@ -15,6 +20,8 @@ The same process also serves a fake Brainstorm on 127.0.0.1:$BS_PORT (8788):
   POST /authChallenge/{hex}/verify     -> {"data":{"token":"tok-<uuid>"}} (token never logged)
   POST /user/followList                -> 200, requires Bearer tok-…
   POST /user/graperank                 -> mode "graperank" answer
+  GET  /user/graperankResult           -> the run's next step (data null before any accepted run)
+  GET  /user/history                   -> last_time_calculated_graperank: when a poll last answered done
   GET  /setup/{hex}                    -> mode "setup": six rows like the live body, or 404
   GET  /search/byText                  -> canned data.results profiles filtered by text
   GET  /pic/alice.png                  -> a 64x64 PNG of sixteen flat colours (Alice's picture)"""
@@ -25,7 +32,8 @@ from urllib.parse import urlparse, parse_qs
 DIR = os.environ.get("E2E_DIR", "/tmp/e2e")
 MODE = os.path.join(DIR, "mode.json")
 LOG = os.path.join(DIR, "server.log")
-state = {"mtime": None, "creates": 0, "made": {}, "grape": []}   # made: bounties created here, by id
+state = {"mtime": None, "creates": 0, "made": {}, "grape": [],   # made: bounties created here, by id
+         "polls": None, "finished": None}   # polls: graperankResult reads since the last accepted run
 
 BS_PORT = int(os.environ.get("BS_PORT", "8788"))
 BS_PROVIDER = "c63c30b4e2f7966c3e329149dbdb5d5e0898b5cb4ddf1f97ed5011fe5b91c025"
@@ -35,7 +43,8 @@ BS_CHALLENGES = {}   # hex -> challenge, kept only until verify
 
 def mode():
     m = {"create": "ok", "hang_secs": 45, "scan": "ok", "dup_coordinate": "",
-         "graperank": "ok", "setup": "ok", "delay_secs": 0}
+         "graperank": "ok", "setup": "ok", "delay_secs": 0,
+         "run": ["waiting", "calculating", "publishing", "done"]}
     try:
         st = os.stat(MODE)
         if st.st_mtime != state["mtime"]:
@@ -176,6 +185,29 @@ BS_SEARCH = [
 ]
 
 
+def iso(t):
+    """Naive UTC with microseconds, as the real server's pydantic writes it."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%06d" % int((t % 1) * 1e6)
+
+
+def bs_run(step):
+    """A BrainstormRequestInstance at `step`, the shape /user/graperankResult
+    returns (brainstorm_server app/schemas/schemas.py)."""
+    status, ta, internal, error = {
+        "waiting": ("waiting", "waiting", "waiting", None),
+        "calculating": ("ongoing", "waiting", "waiting", None),
+        "publishing": ("success", "ongoing", "success", None),
+        "done": ("success", "success", "success", None),
+    }.get(step) or ("failure", "waiting", "waiting",
+                    {"code": step.split(":", 1)[-1], "message": None})
+    now = iso(time.time())
+    return {"private_id": 1, "status": status, "ta_status": ta, "internal_publication_status": internal,
+            "count_values": None, "password": "", "algorithm": "graperank", "parameters": "",
+            "how_many_others_with_priority": 2 if step == "waiting" else 0, "pubkey": None,
+            "trigger_source": "manual", "graperank_preset_used": None, "graperank_params": None,
+            "error": error, "created_at": now, "updated_at": now}
+
+
 def bs_setup_rows():
     return [["30382:rank", BS_PROVIDER, BS_RELAY],
             ["30382:followers", BS_PROVIDER, BS_RELAY],
@@ -249,6 +281,31 @@ class B(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
+        if u.path == "/user/graperankResult":
+            if not self.authed():
+                log("BS GET graperankResult auth=False -> 401")
+                return self.send(401, {"error": "unauthorized"})
+            if state["polls"] is None:
+                log("BS GET graperankResult -> none")
+                return self.send(200, {"code": 200, "data": None})
+            steps = m.get("run") or ["done"]
+            step = steps[min(state["polls"], len(steps) - 1)]
+            state["polls"] += 1
+            if step == "done":
+                state["finished"] = time.time()
+            log("BS GET graperankResult -> %s" % step)
+            return self.send(200, {"code": 200, "data": bs_run(step)})
+        if u.path == "/user/history":
+            if not self.authed():
+                log("BS GET /user/history auth=False -> 401")
+                return self.send(401, {"error": "unauthorized"})
+            fin = state["finished"]
+            log("BS GET /user/history -> %s" % ("finished" if fin else "none"))
+            return self.send(200, {"code": 200, "data": {
+                "pubkey": "", "ta_pubkey": BS_PROVIDER,
+                "last_time_calculated_graperank": iso(fin) if fin else None,
+                "last_time_triggered_graperank": None,
+                "created_at": iso(time.time()), "updated_at": iso(time.time())}})
         if u.path == "/search/byText":
             text = (q.get("text") or q.get("q") or [""])[0].lower()
             hits = [p for p in BS_SEARCH if text in p["name"] or text in p["display_name"].lower()]
@@ -289,6 +346,7 @@ class B(BaseHTTPRequestHandler):
             if not self.authed():
                 return self.send(401, {"error": "unauthorized"})
             if g == "ok":
+                state["polls"] = 0
                 return self.send(200, {"success": True})
             if g == "403":
                 return self.send(403, {"detail": "Last GrapeRank run was too recent"})

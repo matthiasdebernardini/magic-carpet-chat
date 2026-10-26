@@ -952,7 +952,7 @@ fn render_trust(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElem
         .child(assertions_card(shell, pubkey, state, now, cx))
         .child(min_rank_card())
         .child(determination_card(shell, pubkey))
-        .child(web_of_trust_card(pubkey, state, cx))
+        .child(web_of_trust_card(shell, pubkey, state, cx))
         .into_any_element()
 }
 
@@ -1656,7 +1656,12 @@ fn determination_card(shell: &Shell, pubkey: &str) -> AnyElement {
 
 /// Card 5: following count and verified followers, each honest about which
 /// read produced it.
-fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) -> AnyElement {
+fn web_of_trust_card(
+    shell: &Shell,
+    pubkey: &str,
+    state: &TrustState,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
     let (following, following_note) = match &state.follows.last {
         Some(Some(n)) => (n.to_string(), None),
         Some(None) => ("—".to_string(), Some("no follow list found")),
@@ -1713,6 +1718,18 @@ fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) 
                     "Verified followers as counted by {}.",
                     issuer_short_npub()
                 )),
+        )
+        .child(
+            div()
+                .mt(px(14.))
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT_MUTED))
+                .child("Followed someone new? Ask Brainstorm to score your web of trust again from your follow list."),
+        )
+        .child(
+            div()
+                .mt(px(10.))
+                .child(community::recalc_block(shell, pubkey, "trust-recalc", cx)),
         )
         .child(open_link(
             "wot-brainstorm",

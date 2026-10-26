@@ -97,6 +97,11 @@ pub struct StoredAccount {
     pub created_in_app: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coinos: Option<coinos::Login>,
+    /// The id of the last kind-3 Brainstorm's `followList` accepted. That
+    /// POST is rate-limited, so an unchanged list is never sent again, not
+    /// even after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_list_sent: Option<String>,
 }
 
 impl StoredAccount {
@@ -222,6 +227,7 @@ pub fn add_account(nsec: &Secret, generated: bool) -> Result<AccountRecord, Secr
                 nsec,
                 created_in_app: generated,
                 coinos: None,
+                follow_list_sent: None,
             });
         }
         store.active = Some(pubkey.clone());
@@ -283,6 +289,30 @@ pub fn forget_coinos_login(pubkey: &str) -> Result<(), SecretError> {
         }
         Ok(())
     })
+}
+
+/// Remember `event_id` as the follow list Brainstorm last accepted for
+/// `pubkey`.
+pub fn store_follow_list_sent(pubkey: &str, event_id: &str) -> Result<(), SecretError> {
+    modify(|store| {
+        let account = store
+            .accounts
+            .iter_mut()
+            .find(|a| a.pubkey == pubkey)
+            .ok_or_else(|| missing(pubkey))?;
+        account.follow_list_sent = Some(event_id.to_string());
+        Ok(())
+    })
+}
+
+/// The id of the follow list Brainstorm last accepted for `pubkey`; `None`
+/// when none was ever sent (or no such account).
+pub fn follow_list_sent(pubkey: &str) -> Result<Option<String>, SecretError> {
+    Ok(load()?
+        .accounts
+        .into_iter()
+        .find(|a| a.pubkey == pubkey)
+        .and_then(|a| a.follow_list_sent))
 }
 
 /// Validate a user-pasted secret: `nsec1…` bech32 or 64 hex characters.
@@ -476,6 +506,28 @@ mod tests {
         let stored = nsec(&record.pubkey).unwrap().unwrap();
         assert_eq!(stored.expose(), keys.secret_key().to_bech32().unwrap());
         assert!(nsec(&"cc".repeat(32)).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sent_follow_list_id_survives_a_reload() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-follow-sent-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+
+        let keys = Keys::generate();
+        let record = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true).unwrap();
+        assert_eq!(follow_list_sent(&record.pubkey).unwrap(), None);
+        store_follow_list_sent(&record.pubkey, "e1").unwrap();
+        store_follow_list_sent(&record.pubkey, "e2").unwrap();
+        assert_eq!(follow_list_sent(&record.pubkey).unwrap().as_deref(), Some("e2"));
+        assert!(store_follow_list_sent(&"cc".repeat(32), "e3").is_err());
+        assert_eq!(follow_list_sent(&"cc".repeat(32)).unwrap(), None);
+        let mode = std::fs::metadata(store_path().unwrap()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "store file mode");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,6 +1,7 @@
 //! The Brainstorm API (api.brainstorm.world): the challenge login, the
-//! follow-list ingest, the graperank trigger, the `/setup` rows a Treasure
-//! Map is built from, and the profile search the follow step uses.
+//! follow-list ingest, the graperank trigger and its run's progress and
+//! history, the `/setup` rows a Treasure Map is built from, and the profile
+//! search the follow step uses.
 //!
 //! The pure half (parsers, error wording, the login event template) is
 //! unit-tested here; the async half is only ever awaited on the tokio
@@ -111,6 +112,155 @@ pub fn error_text(status: u16, body: &str) -> &'static str {
     } else {
         "Something went wrong. Please wait a moment and try again."
     }
+}
+
+/// The line shown while the account follows no one — Brainstorm's own copy,
+/// and the wording for a run that failed with `NO_ELIGIBLE_USERS`.
+pub const FOLLOW_FIRST: &str = "Follow at least one account first so we can calculate your scores.";
+
+/// Where a recalculation run stands, read from `GET /user/graperankResult`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    /// Queued; `ahead` is how many runs Brainstorm will do first.
+    Waiting { ahead: u64 },
+    /// The scores are being calculated.
+    Calculating,
+    /// Calculated; the scores are being published.
+    Publishing,
+    /// Both publications succeeded.
+    Done,
+    /// The run failed; fixed wording from [`run_error_text`].
+    Failed(&'static str),
+}
+
+impl RunState {
+    /// Done or failed: nothing more will change, so polling stops.
+    pub fn is_final(self) -> bool {
+        matches!(self, RunState::Done | RunState::Failed(_))
+    }
+}
+
+/// A failed run's `error.code` in plain words. Fixed strings — the server's
+/// message never reaches the screen.
+pub fn run_error_text(code: Option<&str>) -> &'static str {
+    match code {
+        Some("NO_ELIGIBLE_USERS") => FOLLOW_FIRST,
+        Some("NEO4J_ERROR" | "RESULT_PAYLOAD_LOST") => {
+            "Brainstorm had a problem on its side. Please wait a few minutes and try again."
+        }
+        _ => "Brainstorm couldn't calculate your scores. Please wait a few minutes and try again.",
+    }
+}
+
+/// A `/user/graperankResult` body. `Some(None)` when the account has never
+/// had a run (`data` is null); `None` when the body is not the envelope or
+/// carries a status this client does not know.
+///
+/// Failed is `status` = `failure` (or a failed publication, which would
+/// otherwise never finish); done is `ta_status` and
+/// `internal_publication_status` both `success`.
+pub fn parse_run(body: &str) -> Option<Option<RunState>> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let data = value.get("data")?;
+    if data.is_null() {
+        return Some(None);
+    }
+    let status = field(data, "status")?;
+    let ta = field(data, "ta_status");
+    let internal = field(data, "internal_publication_status");
+    let code = data.get("error").and_then(|error| field(error, "code"));
+    let state = if status == "failure" || ta == Some("failure") || internal == Some("failure") {
+        RunState::Failed(run_error_text(code))
+    } else if ta == Some("success") && internal == Some("success") {
+        RunState::Done
+    } else {
+        match status {
+            "waiting" => RunState::Waiting {
+                ahead: data
+                    .get("how_many_others_with_priority")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            },
+            "ongoing" => RunState::Calculating,
+            "success" => RunState::Publishing,
+            _ => return None,
+        }
+    };
+    Some(Some(state))
+}
+
+/// A `/user/history` body: `data.last_time_calculated_graperank` as unix
+/// seconds. `Some(None)` when no run has finished yet; `None` for a body
+/// that is not the envelope or a time that does not parse.
+pub fn parse_history(body: &str) -> Option<Option<u64>> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let data = value.get("data")?.as_object()?;
+    match data.get("last_time_calculated_graperank") {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(time) => iso_utc(time.as_str()?).map(Some),
+    }
+}
+
+/// `2026-10-09T12:34:56[.ffffff][Z|±HH:MM]` → unix seconds. No offset means
+/// UTC: the server stores naive UTC times.
+fn iso_utc(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| num_of(text.get(range)?);
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut rest = &text[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        rest = &fraction[digits..];
+    }
+    let offset = match rest {
+        "" | "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes()[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let zone = &rest[1..];
+            if zone.len() != 5 || zone.as_bytes()[2] != b':' {
+                return None;
+            }
+            let (h, m) = (num_of(zone.get(0..2)?)?, num_of(zone.get(3..5)?)?);
+            sign * (h * 3_600 + m * 60)
+        }
+    };
+    // Days from civil (Howard Hinnant's algorithm), the inverse of
+    // `timefmt::month_day_year`.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - offset;
+    u64::try_from(seconds).ok()
+}
+
+fn num_of(part: &str) -> Option<i64> {
+    part.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| part.parse().ok())
+        .flatten()
 }
 
 /// The one login template: kind 22242, the challenge in a tag, empty
@@ -231,6 +381,49 @@ pub async fn post_graperank(token: &Secret) -> Result<(), Fail> {
     } else {
         Err(Fail::Text(error_text(status.as_u16(), &body)))
     }
+}
+
+/// `GET {base}/user/graperankResult` — the latest run's state; `Ok(None)`
+/// when the account never had one. Not rate-limited: the poll's read.
+pub async fn get_graperank_result(token: &Secret) -> Result<Option<RunState>, Fail> {
+    let url = format!("{}/user/graperankResult", base());
+    let (status, body) = send(
+        http().map_err(Fail::Text)?
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token.expose()))
+            .header("access_token", token.expose()),
+    )
+    .await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Fail::Unauthorized);
+    }
+    if !status.is_success() {
+        return Err(Fail::Text(error_text(status.as_u16(), &body)));
+    }
+    parse_run(&body).ok_or(Fail::Text(GENERIC))
+}
+
+/// `GET {base}/user/history` — when the last run finished, as unix seconds;
+/// `Ok(None)` when none has (or Brainstorm has no history for the account).
+pub async fn get_history(token: &Secret) -> Result<Option<u64>, Fail> {
+    let url = format!("{}/user/history", base());
+    let (status, body) = send(
+        http().map_err(Fail::Text)?
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token.expose()))
+            .header("access_token", token.expose()),
+    )
+    .await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Fail::Unauthorized);
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(Fail::Text(error_text(status.as_u16(), &body)));
+    }
+    parse_history(&body).ok_or(Fail::Text(GENERIC))
 }
 
 /// `GET {base}/setup/{hex}` (no auth): `Ok(Some(rows))` on 200, `Ok(None)`
@@ -363,6 +556,111 @@ mod tests {
         assert_eq!(error_text(504, ""), down);
         assert_eq!(error_text(500, ""), generic);
         assert_eq!(error_text(400, "bad input"), generic);
+    }
+
+    #[test]
+    fn parse_run_reads_each_state_of_a_run() {
+        let run = |status: &str, ta: &str, internal: &str, extra: &str| {
+            format!(
+                r#"{{"code":200,"data":{{"private_id":7,"status":"{status}","ta_status":{ta},
+                    "internal_publication_status":{internal},"count_values":null,"password":"x",
+                    "algorithm":"graperank","parameters":"aa","how_many_others_with_priority":3,
+                    "pubkey":"aa","created_at":"2026-10-09T12:00:00","updated_at":"2026-10-09T12:00:00"{extra}}}}}"#
+            )
+        };
+        assert_eq!(
+            parse_run(&run("waiting", r#""waiting""#, r#""waiting""#, "")),
+            Some(Some(RunState::Waiting { ahead: 3 }))
+        );
+        assert_eq!(
+            parse_run(&run("ongoing", r#""waiting""#, r#""waiting""#, "")),
+            Some(Some(RunState::Calculating))
+        );
+        assert_eq!(
+            parse_run(&run("success", r#""ongoing""#, r#""success""#, "")),
+            Some(Some(RunState::Publishing))
+        );
+        assert_eq!(
+            parse_run(&run("success", "null", "null", "")),
+            Some(Some(RunState::Publishing))
+        );
+        assert_eq!(
+            parse_run(&run("success", r#""success""#, r#""success""#, "")),
+            Some(Some(RunState::Done))
+        );
+        assert_eq!(
+            parse_run(&run(
+                "failure",
+                r#""waiting""#,
+                r#""waiting""#,
+                r#","error":{"code":"NO_ELIGIBLE_USERS","message":null}"#
+            )),
+            Some(Some(RunState::Failed(FOLLOW_FIRST)))
+        );
+        assert_eq!(
+            parse_run(&run("failure", "null", "null", r#","error":null"#)),
+            Some(Some(RunState::Failed(run_error_text(None))))
+        );
+        assert!(RunState::Done.is_final());
+        assert!(RunState::Failed(FOLLOW_FIRST).is_final());
+        assert!(!RunState::Publishing.is_final());
+        // No run yet, versus a body that is not the envelope.
+        assert_eq!(parse_run(r#"{"code":200,"data":null}"#), Some(None));
+        assert_eq!(parse_run("{}"), None);
+        assert_eq!(parse_run("not json"), None);
+        assert_eq!(parse_run(&run("paused", "null", "null", "")), None);
+    }
+
+    #[test]
+    fn run_error_codes_have_plain_fixed_wording() {
+        assert_eq!(
+            run_error_text(Some("NO_ELIGIBLE_USERS")),
+            "Follow at least one account first so we can calculate your scores."
+        );
+        let theirs = "Brainstorm had a problem on its side. Please wait a few minutes and try again.";
+        assert_eq!(run_error_text(Some("NEO4J_ERROR")), theirs);
+        assert_eq!(run_error_text(Some("RESULT_PAYLOAD_LOST")), theirs);
+        let generic =
+            "Brainstorm couldn't calculate your scores. Please wait a few minutes and try again.";
+        for code in [
+            Some("MALFORMED_PARAMS"),
+            Some("UNKNOWN_RELATIONSHIP"),
+            Some("ALGORITHM_EXCEPTION"),
+            Some("UNKNOWN"),
+            Some("<script>"),
+            None,
+        ] {
+            assert_eq!(run_error_text(code), generic);
+        }
+    }
+
+    #[test]
+    fn parse_history_reads_the_last_finished_time() {
+        let body = |time: &str| {
+            format!(
+                r#"{{"code":200,"data":{{"pubkey":"aa","ta_pubkey":"bb",
+                    "last_time_calculated_graperank":{time},"last_time_triggered_graperank":null,
+                    "created_at":"2026-10-09T12:00:00","updated_at":"2026-10-09T12:00:00"}}}}"#
+            )
+        };
+        // 2026-08-11 00:00:00 UTC is timefmt's own vector.
+        assert_eq!(parse_history(&body(r#""2026-08-11T00:00:00""#)), Some(Some(1_786_406_400)));
+        assert_eq!(
+            parse_history(&body(r#""2026-08-11T00:00:05.123456""#)),
+            Some(Some(1_786_406_405))
+        );
+        assert_eq!(parse_history(&body(r#""2026-08-11T00:00:00Z""#)), Some(Some(1_786_406_400)));
+        assert_eq!(
+            parse_history(&body(r#""2026-08-11T02:00:00+02:00""#)),
+            Some(Some(1_786_406_400))
+        );
+        assert_eq!(parse_history(&body(r#""2020-02-29 00:00:00""#)), Some(Some(1_582_934_400)));
+        assert_eq!(parse_history(&body("null")), Some(None));
+        assert_eq!(parse_history(&body(r#""yesterday""#)), None);
+        assert_eq!(parse_history(&body(r#""2026-13-01T00:00:00""#)), None);
+        assert_eq!(parse_history(&body(r#""2026-08-11T00:00:00+0é:00""#)), None);
+        assert_eq!(parse_history(r#"{"data":null}"#), None);
+        assert_eq!(parse_history("not json"), None);
     }
 
     #[test]
