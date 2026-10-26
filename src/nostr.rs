@@ -401,6 +401,7 @@ pub enum Update {
         pubkey_hex: String,
         npub: String,
         name: Option<String>,
+        picture: Option<String>,
     },
     /// One finished piece of a community flow, dropped by the UI unless its
     /// generation matches the panel's.
@@ -449,11 +450,12 @@ pub enum CommunityPart {
         seq: u64,
         result: Result<Vec<SearchHit>, String>,
     },
-    /// A `FetchProfileName` reply; `name` is `None` when no kind-0 was found.
+    /// A `FetchProfileName` reply; both are `None` when no kind-0 was found.
     ProfileName {
         seq: u64,
         target: String,
         name: Option<String>,
+        picture: Option<String>,
     },
     /// A `Follow` outcome.
     Followed(Result<FollowOk, FollowErr>),
@@ -889,11 +891,16 @@ async fn run(
             } => {
                 let updates = updates.clone();
                 tokio::spawn(async move {
-                    let name = trust_relay_name(&target).await;
+                    let Profile { name, picture, .. } = trust_relay_profile(&target).await;
                     let _ = updates.unbounded_send(Update::Community {
                         pubkey,
                         generation,
-                        part: CommunityPart::ProfileName { seq, target, name },
+                        part: CommunityPart::ProfileName {
+                            seq,
+                            target,
+                            name,
+                            picture,
+                        },
                     });
                 });
             }
@@ -2202,25 +2209,31 @@ async fn fetch_owner(updates: mpsc::UnboundedSender<Update>) {
         .ok()
         .and_then(|pk| pk.to_bech32().ok())
         .unwrap_or_else(|| pubkey_hex.clone());
-    let mut name = None;
+    let mut profile = Profile::default();
     if let Ok(api) = Api::new()
         && let Ok(Some(content)) = fetch_kind0(&api, &pubkey_hex).await
     {
-        name = parse_profile(&content).name;
+        profile = parse_profile(&content);
     }
-    if name.is_none() {
-        name = trust_relay_name(&pubkey_hex).await;
+    if profile.name.is_none() || profile.picture.is_none() {
+        let relay = trust_relay_profile(&pubkey_hex).await;
+        profile.name = profile.name.or(relay.name);
+        profile.picture = profile.picture.or(relay.picture);
     }
     let _ = updates.unbounded_send(Update::Owner {
         pubkey_hex,
         npub,
-        name,
+        name: profile.name,
+        picture: profile.picture,
     });
 }
 
-/// The name in the newest kind-0 the trust relays hold for `pubkey_hex`.
-async fn trust_relay_name(pubkey_hex: &str) -> Option<String> {
-    let public = PublicKey::parse(pubkey_hex).ok()?;
+/// The newest kind-0 the trust relays hold for `pubkey_hex`, as far as it
+/// goes; empty when none answers.
+async fn trust_relay_profile(pubkey_hex: &str) -> Profile {
+    let Ok(public) = PublicKey::parse(pubkey_hex) else {
+        return Profile::default();
+    };
     let urls = trust_relays();
     let client = Client::default();
     for url in &urls {
@@ -2235,7 +2248,8 @@ async fn trust_relay_name(pubkey_hex: &str) -> Option<String> {
         .into_iter()
         .filter(|(_, event)| event.pubkey.to_hex() == pubkey_hex && event.verify().is_ok())
         .max_by_key(|(_, event)| event.created_at)
-        .and_then(|(_, event)| parse_profile(&event.content).name)
+        .map(|(_, event)| parse_profile(&event.content))
+        .unwrap_or_default()
 }
 
 /// What the follow panel's search box holds when it is a key and not a name.

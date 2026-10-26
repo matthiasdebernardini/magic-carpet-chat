@@ -746,8 +746,9 @@ pub struct Shell {
     pub(crate) community: HashMap<String, CommunityState>,
     /// The next generation a community panel gets.
     pub(crate) community_generation: u32,
-    /// The instance owner once `Update::Owner` lands: (hex, npub, name).
-    pub(crate) owner: Option<(String, String, Option<String>)>,
+    /// The instance owner once `Update::Owner` lands: (hex, npub, name,
+    /// picture URL).
+    pub(crate) owner: Option<(String, String, Option<String>, Option<String>)>,
     /// `FetchOwner` goes out once per app run — the answer never expires.
     pub(crate) owner_requested: bool,
     /// The Account page's own state — which account, which tab — while
@@ -1497,8 +1498,9 @@ impl Shell {
                 pubkey_hex,
                 npub,
                 name,
+                picture,
             } => {
-                self.owner = Some((pubkey_hex, npub, name));
+                self.owner = Some((pubkey_hex, npub, name, picture));
             }
             Update::Community {
                 pubkey,

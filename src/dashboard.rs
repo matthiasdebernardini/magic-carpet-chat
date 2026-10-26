@@ -53,6 +53,32 @@ pub fn avatar(
         .child(initials.into())
 }
 
+/// [`avatar`] drawn over a remote picture. gpui fetches the URL through its
+/// own HTTP client and caches it per URL; the initials show while it loads,
+/// on error, and when `picture` is absent or not http(s).
+pub fn remote_avatar(
+    picture: Option<&str>,
+    initials: impl Into<SharedString>,
+    hue: (u32, u32),
+    size: f32,
+    text: f32,
+) -> AnyElement {
+    let initials: SharedString = initials.into();
+    let Some(url) = picture.filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+    else {
+        return avatar(initials, hue, size, text).into_any_element();
+    };
+    let (loading, failed) = (initials.clone(), initials);
+    img(SharedUri::from(url.to_string()))
+        .size(px(size))
+        .flex_shrink_0()
+        .rounded_full()
+        .object_fit(ObjectFit::Cover)
+        .with_loading(move || avatar(loading.clone(), hue, size, text).into_any_element())
+        .with_fallback(move || avatar(failed.clone(), hue, size, text).into_any_element())
+        .into_any_element()
+}
+
 /// A count in a soft accent pill — the badge beside "Needs attention".
 pub fn count_badge(count: impl Into<SharedString>) -> impl IntoElement {
     div()

@@ -11,7 +11,7 @@ account for real, or publish anywhere but the fake server (P and R excepted).
 """
 import asyncio, os, time
 from agent import Step, Cand
-from suite import has
+from suite import has, ocr_phrase_pos
 
 FOCUS = ("focus", "Magic Carpet")
 PARK = ("shell", "xdotool mousemove 20 740")   # hover tooltips hide the header
@@ -958,6 +958,61 @@ async def scenario_u(sc):
                  f"{len(k3[0].get('tags', []))} tags")
 
 
+# ---------------------------------------------------------------- T
+def avatar_colours(data, phrase):
+    """Distinct colours (4 bits per channel, at least 3 pixels each) in the
+    round avatar left of `phrase`'s row: the saturated blob found in a window
+    just left of the label, shrunk by 3 px. None when nothing is found."""
+    import io
+    from collections import Counter
+    from PIL import Image
+    pos = ocr_phrase_pos(data, phrase)
+    if pos is None:
+        return None
+    cx, cy = int(pos[0]), int(pos[1])
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    px = im.load()
+    sat = [(x, y) for y in range(cy - 14, cy + 15) for x in range(cx - 70, cx - 18)
+           if 0 <= x < im.width and 0 <= y < im.height and max(px[x, y]) - min(px[x, y]) > 60]
+    if len(sat) < 40:
+        return None
+    x0, x1 = min(x for x, _ in sat) + 3, max(x for x, _ in sat) - 3
+    y0, y1 = min(y for _, y in sat) + 3, max(y for _, y in sat) - 3
+    seen = Counter(tuple(c >> 4 for c in px[x, y]) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1))
+    return sum(1 for n in seen.values() if n >= 3)
+
+
+async def scenario_t(sc):
+    """Search hits draw their kind-0 picture: Alice's (served by the fake) is a
+    sixteen-colour PNG, Bob has none and keeps the initials circle."""
+    acct, owner = fresh_key(sc.box), fresh_key(sc.box)
+    sc.box.start_fake({})
+    publish_owner_profile(sc.box, owner, sc.suite.run_id)
+    sc.box.launch("T", sc.suite.run_id, nsecs=acct["sec"],
+                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
+    if not await open_trust(sc):
+        return
+    sc.box.mark("search")
+    if not await sc.step(Step(
+            "Click the 'Search profiles to follow' box in step 1 and type 'e2e'.",
+            [Cand("search-e2e", "Click the 'Search profiles to follow' input, then type e2e into it.",
+                  [FOCUS, ("click_text", "Search profiles"), ("wait", 0.5),
+                   ("type", "e2e"), ("wait", 2), PARK])],
+            "Result rows 'Alice E2E' and 'Bob E2E', each with a 'Follow' button, show under the search box.",
+            tries=3, settle=4, cues=("Alice E2E", "Bob E2E", "No profiles match", "Searching")),
+            must_act=True, label="search e2e"):
+        return
+    await asyncio.sleep(4)   # the picture loads after the row is drawn
+    data, _ = await sc.snap("avatars")
+    pic, plain = avatar_colours(data, "Alice"), avatar_colours(data, "Bob")
+    sc.check("the fake served Alice's picture", "BS GET /pic/alice.png" in sc.log_after("search"))
+    sc.check("both avatars were found on screen", pic is not None and plain is not None,
+             f"picture={pic} initials={plain}")
+    if pic is not None and plain is not None:
+        sc.check("Alice's avatar has clearly more colours than Bob's initials circle",
+                 pic >= plain * 1.5 and pic >= plain + 6, f"picture={pic} initials={plain}")
+
+
 SCENARIOS = {
     "A": ("submit lock while a create hangs", scenario_a),
     "B": ("502 on create: hint and refetch", scenario_b),
@@ -973,6 +1028,7 @@ SCENARIOS = {
     "O": ("trust: graperank 429/403/503 wording and retries", scenario_o),
     "Q": ("trust: /setup 404 keeps publish disabled", scenario_q),
     "U": ("trust: follow a pasted npub the search does not know", scenario_u),
+    "T": ("trust: search hit draws its picture, initials without one", scenario_t),
     "S": ("issuer posts a new bounty on an existing list", scenario_s),
     "P": ("paid: real bounty, claim, settle", scenario_p),
     "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),

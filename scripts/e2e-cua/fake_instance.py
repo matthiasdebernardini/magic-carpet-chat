@@ -16,8 +16,9 @@ The same process also serves a fake Brainstorm on 127.0.0.1:$BS_PORT (8788):
   POST /user/followList                -> 200, requires Bearer tok-…
   POST /user/graperank                 -> mode "graperank" answer
   GET  /setup/{hex}                    -> mode "setup": six rows like the live body, or 404
-  GET  /search/byText                  -> canned data.results profiles filtered by text"""
-import json, os, re, threading, time, uuid
+  GET  /search/byText                  -> canned data.results profiles filtered by text
+  GET  /pic/alice.png                  -> a 64x64 PNG of sixteen flat colours (Alice's picture)"""
+import json, os, re, struct, threading, time, uuid, zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -149,9 +150,25 @@ class H(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------- fake Brainstorm
+def colour_png():
+    """A 64x64 PNG, a 4x4 grid of sixteen flat, well-apart colours."""
+    cols = [(r, g, b) for r in (230, 40) for g in (230, 40) for b in (230, 40)]
+    cols += [(230, 140, 20), (140, 20, 230), (20, 230, 140), (230, 20, 140),
+             (20, 140, 230), (140, 230, 20), (120, 120, 120), (250, 250, 20)]
+    rows = b"".join(
+        b"\x00" + b"".join(bytes(cols[(y // 16) * 4 + x // 16]) for x in range(64))
+        for y in range(64))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+BS_PIC = "http://127.0.0.1:%d/pic/alice.png" % BS_PORT
 BS_SEARCH = [
     {"pubkey": "a" * 64, "name": "alice", "display_name": "Alice E2E",
-     "nip05": "alice@e2e.test", "picture": ""},
+     "nip05": "alice@e2e.test", "picture": BS_PIC},
     {"pubkey": "b" * 64, "name": "bob", "display_name": "Bob E2E",
      "nip05": "bob@e2e.test", "picture": ""},
     {"pubkey": "c" * 64, "name": "carol", "display_name": "Carol E2E",
@@ -220,6 +237,18 @@ class B(BaseHTTPRequestHandler):
             if m["setup"] == "404":
                 return self.send(404, {"error": "no setup data"})
             return self.send(200, bs_setup_rows())
+        if u.path == "/pic/alice.png":
+            log("BS GET /pic/alice.png")
+            try:
+                body = colour_png()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if u.path == "/search/byText":
             text = (q.get("text") or q.get("q") or [""])[0].lower()
             hits = [p for p in BS_SEARCH if text in p["name"] or text in p["display_name"].lower()]

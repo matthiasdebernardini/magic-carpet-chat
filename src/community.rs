@@ -10,6 +10,7 @@
 //! [`accepts`] drops a late one. All the network work is the runtime's —
 //! this file only sends Commands and renders Updates.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui_kit::component::{
@@ -29,7 +30,7 @@ use magic_carpet_chat::trust::Designation;
 use nostr_sdk::prelude::ToBech32 as _;
 
 use crate::account_setup::quiet_button;
-use crate::dashboard::{MONO, avatar, muted};
+use crate::dashboard::{MONO, muted, remote_avatar};
 use crate::palette::*;
 use crate::shell::{Shell, short_npub};
 use crate::timefmt;
@@ -79,6 +80,8 @@ pub(crate) struct CommunityState {
     pub debounce: Option<Task<()>>,
     /// Follows made this session, the chips: (hex pubkey, label).
     pub follows: Vec<(String, String)>,
+    /// The picture URL of each followed key that had one, for the chips.
+    pub pictures: HashMap<String, String>,
     /// The follow in flight: (hex, label). `None` means the row is idle.
     pub pending: Option<(String, String)>,
     /// The last follow's failure, fixed text.
@@ -178,7 +181,8 @@ fn hit_label(hit: &SearchHit) -> String {
         })
 }
 
-/// A stable hue per pubkey for the initial-tile avatar (no remote images).
+/// A stable hue per pubkey for the initial-tile avatar, shown while a
+/// picture loads or when there is none.
 fn hit_hue(pubkey: &str) -> (u32, u32) {
     const HUES: [(u32, u32); 5] = [
         (ACCENT, ACCENT_DEEP),
@@ -245,6 +249,7 @@ impl Shell {
                 last_query: String::new(),
                 debounce: None,
                 follows: Vec::new(),
+                pictures: HashMap::new(),
                 pending: None,
                 follow_error: None,
                 confirm_first: None,
@@ -358,6 +363,20 @@ impl Shell {
         if state.pending.is_some() {
             return;
         }
+        let picture = match &state.search_results {
+            Some(Ok(hits)) => hits.iter().find(|hit| hit.pubkey == target),
+            _ => None,
+        }
+        .and_then(|hit| hit.picture.clone())
+        .or_else(|| {
+            self.owner
+                .as_ref()
+                .filter(|(hex, ..)| *hex == target)
+                .and_then(|(_, _, _, picture)| picture.clone())
+        });
+        if let Some(picture) = picture {
+            state.pictures.insert(target.clone(), picture);
+        }
         state.pending = Some((target.clone(), label));
         state.follow_error = None;
         state.confirm_first = None;
@@ -465,7 +484,12 @@ impl Shell {
                 state.searching = false;
                 state.search_results = Some(result);
             }
-            CommunityPart::ProfileName { seq, target, name } => {
+            CommunityPart::ProfileName {
+                seq,
+                target,
+                name,
+                picture,
+            } => {
                 let Some(state) = self.community.get_mut(&pubkey) else {
                     return;
                 };
@@ -476,6 +500,7 @@ impl Shell {
                     && let Some(hit) = hits.iter_mut().find(|hit| hit.pubkey == target)
                 {
                     hit.name = name;
+                    hit.picture = picture;
                 }
             }
             CommunityPart::Followed(result) => {
@@ -791,7 +816,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
         None
     } else {
         let (hex, npub) = match &shell.owner {
-            Some((hex, npub, _)) => (hex.clone(), npub.clone()),
+            Some((hex, npub, ..)) => (hex.clone(), npub.clone()),
             None => {
                 let hex = nostr::issuer_pubkey();
                 let npub = nostr_sdk::prelude::PublicKey::from_hex(&hex)
@@ -804,8 +829,12 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
         let name = shell
             .owner
             .as_ref()
-            .and_then(|(_, _, name)| name.clone())
+            .and_then(|(_, _, name, _)| name.clone())
             .unwrap_or_else(|| "Magic Carpet owner".to_string());
+        let owner_picture = shell
+            .owner
+            .as_ref()
+            .and_then(|(_, _, _, picture)| picture.clone());
         let owner_followed = state.follows.iter().any(|(p, _)| *p == hex);
         let owner_busy = state
             .pending
@@ -824,6 +853,13 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 .rounded(px(9.))
                 .px(px(12.))
                 .py(px(8.))
+                .child(remote_avatar(
+                    owner_picture.as_deref(),
+                    name.chars().next().unwrap_or('?').to_uppercase().to_string(),
+                    hit_hue(&hex),
+                    20.,
+                    8.5,
+                ))
                 .child(
                     v_flex()
                         .flex_1()
@@ -935,7 +971,8 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                         .rounded(px(9.))
                         .px(px(12.))
                         .py(px(7.))
-                        .child(avatar(
+                        .child(remote_avatar(
+                            hit.picture.as_deref(),
                             label.chars().next().unwrap_or('?').to_uppercase().to_string(),
                             hit_hue(&hit.pubkey),
                             20.,
@@ -1010,7 +1047,8 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
     let chips: Vec<AnyElement> = state
         .follows
         .iter()
-        .map(|(_, label)| {
+        .map(|(key, label)| {
+            let picture = state.pictures.get(key).map(String::as_str);
             h_flex()
                 .items_center()
                 .gap(px(6.))
@@ -1024,6 +1062,13 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 .text_size(px(11.5))
                 .font_weight(FontWeight::MEDIUM)
                 .child(div().text_color(rgb(GREEN)).child("✓"))
+                .child(remote_avatar(
+                    picture,
+                    label.chars().next().unwrap_or('?').to_uppercase().to_string(),
+                    hit_hue(key),
+                    16.,
+                    7.5,
+                ))
                 .child(SharedString::from(label.clone()))
                 .into_any_element()
         })
