@@ -2320,8 +2320,9 @@ async fn trust_relay_profile(pubkey_hex: &str) -> Profile {
 pub enum PastedKey {
     /// An `npub1…`, `nostr:npub1…` or `nprofile1…`; the hex pubkey.
     Public(String),
-    /// An `nsec1…` or a bare 64-hex string (which `secrets::parse_secret`
-    /// accepts as a secret) — never searched, echoed or sent.
+    /// Text holding an `nsec1…` or `ncryptsec1…` anywhere, or a bare 64-hex
+    /// string (which `secrets::parse_secret` accepts as a secret) — never
+    /// searched, echoed or sent.
     Private,
 }
 
@@ -2331,7 +2332,10 @@ pub fn parse_pasted_key(input: &str) -> Option<PastedKey> {
     let lower = input.trim().to_ascii_lowercase();
     let text = lower.strip_prefix("nostr:").unwrap_or(&lower);
     let is_hex = text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit());
-    if text.starts_with("nsec1") || is_hex {
+    // Anywhere in the text, not just a prefix: a line pasted from notes
+    // ("backup nsec1…") would otherwise go to Brainstorm search in a URL.
+    // ncryptsec1 is a password-encrypted nsec (NIP-49).
+    if lower.contains("nsec1") || lower.contains("ncryptsec1") || is_hex {
         return Some(PastedKey::Private);
     }
     let public = if text.starts_with("npub1") {
@@ -3257,6 +3261,14 @@ mod tests {
         assert_eq!(parse_pasted_key(&hex), Some(PastedKey::Private));
         assert_eq!(
             parse_pasted_key(&keys.secret_key().to_secret_hex().to_ascii_uppercase()),
+            Some(PastedKey::Private)
+        );
+        assert_eq!(
+            parse_pasted_key(&format!("backup {nsec} (phone)")),
+            Some(PastedKey::Private)
+        );
+        assert_eq!(
+            parse_pasted_key("ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p"),
             Some(PastedKey::Private)
         );
         assert_eq!(parse_pasted_key("alice"), None);
