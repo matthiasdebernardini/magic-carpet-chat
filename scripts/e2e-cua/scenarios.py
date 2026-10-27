@@ -11,7 +11,7 @@ account for real, or publish anywhere but the fake server (P and R excepted).
 """
 import asyncio, os, time
 from agent import Step, Cand
-from suite import accent_pills, has, ocr_phrase_all, ocr_phrase_pos
+from suite import accent_pills, fine_lines, has, norm, ocr_phrase_all, ocr_phrase_pos, shot_bytes
 
 FOCUS = ("focus", "Magic Carpet")
 PARK = ("shell", "xdotool mousemove 20 740")   # hover tooltips hide the header
@@ -606,27 +606,37 @@ def publish_owner_profile(box, owner, run_id):
         {"name": f"E2E Owner {run_id[-4:]}", "display_name": f"E2E Owner {run_id[-4:]}"}))
 
 
+# The sidebar chip opens the active account's page on its Trust tab
+# (shell.rs, `open_account(.., Tab::Trust)`), so the chip click is the whole
+# action. A second OCR click on the tab used to follow it and raised whenever
+# the 1.5 s wait ended before the software-rendered page had repainted.
+TRUST_STEPS = ("Good news: you can do the three needed steps right here",
+               "Follow at least one well-known account",
+               "Ask Brainstorm to calculate your community's trust scores",
+               "Publish your Treasure Map")
 TRUST_TAB = Step(
-    "Open the active account's page and select its 'Trust' tab. If a Dashboard shows, click the account name at the top of the left sidebar first.",
-    [Cand("chip-then-trust", "Click the account name at the top of the left sidebar, then click the 'Trust' tab beside 'Identity & keys'.",
-          [FOCUS, ("click", CHIP_XY), ("wait", 1.5), PARK,
-           ("click_text", {"text": "Trust", "near": "Identity"}), ("wait", 1), PARK]),
-     Cand("avatar-then-trust", "Click the first avatar in the left rail, then the account name at the top of the sidebar, then the 'Trust' tab.",
-          [FOCUS, ("avatar", "house"), ("wait", 1.5), PARK,
-           ("click", CHIP_XY), ("wait", 1.5), PARK,
-           ("click_text", {"text": "Trust", "near": "Identity"}), ("wait", 1), PARK])],
-    "The account page's 'Trust' tab is selected and shows the 'Your Trusted Community' steps: 'Follow at least one well-known account', 'Ask Brainstorm to calculate', 'Publish your Treasure Map'.",
-    tries=4, settle=3,
-    cues=("Follow at least one well-known account", "Calculate my trust scores",
-          "Publish my Treasure Map", "Located", "Your Trusted Community"))
+    "Open the active account's page on its 'Trust' tab.",
+    [Cand("chip-opens-trust", "Click the account name at the top of the left sidebar; it opens the account page on its 'Trust' tab.",
+          [FOCUS, ("click", CHIP_XY), ("wait", 2), PARK]),
+     Cand("trust-tab", "The account page is already open on another tab: click its 'Trust' tab, beside 'Identity & keys'.",
+          [FOCUS, ("click_text", {"text": "Trust", "near": "Identity & keys"}), ("wait", 1), PARK])],
+    # The Trust tab has no "Your Trusted Community" heading (that is the
+    # setup screen's step 3); naming it sank the judge to p~0.53 every time.
+    "The account page is open with its tab strip 'Identity & keys, Trust, Progress, Wallet, Limits & defaults', "
+    "a 'Treasure Map' card, the line 'Good news: you can do the three needed steps right here.', and the three "
+    "numbered steps 'Follow at least one well-known account', 'Ask Brainstorm to calculate your community's trust "
+    "scores' and 'Publish your Treasure Map'.",
+    tries=3, settle=3,
+    cues=("Identity & keys", "Treasure Map") + TRUST_STEPS)
 
 
 async def open_trust(sc):
     if await sc.step(TRUST_TAB, label="trust tab"):
         return True
-    # A long warning on the page can sink the judge; the literal steps decide.
-    if sc.check_screen("the Trust tab's steps are on screen", ["Calculate my trust scores", "Publish my Treasure Map"]):
-        sc.accept_step("trust tab", "Calculate my trust scores and Publish my Treasure Map on screen")
+    # The literal tab strip and steps decide when the judge does not.
+    if sc.check_screen("the Trust tab's steps are on screen",
+                       ["Identity & keys", "Calculate my trust scores", "Publish my Treasure Map"] + list(TRUST_STEPS[1:])):
+        sc.accept_step("trust tab", "the tab strip, the three steps and their buttons on screen")
         return True
     return False
 
@@ -634,8 +644,12 @@ async def open_trust(sc):
 async def follow_owner(sc, expect_confirm):
     """Click Follow on the recommended owner row; if the first-list amber box
     shows, approve it. Returns True once '✓ Following' / 'Saved on' shows."""
+    # An account with a kind-3 reads "You already follow N account. Go to
+    # step 2." over the row; without the last sentence the judge's abstain
+    # mass reached 0.32 there and the step halted before any click (W).
     ok = await sc.step(Step(
-        "Click 'Follow' on the recommended row ('RECOMMENDED — YOUR OWNER NPUB') in the 'Your Trusted Community' steps.",
+        "Click 'Follow' on the recommended row ('RECOMMENDED — YOUR OWNER NPUB') in step 1 of the Trust tab. "
+        "The test needs the owner in the follow list, so click it even when step 1 says 'You already follow N account'.",
         [Cand("follow-owner", "Click the 'Follow' button on the recommended owner row.",
               [FOCUS, ("click_pill", "RECOMMENDED"), ("wait", 1), PARK])],
         "After the click, either a confirmation box offers the buttons 'Start a new follow list' and 'Cancel', or the row already reads '✓ Following' or 'Saved on'.",
@@ -912,6 +926,27 @@ async def scenario_s(sc):
 
 
 # ---------------------------------------------------------------- U
+async def find_search_box(sc):
+    """(x, y) of the empty follow-search box, or None. Found once, before
+    anything is typed: the placeholder is the only text that marks it."""
+    data, _ = await sc.snap("search box")
+    box = ocr_phrase_pos(data, "Search profiles")
+    sc.check("the search box is on screen", box is not None)
+    return box
+
+
+def type_into(box, text):
+    """Click the box, select what it holds, type `text`: a retry replaces
+    the earlier attempt's text instead of appending to it."""
+    return [FOCUS, ("click", box), ("wait", 0.5), ("key", "ctrl+a"), ("type", text), ("wait", 2), PARK]
+
+
+def row_has_follow(data, pos):
+    """An accent pill (the Follow button) on the row at `pos`, right of it.
+    OCR cannot read the button's dark-on-violet label."""
+    return any(abs(p[1] - pos[1]) < 14 and p[0] > pos[0] for p in accent_pills(data))
+
+
 async def scenario_u(sc):
     """Fresh account, no kind-3: paste an npub the fake Brainstorm search does
     not know; the one row shows, Follow publishes a kind-3 with its p tag."""
@@ -925,26 +960,31 @@ async def scenario_u(sc):
     short = target["npub"][:12]
     # The box itself shows the pasted npub, so the row is only the match
     # below it: remember where the box is before typing into it.
-    data, _ = await sc.snap("search box")
-    box = ocr_phrase_pos(data, "Search profiles")
-    if not sc.check("the search box is on screen", box is not None):
+    box = await find_search_box(sc)
+    if box is None:
         return
     row_below = box[1] + 12
-    if not await sc.step(Step(
-            "Click the 'Search profiles to follow' box in step 1 and paste the npub.",
-            [Cand("paste-npub", "Click the 'Search profiles to follow' input, then type the npub into it.",
-                  [FOCUS, ("click_text", "Search profiles"), ("wait", 0.5),
-                   ("type", target["npub"]), ("wait", 1.5), PARK])],
-            f"One result row beginning '{short}' with a 'Follow' button shows under the search box.",
-            tries=3, settle=4, cues=(short, "No profiles match", "Searching")),
-            must_act=True, label="paste npub"):
-        return
+    met = await sc.step(Step(
+        "Click the 'Search profiles to follow' box in step 1 and paste the npub.",
+        [Cand("paste-npub", "Click the 'Search profiles to follow' input, then type the npub into it.",
+              type_into(box, target["npub"]))],
+        # The Follow label is dark on violet and never in the OCR: the
+        # condition names only what the judge can read.
+        f"The search box holds an npub, and below it one result row is labelled with the short npub "
+        f"'{short}…' (the start of the same key).",
+        tries=3, settle=4, cues=(short, "No profiles match", "Searching", "private key")),
+        must_act=True, label="paste npub")
     data, _ = await sc.snap("pasted row")
     rows = [p for p in ocr_phrase_all(data, short) if p[1] > row_below]
     sc.check("the result row below the box is labelled by the short npub", rows, f"box y={box[1]:.0f}")
     sc.check_screen("no 'no match' line", [], ["No profiles match"])
     if not rows:
         return
+    # Without its pill, click_pill would fall back to the recommended row's.
+    if not sc.check("the pasted row has a Follow button", row_has_follow(data, rows[0]), f"row y={rows[0][1]:.0f}"):
+        return
+    if not met:
+        sc.accept_step("paste npub", "a row labelled by the short npub, with a Follow button, below the box")
     if not await sc.step(Step(
             f"Click 'Follow' on the result row '{short}' (not the recommended row).",
             [Cand("follow-pasted", "Click the 'Follow' button on the result row of the pasted npub.",
@@ -971,10 +1011,13 @@ async def scenario_u(sc):
 
 
 # ---------------------------------------------------------------- T
-def avatar_colours(data, phrase):
-    """Distinct colours (4 bits per channel, at least 3 pixels each) in the
-    round avatar left of `phrase`'s row: the saturated blob found in a window
-    just left of the label, shrunk by 3 px. None when nothing is found."""
+def avatar_spread(data, phrase):
+    """How much of the round avatar left of `phrase`'s row the three
+    commonest colours cover (2 bits per channel), from 0 to 1. An initials
+    circle is one gradient fill and a letter (about 0.8 measured); the fake's
+    sixteen-colour picture spreads over many (about 0.4). The avatar is the
+    saturated blob in a window just left of the label, shrunk by 3 px. None
+    when nothing is found."""
     import io
     from collections import Counter
     from PIL import Image
@@ -990,8 +1033,9 @@ def avatar_colours(data, phrase):
         return None
     x0, x1 = min(x for x, _ in sat) + 3, max(x for x, _ in sat) - 3
     y0, y1 = min(y for _, y in sat) + 3, max(y for _, y in sat) - 3
-    seen = Counter(tuple(c >> 4 for c in px[x, y]) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1))
-    return sum(1 for n in seen.values() if n >= 3)
+    seen = Counter(tuple(c >> 6 for c in px[x, y]) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1))
+    total = sum(seen.values())
+    return round(sum(n for _, n in seen.most_common(3)) / total, 2) if total else None
 
 
 async def scenario_t(sc):
@@ -1004,34 +1048,44 @@ async def scenario_t(sc):
                   extra_env={"MC_ISSUER_NPUB": owner["npub"]})
     if not await open_trust(sc):
         return
-    sc.box.mark("search")
-    if not await sc.step(Step(
-            "Click the 'Search profiles to follow' box in step 1 and type 'e2e'.",
-            [Cand("search-e2e", "Click the 'Search profiles to follow' input, then type e2e into it.",
-                  [FOCUS, ("click_text", "Search profiles"), ("wait", 0.5),
-                   ("type", "e2e"), ("wait", 2), PARK])],
-            "Result rows 'Alice E2E' and 'Bob E2E', each with a 'Follow' button, show under the search box.",
-            tries=3, settle=4, cues=("Alice E2E", "Bob E2E", "No profiles match", "Searching")),
-            must_act=True, label="search e2e"):
+    box = await find_search_box(sc)
+    if box is None:
         return
+    sc.box.mark("search")
+    met = await sc.step(Step(
+        "Click the 'Search profiles to follow' box in step 1 and type 'e2e'.",
+        [Cand("search-e2e", "Click the 'Search profiles to follow' input, then type e2e into it.",
+              type_into(box, "e2e"))],
+        # The Follow labels are dark on violet and never in the OCR (p was
+        # 0.44 with every row on screen): the hard check counts the pills.
+        "The search box holds 'e2e' and below it result rows show 'Alice E2E', 'Bob E2E' and 'Carol E2E', "
+        "each with a round avatar on its left.",
+        tries=3, settle=4, cues=("Alice E2E", "Bob E2E", "Carol E2E", "No profiles match", "Searching")),
+        must_act=True, label="search e2e")
     await asyncio.sleep(4)   # the picture loads after the row is drawn
     data, _ = await sc.snap("avatars")
-    pic, plain = avatar_colours(data, "Alice"), avatar_colours(data, "Bob")
+    rows = {name: ocr_phrase_pos(data, name) for name in ("Alice", "Bob")}
+    found = all(p is not None and p[1] > box[1] + 12 for p in rows.values())
+    with_follow = found and all(row_has_follow(data, p) for p in rows.values())
+    if sc.check("rows 'Alice' and 'Bob' below the box, each with a Follow button", with_follow, rows) and not met:
+        sc.accept_step("search e2e", "rows Alice and Bob with Follow buttons below the box")
     sc.check("the fake served Alice's picture", "BS GET /pic/alice.png" in sc.log_after("search"))
+    pic, plain = avatar_spread(data, "Alice"), avatar_spread(data, "Bob")
     sc.check("both avatars were found on screen", pic is not None and plain is not None,
              f"picture={pic} initials={plain}")
     if pic is not None and plain is not None:
-        sc.check("Alice's avatar has clearly more colours than Bob's initials circle",
-                 pic >= plain * 1.5 and pic >= plain + 6, f"picture={pic} initials={plain}")
+        sc.check("Alice's avatar is a many-coloured picture, Bob's a one-colour initials circle",
+                 pic <= 0.5 and plain >= 0.7, f"top-3 colour share: picture={pic} initials={plain}")
 
 
 # ---------------------------------------------------------------- V, W
-RUN_POLL = "20"   # MC_RECALC_POLL_SECS: each run state stays up ~20 s for Jev
-WAITING, CALCULATING = "Waiting in Brainstorm's queue", "Calculating your scores"
+RUN_POLL = "20"   # MC_RECALC_POLL_SECS: each run state stays up ~20 s
+WAITING, CALCULATING = "Waiting in Brainstorm", "Calculating your scores"   # OCR may drop the apostrophe
 PUBLISHING, DONE_LINE = "Publishing your scores", "Your scores are recalculated and published"
 RECALC_WAIT = "Please wait a few minutes before recalculating"
 FOLLOW_FIRST = "Follow at least one account first so we can calculate"
-RUN_CUES = (WAITING, CALCULATING, PUBLISHING, DONE_LINE, RECALC_WAIT, FOLLOW_FIRST, "Sending your follow list")
+SENDING = "Sending your follow list"
+RUN_CUES = (WAITING, CALCULATING, PUBLISHING, DONE_LINE, RECALC_WAIT, FOLLOW_FIRST, SENDING)
 
 
 RECALC_REACH = 90   # px below the 'Saved on' line that the Recalculate pill sits within
@@ -1054,22 +1108,69 @@ async def recalculate(sc, label):
         return False
     await sc.suite.driver.sb.mouse.click(pills[0][0], pills[0][1])
     await sc.suite.driver.act(*PARK)
-    return True
+    return pills[0]
 
 
-async def judge_run(sc, label):
-    """Jev judges each live state of the run in order: waiting (with its queue
-    position), calculating, publishing, done."""
-    wait = Cand("wait-for-poll", "Wait a few seconds for the next progress update.", [("wait", 3)])
-    for name, cond in [
-            ("waiting", f"The Recalculate area says '{WAITING}' and how many runs are ahead."),
-            ("calculating", f"The Recalculate area says '{CALCULATING}'."),
-            ("publishing", f"The Recalculate area says '{PUBLISHING}'."),
-            ("done", f"The Recalculate area says 'Done. {DONE_LINE}.'")]:
-        if not await sc.step(Step(f"Watch the recalculation reach '{name}'.", [wait], cond,
-                                  tries=8, settle=1, cues=RUN_CUES), label=f"{label} {name}"):
-            return False
-    return True
+RUN_STATES = (("waiting", WAITING), ("calculating", CALCULATING), ("publishing", PUBLISHING), ("done", DONE_LINE))
+
+
+async def watch_run(sc, label, pill, timeout=150, every=1.0):
+    """Watch one run's status line, the band under the Recalculate `pill`,
+    until 'Done' or an error line shows. Each state lasts one poll (20 s),
+    and a full see() takes ~40 s on the box, so neither Jev nor see() can
+    catch them (run 20261026-173419: the judge first looked at 'Publishing').
+    Raw screenshots with OCR of the band alone take a few seconds each.
+    Returns [(state, secs after the click, band text)] in the order first
+    seen; each new state also lands as an evidence frame."""
+    band = (380, max(0, int(pill[1]) - 20), 1220, int(pill[1]) + 110)
+    t0, seen, started = time.time(), [], False
+    while time.time() - t0 < timeout:
+        data = shot_bytes(await sc.suite.sb.screenshot())
+        text = "\n".join(line for line, _, _ in fine_lines(data, band, scale=3, thr=50))
+        # The previous run's Done line stays until the repaint after the
+        # click: nothing counts before this run's own first line shows.
+        started = started or any(has(text, p) for p in (SENDING, WAITING, CALCULATING, PUBLISHING,
+                                                        RECALC_WAIT, FOLLOW_FIRST))
+        for name, phrase in RUN_STATES if started else ():
+            if has(text, phrase) and name not in [n for n, _, _ in seen]:
+                seen.append((name, round(time.time() - t0, 1), text))
+                sc.keep(data, f"{label} {name}", text)
+            elif name == "waiting" and has(text, phrase) and "runs ahead" in norm(text):
+                # A later waiting frame where OCR read the queue position.
+                i = next(i for i, (n, _, _) in enumerate(seen) if n == "waiting")
+                if "2 runs ahead" not in norm(seen[i][2]):
+                    seen[i] = (name, seen[i][1], text)
+        if any(n == "done" for n, _, _ in seen) or has(text, RECALC_WAIT) or has(text, FOLLOW_FIRST):
+            break
+        await asyncio.sleep(every)
+    sc.notes.append({f"{label} states": [f"{n}@{t}s" for n, t, _ in seen]})
+    return seen
+
+
+def check_run(sc, label, seen, marker):
+    """Every state shown, waiting with the fake's queue position (2), in
+    order; and the fake answered the polls in that order."""
+    names = [n for n, _, _ in seen]
+    for name, phrase in RUN_STATES:
+        sc.check(f"{label}: '{phrase}' shown", name in names, names)
+    waiting = next((text for n, _, text in seen if n == "waiting"), "")
+    sc.check(f"{label}: waiting shows the queue position", "2 runs ahead" in norm(waiting), waiting[:200])
+    sc.check(f"{label}: the states came in order", names == [n for n, _ in RUN_STATES], names)
+    polls = [l.rsplit(" ", 1)[-1] for l in sc.log_after(marker) if l.startswith("BS GET graperankResult -> ")]
+    sc.check(f"{label}: the fake answered waiting, calculating, publishing, done",
+             polls[:4] == [n for n, _ in RUN_STATES], polls)
+
+
+async def judge_done(sc, label):
+    """Done is the one state that stays: Jev judges it, with the finished
+    time from /user/history beside it."""
+    done = f"The Recalculate area says 'Done. {DONE_LINE}.' and a 'Last run finished' line shows."
+    met = await sc.step(Step("Watch the recalculation finish.",
+                             [Cand("wait-for-poll", "Wait a few seconds for the next progress update.", [("wait", 3)])],
+                             done, tries=2, settle=1, cues=RUN_CUES + ("Last run finished",)), label=f"{label} done")
+    ok = sc.check_screen(f"{label}: 'Done' and 'Last run finished' on screen", [DONE_LINE, "Last run finished"])
+    if ok and not met:
+        sc.accept_step(f"{label} done", "the Done line and 'Last run finished' on screen")
 
 
 def bs_posts(sc, marker, path):
@@ -1090,12 +1191,12 @@ async def scenario_v(sc):
     if not await follow_owner(sc, expect_confirm=True):
         return
     sc.box.mark("V first")
-    if not await recalculate(sc, "first recalculate"):
+    pill = await recalculate(sc, "first recalculate")
+    if not pill:
         return
-    if not await judge_run(sc, "first run"):
-        return
-    screen = await sc.wait_for(["Last run finished"], timeout=20, every=3, label="history")
-    sc.check_screen("the finished time from history shows", ["Last run finished"], screen=screen)
+    check_run(sc, "first run", await watch_run(sc, "first run", pill), "V first")
+    await sc.wait_for(["Last run finished"], timeout=20, every=3, label="history")
+    await judge_done(sc, "first run")
     sc.check("the first run sent the new follow list once",
              len(bs_posts(sc, "V first", "/user/followList")) == 1, bs_posts(sc, "V first", "/user/followList"))
     sc.check("the first run sent one graperank",
@@ -1103,9 +1204,10 @@ async def scenario_v(sc):
     sc.check("history was read", any(l.startswith("BS GET /user/history") for l in sc.log_after("V first")))
 
     sc.box.mark("V second")
-    if not await recalculate(sc, "second recalculate"):
+    pill = await recalculate(sc, "second recalculate")
+    if not pill:
         return
-    await judge_run(sc, "second run")
+    check_run(sc, "second run", await watch_run(sc, "second run", pill), "V second")
     follows, grapes = bs_posts(sc, "V second", "/user/followList"), bs_posts(sc, "V second", "/user/graperank")
     sc.check("the unchanged follow list was not sent again", not follows, follows)
     sc.check("the second run sent exactly one graperank", len(grapes) == 1, grapes)

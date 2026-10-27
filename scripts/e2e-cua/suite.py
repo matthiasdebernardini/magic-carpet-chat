@@ -700,10 +700,16 @@ class Scenario:
     # --- observe ----------------------------------------------------------
     async def snap(self, label):
         data = shot_bytes(await self.suite.sb.screenshot())
+        return data, self.keep(data, label)
+
+    def keep(self, data, label, text=None):
+        """Save `data` (and its OCR `text`) as the next evidence frame."""
         self.frame_n += 1
         stem = f"{self.frame_n:02d}-{re.sub(r'[^a-z0-9]+', '-', label.lower())[:40]}"
         open(os.path.join(self.dir, "frames", stem + ".png"), "wb").write(data)
-        return data, stem
+        if text is not None:
+            open(os.path.join(self.dir, "frames", stem + ".txt"), "w").write(redact(text, self.suite.secrets))
+        return stem
 
     async def stable(self, max_wait=15.0, gap=0.8, tolerance=400):
         """Wait until two captures `gap` apart differ in fewer than
@@ -746,6 +752,9 @@ class Scenario:
         rec = {"step": label, "goal": s.goal, "cond": s.done, "picks": [], "p": None, "met": False}
         t0 = time.time()
         for attempt in range(s.tries):
+            # Whether this attempt's actions raised: accept_step reads the
+            # last attempt only, since its screen is the one a check reads.
+            rec["raised"] = False
             # A must_act step reuses a fresh previous observation as its
             # "before": timed scenarios (A) cannot afford a second OCR.
             if must_act and self.screen and time.time() - self.seen_at < 20:
@@ -768,6 +777,7 @@ class Scenario:
                     await self.suite.driver.act(kind, arg)
                 except Exception as e:   # e.g. click_text found nothing: the attempt fails, the loop goes on
                     rec.setdefault("act_errors", []).append(redact(str(e), self.suite.secrets)[:300])
+                    rec["raised"] = True
                     break
             await asyncio.sleep(s.settle)
             await self.stable()
@@ -841,8 +851,8 @@ class Scenario:
         rec = next((r for r in reversed(self.steps) if r["step"] == label and not r["met"]), None)
         if rec is None:
             return
-        if "act_errors" in rec:
-            print(f"  [{self.sid}] step '{label}' not accepted: actions raised", flush=True)
+        if rec.get("raised"):
+            print(f"  [{self.sid}] step '{label}' not accepted: the last attempt's actions raised", flush=True)
             return
         rec["met"], rec["override"] = True, reason
         print(f"  [{self.sid}] step '{label}' accepted by hard check: {reason}", flush=True)
