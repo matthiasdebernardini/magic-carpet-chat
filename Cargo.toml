@@ -57,6 +57,11 @@ bech32 = "0.11"
 # module by module with gpui quads, so only the matrix is needed.
 qrcode = { version = "0.14", default-features = false }
 
+[dev-dependencies]
+# Reads the bundled mono font's family name (src/dashboard.rs test); the
+# version unifies with the one gpui's text stack already uses.
+ttf-parser = "0.25"
+
 # Debug builds of gpui and its text/layout stack are unusably slow without this.
 # Copied from the gpui-kit workspace.
 [profile.dev]

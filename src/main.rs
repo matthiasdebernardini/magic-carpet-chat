@@ -93,6 +93,17 @@ fn main() {
     app.run(move |cx| {
         // Must run before anything else from gpui-component.
         gpui_kit::init(cx);
+        // gpui's Linux text system cannot resolve the generic "monospace".
+        #[cfg(not(target_os = "macos"))]
+        if let Err(error) = cx
+            .text_system()
+            .add_fonts(dashboard::MONO_FONTS
+                .iter()
+                .map(|font| std::borrow::Cow::Borrowed(*font))
+                .collect())
+        {
+            eprintln!("mono font not registered: {error}");
+        }
         Theme::change(ThemeMode::Dark, None, cx);
         // The design mock is its own palette, not a tint of a stock theme, so
         // the controls gpui-component draws are repainted to match.

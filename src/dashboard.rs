@@ -18,11 +18,26 @@ use crate::timefmt;
 use crate::trust_state::MapVerdict;
 
 /// The mock's monospace face, used for every sats figure and every npub.
-/// Menlo is the bundled macOS face; Linux resolves the generic family.
-#[cfg(target_os = "macos")]
-pub const MONO: &str = "Menlo";
-#[cfg(not(target_os = "macos"))]
-pub const MONO: &str = "monospace";
+/// Menlo is the bundled macOS face. gpui's Linux text system matches family
+/// names exactly and does not resolve the generic "monospace", so every layout
+/// failed the lookup and repainted slowly; Linux registers a bundled font.
+pub const MONO: &str = if cfg!(target_os = "macos") {
+    "Menlo"
+} else {
+    MONO_FONT_FAMILY
+};
+
+/// The family name inside [`MONO_FONT`]; a test keeps the two in step.
+const MONO_FONT_FAMILY: &str = "JetBrains Mono";
+
+/// JetBrains Mono Regular and Bold (SIL OFL 1.1, licence beside them),
+/// registered with gpui's text system at startup on every platform but macOS.
+/// Bold also serves semibold text by nearest match.
+#[cfg(any(test, not(target_os = "macos")))]
+pub const MONO_FONTS: [&[u8]; 2] = [
+    include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf"),
+];
 
 /// One line of small secondary text in `color`.
 pub(crate) fn muted(text: impl Into<SharedString>, color: u32) -> AnyElement {
@@ -556,4 +571,28 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                 .child(card("Needs attention", badge, attention_elements))
                 .child(card("Recent activity", None, activity_elements)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MONO_FONTS, MONO_FONT_FAMILY};
+
+    /// The family gpui indexes each bundled face under is the one `MONO` names
+    /// off macOS; a mismatch would send Linux back to the failing lookup.
+    /// fontdb's rule: the typographic family (name ID 16) wins, else ID 1.
+    #[test]
+    fn every_bundled_mono_face_is_indexed_under_the_mono_family() {
+        for data in MONO_FONTS {
+            let face = ttf_parser::Face::parse(data, 0).expect("bundled font parses");
+            let family_of = |id| {
+                face.names()
+                    .into_iter()
+                    .filter(|name| name.name_id == id)
+                    .find_map(|name| name.to_string())
+            };
+            let family = family_of(ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+                .or_else(|| family_of(ttf_parser::name_id::FAMILY));
+            assert_eq!(family.as_deref(), Some(MONO_FONT_FAMILY));
+        }
+    }
 }
