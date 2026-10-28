@@ -127,6 +127,14 @@ pub enum Command {
     /// `BountiesFailed` carrying the same `seq`, so the UI can tell a reply
     /// to this read from one to an earlier read.
     FetchBounties { seq: u64 },
+    /// Log in as `pubkey`, then GET the open bounties its issuers rank it
+    /// high enough to claim. Emits `Eligible` or `EligibleFailed` carrying
+    /// the same `pubkey` and `seq`, so the UI drops a reply for an account
+    /// it already switched away from.
+    FetchEligible {
+        pubkey: String,
+        seq: u64,
+    },
     PublishDList {
         pubkey: String,
         singular: String,
@@ -307,6 +315,18 @@ pub enum Update {
     /// The issuer's bounty list, freshly fetched.
     Bounties { seq: u64, list: Vec<Bounty> },
     BountiesFailed { seq: u64, message: String },
+    /// The server's eligible list for `pubkey`, as sent: own bounties and the
+    /// auto-pay minimum are filtered by the UI ([`crate::api::claimable_by`]).
+    Eligible {
+        pubkey: String,
+        seq: u64,
+        list: Vec<Bounty>,
+    },
+    EligibleFailed {
+        pubkey: String,
+        seq: u64,
+        message: String,
+    },
     /// A fresh full snapshot of a watched bounty (emitted only on change).
     /// Boxed: the snapshot dwarfs every other variant on the channel.
     BountyDetail(Box<BountyDetail>),
@@ -694,6 +714,14 @@ async fn run(
             Command::FetchBounties { seq } => {
                 tokio::spawn(fetch_bounties(seq, updates.clone()));
             }
+            Command::FetchEligible { pubkey, seq } => {
+                tokio::spawn(fetch_eligible(
+                    sessions.clone(),
+                    pubkey,
+                    seq,
+                    updates.clone(),
+                ));
+            }
             Command::AddAccount {
                 secret,
                 name,
@@ -957,22 +985,75 @@ async fn create_bounty(
     let session = session(sessions, pubkey).await?;
     let mut session = session.lock().await;
     // The bounty issuer is always the session pubkey, so log in first.
-    if !session.logged_in {
-        session.api.login(&session.keys).await?;
-        session.logged_in = true;
-    }
+    ensure_login(&mut session).await?;
     // The server's session cookie dies after 24 h with no renewal, while
     // `logged_in` lives as long as the app: a 401 means log in again, once.
     let bounty = match session.api.create_bounty(req).await {
         Err(ApiError::Status { status: 401, .. }) => {
             session.logged_in = false;
-            session.api.login(&session.keys).await?;
-            session.logged_in = true;
+            ensure_login(&mut session).await?;
             session.api.create_bounty(req).await.map_err(create_outcome)?
         }
         result => result.map_err(create_outcome)?,
     };
     Ok(bounty.id)
+}
+
+/// The kind-22242 login, unless this session already holds one.
+async fn ensure_login(session: &mut Session) -> Result<(), ApiError> {
+    if !session.logged_in {
+        session.api.login(&session.keys).await?;
+        session.logged_in = true;
+    }
+    Ok(())
+}
+
+/// Log in (dropping a stale `logged_in` first when `relogin`) under the
+/// account's lock, then hand back a clone of its `Api`. The login waits for
+/// the lock like any other session work; the clone shares the cookie jar, so
+/// the GET that follows runs without the lock and a create never waits
+/// behind a slow eligible read.
+async fn logged_in_api(session: &TokioMutex<Session>, relogin: bool) -> Result<Api, ApiError> {
+    let mut session = session.lock().await;
+    if relogin {
+        session.logged_in = false;
+    }
+    ensure_login(&mut session).await?;
+    Ok(session.api.clone())
+}
+
+async fn eligible_bounties(
+    sessions: &SharedSessions,
+    pubkey: &str,
+) -> Result<Vec<Bounty>, BridgeError> {
+    let session = session(sessions, pubkey).await?;
+    let api = logged_in_api(&session, false).await?;
+    // The same once-only re-login as `create_bounty`: the cookie may have
+    // expired while `logged_in` stayed true.
+    match api.eligible_bounties(pubkey).await {
+        Err(ApiError::Status { status: 401, .. }) => {
+            let api = logged_in_api(&session, true).await?;
+            Ok(api.eligible_bounties(pubkey).await?)
+        }
+        result => Ok(result?),
+    }
+}
+
+async fn fetch_eligible(
+    sessions: SharedSessions,
+    pubkey: String,
+    seq: u64,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let update = match eligible_bounties(&sessions, &pubkey).await {
+        Ok(list) => Update::Eligible { pubkey, seq, list },
+        Err(e) => Update::EligibleFailed {
+            pubkey,
+            seq,
+            message: e.to_string(),
+        },
+    };
+    let _ = updates.unbounded_send(update);
 }
 
 async fn publish_claim(
