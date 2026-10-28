@@ -17,6 +17,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::a11y::Accessible as _;
 use crate::dashboard::{MONO, muted};
 use crate::palette::*;
 use crate::shell::{Shell, short_npub};
@@ -116,8 +117,9 @@ fn card() -> Div {
         .gap(px(10.))
 }
 
-fn card_title(text: &'static str) -> impl IntoElement {
+fn card_title(id: &'static str, text: &'static str) -> impl IntoElement {
     div()
+        .a11y(id, Role::Heading, text)
         .text_size(px(14.5))
         .font_weight(FontWeight::SEMIBOLD)
         .child(text)
@@ -168,7 +170,8 @@ pub(crate) fn quiet_button(id: &'static str, label: &'static str) -> Stateful<Di
         .child(label)
 }
 
-fn dot_row(dot: u32, text: impl Into<SharedString>, color: u32) -> AnyElement {
+fn dot_row(id: &'static str, dot: u32, text: impl Into<SharedString>, color: u32) -> AnyElement {
+    let text = text.into();
     h_flex()
         .gap(px(9.))
         .items_start()
@@ -182,28 +185,31 @@ fn dot_row(dot: u32, text: impl Into<SharedString>, color: u32) -> AnyElement {
         )
         .child(
             div()
+                .a11y(id, Role::Label, text.clone())
                 .flex_1()
                 .min_w(px(0.))
                 .text_size(px(12.5))
                 .text_color(rgb(color))
-                .child(text.into()),
+                .child(text),
         )
         .into_any_element()
 }
 
 fn error_line(error: Option<String>) -> Option<AnyElement> {
     error.map(|error| {
+        let error = SharedString::from(error);
         div()
+            .a11y("setup-error", Role::Label, error.clone())
             .text_size(px(12.))
             .text_color(rgb(RED))
-            .child(SharedString::from(error))
+            .child(error)
             .into_any_element()
     })
 }
 
 fn back_link(cx: &mut Context<Shell>) -> AnyElement {
     div()
-        .id("setup-back")
+        .a11y("setup-back", Role::Button, "← Back")
         .text_size(px(11.5))
         .text_color(rgb(TEXT_DIM))
         .cursor_pointer()
@@ -216,19 +222,23 @@ fn back_link(cx: &mut Context<Shell>) -> AnyElement {
 fn choice_card(cx: &mut Context<Shell>) -> AnyElement {
     card()
         .border_color(rgb(BORDER_3))
-        .child(card_title("Your Nostr account"))
+        .child(card_title("setup-title-choose", "Your Nostr account"))
         .child(muted(
             "Your secret key stays on this computer. Your name and payment \
              address are public.",
             TEXT_MUTED,
         ))
         .child(
-            primary_button("setup-create", "Create a new account").on_click(cx.listener(
+            primary_button("setup-create", "Create a new account")
+                .a11y("setup-create", Role::Button, "Create a new account")
+                .on_click(cx.listener(
                 |this, _, window, cx| this.setup_choose(Path::Create, window, cx),
             )),
         )
         .child(
-            quiet_button("setup-paste", "I already have a key").on_click(cx.listener(
+            quiet_button("setup-paste", "I already have a key")
+                .a11y("setup-paste", Role::Button, "I already have a key")
+                .on_click(cx.listener(
                 |this, _, window, cx| this.setup_choose(Path::Paste, window, cx),
             )),
         )
@@ -238,23 +248,31 @@ fn choice_card(cx: &mut Context<Shell>) -> AnyElement {
 fn create_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
     card()
         .border_color(rgb(BORDER_3))
-        .child(card_title("Create a new account"))
+        .child(card_title("setup-title-create", "Create a new account"))
         .child(
             v_flex()
                 .gap(px(3.))
                 .child(
                     div()
+                        .a11y("setup-name-label", Role::Label, "Name (optional)")
                         .text_size(px(10.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TEXT_DIM))
                         .child("Name (optional)"),
                 )
-                .child(div().text_size(px(12.5)).child(Input::new(&setup.name))),
+                .child(
+                    div().text_size(px(12.5)).child(
+                        Input::new(&setup.name)
+                            .accessibility_id("setup-name")
+                            .aria_label("Name (optional)"),
+                    ),
+                ),
         )
         // ponytail: the wallet is always on. A toggle would need a
         // create-without-wallet ready panel that then offers the wallet
         // button, which the paste path already is — use that instead.
         .child(dot_row(
+            "setup-wallet-note",
             GREEN,
             "A Coinos wallet opens with this account so claims can pay you. \
              Coinos holds your sats, so keep the balance small.",
@@ -263,6 +281,7 @@ fn create_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
         .children(error_line(setup.error.clone()))
         .child(
             primary_button("setup-create-go", "Create — Enter")
+                .a11y("setup-create-go", Role::Button, "Create — Enter")
                 .on_click(cx.listener(|this, _, _, cx| this.setup_submit_create(cx))),
         )
         .child(back_link(cx))
@@ -272,16 +291,23 @@ fn create_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
 fn paste_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
     card()
         .border_color(rgb(BORDER_3))
-        .child(card_title("Use your Nostr key"))
+        .child(card_title("setup-title-paste", "Use your Nostr key"))
         .child(muted(
             "Paste your secret key. It starts with nsec1. Find it in your \
              Nostr app under Settings > Keys.",
             TEXT_MUTED,
         ))
-        .child(div().text_size(px(12.5)).child(Input::new(&setup.key)))
+        .child(
+            div().text_size(px(12.5)).child(
+                Input::new(&setup.key)
+                    .accessibility_id("setup-key")
+                    .aria_label("Secret key"),
+            ),
+        )
         .children(error_line(setup.error.clone()))
         .child(
             div()
+                .a11y("setup-paste-hint", Role::Label, "Enter continues")
                 .text_size(px(11.))
                 .text_color(rgb(TEXT_DIM))
                 .child("Enter continues"),
@@ -298,14 +324,25 @@ fn working_card(text: &'static str) -> AnyElement {
                 .gap(px(10.))
                 .items_center()
                 .child(Spinner::new().small().color(rgb(TEXT_MUTED).into()))
-                .child(div().text_size(px(13.)).child(text)),
+                .child(
+                    div()
+                        .a11y("setup-working", Role::Label, text)
+                        .text_size(px(13.))
+                        .child(text),
+                ),
         )
         .into_any_element()
 }
 
 /// A ready-state step card's head: badge, title, and an optional
 /// right-aligned status tag.
-fn step_head(mark: &'static str, title: &'static str, tag: Option<AnyElement>, active: bool) -> Div {
+fn step_head(
+    id: &'static str,
+    mark: &'static str,
+    title: &'static str,
+    tag: Option<AnyElement>,
+    active: bool,
+) -> Div {
     let badge = if active {
         crate::community::badge(28., mark, ACCENT, BG_RAIL)
     } else {
@@ -317,6 +354,7 @@ fn step_head(mark: &'static str, title: &'static str, tag: Option<AnyElement>, a
         .child(badge)
         .child(
             div()
+                .a11y(id, Role::Heading, title)
                 .flex_1()
                 .min_w(px(0.))
                 .text_size(px(15.))
@@ -327,8 +365,10 @@ fn step_head(mark: &'static str, title: &'static str, tag: Option<AnyElement>, a
 }
 
 /// The small right-aligned tag on a done step ("saved on this computer").
-fn status_tag(text: impl Into<SharedString>) -> AnyElement {
+fn status_tag(id: &'static str, text: impl Into<SharedString>) -> AnyElement {
+    let text = text.into();
     div()
+        .a11y(id, Role::Label, text.clone())
         .flex_shrink_0()
         .px(px(9.))
         .py(px(3.))
@@ -339,7 +379,7 @@ fn status_tag(text: impl Into<SharedString>) -> AnyElement {
         .text_size(px(11.))
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(GREEN))
-        .child(text.into())
+        .child(text)
         .into_any_element()
 }
 
@@ -363,9 +403,10 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
     // ------------------------------------------------ 1 · your identity
     let mut identity = card()
         .child(step_head(
+            "setup-step-identity-title",
             "✓",
             "Your Nostr identity",
-            Some(status_tag("saved on this computer")),
+            Some(status_tag("setup-step-identity-tag", "saved on this computer")),
             false,
         ))
         .child(
@@ -378,9 +419,13 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
                 .font_family(MONO)
                 .text_size(px(12.))
                 .child(
-                    div()
-                        .text_color(rgb(ACCENT_LIGHT))
-                        .child(short_npub(&summary.npub)),
+                    {
+                        let short = short_npub(&summary.npub);
+                        div()
+                            .a11y("setup-npub", Role::Label, short.clone())
+                            .text_color(rgb(ACCENT_LIGHT))
+                            .child(short)
+                    },
                 )
                 .child(div().text_color(rgb(TEXT_DIM)).child(" · saved")),
         )
@@ -395,7 +440,9 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
                 ))
                 .child({
                     let npub = summary.npub.clone();
-                    quiet_button("copy-setup-npub", "Copy npub").on_click(cx.listener(
+                    quiet_button("copy-setup-npub", "Copy npub")
+                        .a11y("setup-copy-npub", Role::Button, "Copy npub")
+                        .on_click(cx.listener(
                         move |_, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(npub.clone()));
                         },
@@ -410,6 +457,7 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
             div()
                 .ml(px(42.))
                 .child(dot_row(
+                    "setup-identity-warning",
                     AMBER,
                     "No profile found for this key. Check that you pasted the \
                      right one.",
@@ -424,18 +472,19 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
     let session_wallet = view.wallet.created.is_some() || view.wallet.error.is_some();
     let wallet_done = view.wallet.created.is_some() || view.lud16.is_some();
     let wallet_tag = if let Some(created) = &view.wallet.created {
-        Some(status_tag(format!(
-            "Coinos wallet ready — {}",
-            created.lightning_address
-        )))
+        Some(status_tag(
+            "setup-step-wallet-tag",
+            format!("Coinos wallet ready — {}", created.lightning_address),
+        ))
     } else {
         view.lud16
             .as_ref()
-            .map(|lud16| status_tag(format!("Lightning address: {lud16}")))
+            .map(|lud16| status_tag("setup-step-wallet-tag", format!("Lightning address: {lud16}")))
     };
     let mut wallet = card()
         .when(!wallet_done, |this| this.border_color(wash(0x8f7df855)))
         .child(step_head(
+            "setup-step-wallet-title",
             if wallet_done { "✓" } else { "2" },
             "A Lightning wallet",
             wallet_tag,
@@ -455,6 +504,7 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
                 .gap(px(8.))
                 .when(!summary.profile_checked, |this| {
                     this.child(dot_row(
+                        "setup-wallet-warning",
                         TEXT_DIM,
                         "Couldn't check your profile. You can still continue.",
                         TEXT_MUTED,
@@ -467,7 +517,13 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
     // ------------------------------------- 3 · your trusted community
     let community = crate::community::card(shell, &summary.pubkey, cx).unwrap_or_else(|| {
         card()
-            .child(step_head("3", "Your Trusted Community", None, true))
+            .child(step_head(
+                "setup-step-community-title",
+                "3",
+                "Your Trusted Community",
+                None,
+                true,
+            ))
             .child(
                 div()
                     .ml(px(42.))
@@ -478,6 +534,11 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
                     "community-dashboard",
                     "Take me to the Magic Carpet Dashboard",
                     false,
+                )
+                .a11y(
+                    "community-dashboard",
+                    Role::Button,
+                    "Take me to the Magic Carpet Dashboard",
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.leave_account_setup(window, cx);
@@ -495,13 +556,14 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
 
 fn browse_card(cx: &mut Context<Shell>) -> AnyElement {
     card()
-        .child(card_title("Just look around"))
+        .child(card_title("setup-title-browse", "Just look around"))
         .child(muted(
             "Browse bounties without an account. Click the + button in the left bar to add one later.",
             TEXT_MUTED,
         ))
         .child(
             quiet_button("setup-browse", "Continue without an account — esc")
+                .a11y("setup-browse", Role::Button, "Continue without an account — esc")
                 .mt(px(2.))
                 .on_click(cx.listener(|this, _, window, cx| this.leave_account_setup(window, cx))),
         )
@@ -512,6 +574,7 @@ fn cancel_card(cx: &mut Context<Shell>) -> AnyElement {
     card()
         .child(
             quiet_button("setup-cancel", "Cancel — esc")
+                .a11y("setup-cancel", Role::Button, "Cancel — esc")
                 .on_click(cx.listener(|this, _, window, cx| this.leave_account_setup(window, cx))),
         )
         .into_any_element()
