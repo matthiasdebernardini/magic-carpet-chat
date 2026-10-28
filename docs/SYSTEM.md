@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the map.** The interactive atlas is built from the same data. It describes commit 3bf9877; the working tree holds an uncommitted refactor (see NA)._
 
-_Question status: **52 open · 2 routed · 5 resolved**._
+_Question status: **54 open · 2 routed · 5 resolved**._
 
 ## One paragraph
 
@@ -26,6 +26,7 @@ Magic Carpet Chat is a macOS desktop app, one window on gpui-kit, for a Nostr bo
 | Chat backend | The desktop chat calls api.anthropic.com directly. The worker exists for clients that should not hold a key and is not called from src/. | src/chat.rs:29, worker/README.md:4-6 |
 | Chat cell | One turn per conversation cell, 409 for a second POST. A finally block releases the cell on every ending the runtime can see; a 30 s stale clock covers the one it cannot, a client hangup. No auth: the tailnet is the perimeter. | worker/src/index.ts:12-14, 55-56, 130-134, 318-325 |
 | Packaging | Ship an unsigned .app with a READ ME FIRST for Gatekeeper rather than sign and notarize. | scripts/make-app.sh:8-17 |
+| Accessibility | Every control and every state a test reads is an AccessKit node with a stable kebab-case id (AXIdentifier on macOS, AccessibleId on AT-SPI), its role and its visible text as label. The e2e driver reads and presses the tree instead of screenshots. Rows are keyed by data (pubkey, bounty id, event id), not position, except chat bubbles, which only append; no secret reaches a label. | src/a11y.rs, docs/a11y-ids.md |
 
 ## Cost model
 
@@ -42,7 +43,7 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 8. **A wallet for the key** — A generated key has no Lightning address, so its claims fail at payment; one click opens a Coinos wallet bound to the key. _(adds WA, CO, CX)_
 9. **Telling the payers the address** — Still inside the wallet command, the new address is merged into the key's existing kind-0 profile, only lud16 changed, and published to the instance and then three public relays. _(adds PR)_
 10. **Chat, two ways** — The cmd-8 pane streams Claude straight from Anthropic with the owner's key; a worker in the repo does the same job on a separate tailnet box, and nothing connects them. _(adds CP, AN, CC)_
-11. **Under the floor, and what is moving** — One UI dependency, a copied palette, an unsigned bundle; five placeholder screens; and an uncommitted refactor that changes the key store. _(adds PK, UB, NA)_
+11. **Under the floor, and what is moving** — One UI dependency, a copied palette, an unsigned bundle; five placeholder screens; and an uncommitted refactor that changes the key store. _(adds PK, AX, UB, NA)_
 12. **The whole system** — Everything at once: pick a flow bottom left, hover to read, click to pin, arrow right to go inside.
 
 ## Structures
@@ -601,6 +602,26 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 - **Q-PK2** README.md still describes a 400-line chat toy with MODEL in main.rs; DEMO.md omits the ~/.config/anthropic/key fallback. Rewrite both?
 - **Q-PK3** aws-lc-rs compiles in although ring is the provider; reqwest's rustls-tls feature pulls it too, so a gpui-kit feature alone cannot drop it.
 
+#### AX · Accessibility tree
+
+**In one line.** Every screen is an AccessKit tree: each control and readable state has a stable id, a role and its visible text as label, so tests drive the app by id instead of by pixels.
+
+**What it does.** gpui 0.3.4 reports an element to AccessKit only when it has a global element id and a role. The app sets both through one helper. Buttons are Button, screens and tabs are Tab (macOS reports a tab's selection, not a button's), status and error lines are Label, rows with controls are Group so macos-harness numbers their children. The tree activates when an assistive client asks; nothing is built otherwise. docs/a11y-ids.md lists every id.
+
+**How it's built.** `Accessible::a11y(id, role, label)` in `src/a11y.rs` sets `accessibility_id`, `role` and `aria_label`; on a plain Div it also sets the gpui id. gpui-component's Input takes `accessibility_id` directly; its Textarea does not, so the chat composer sits in a `chat-composer` group. gpui presses a node by clicking its centre, so a control must be on screen to be pressed. `scripts/a11y-check.sh` walks the main screens with macos-harness.
+
+**Steps in execution.**
+
+1. **Activate** — macOS asks the window for its accessibility children; gpui forces a frame and builds the tree.
+2. **Read** — macos-harness get_app_state prints each node with its ID.
+3. **Press** — click by element index: gpui clicks the node's centre.
+4. **Type** — set_value or type_text into a TextInput.
+
+**Questions.**
+
+- **Q-AX1** gpui 0.3.4 has no disabled flag; inactive step buttons say "unavailable" in their description. Enough for the e2e driver?
+- **Q-AX2** On Linux the tree needs a session D-Bus, at-spi2-core's accessibility bus and org.a11y.Status.IsEnabled = true; the cua box has none of these set up yet.
+
 ### Not built, or moving (designed for, not built)
 
 #### UB · Unbuilt screens _(not switched on)_
@@ -844,6 +865,8 @@ Reference by ID. ✓ resolved (with date) · → routed to a named next step · 
 - **Q-PK1** (PK) make-app.sh says the bundle id must match src/config.rs and a directories crate; neither exists. Which should the id track?
 - **Q-PK2** (PK) README.md still describes a 400-line chat toy with MODEL in main.rs; DEMO.md omits the ~/.config/anthropic/key fallback. Rewrite both?
 - **Q-PK3** (PK) aws-lc-rs compiles in although ring is the provider; reqwest's rustls-tls feature pulls it too, so a gpui-kit feature alone cannot drop it.
+- **Q-AX1** (AX) gpui 0.3.4 has no disabled flag; inactive step buttons say "unavailable" in their description. Enough for the e2e driver?
+- **Q-AX2** (AX) On Linux the tree needs a session D-Bus, at-spi2-core's accessibility bus and org.a11y.Status.IsEnabled = true; the cua box has none of these set up yet.
 - ~~**Q-UB1**~~ (UB) ✓ Accounts is built now: account cards plus the per-account page with the Trust tab (src/account.rs, this working tree). Settings is still a placeholder.
 - **Q-NA1** (NA) Which revision should the atlas track once the refactor lands: HEAD, the refactor, or both with a moving marker? → routed: _rebuild after the refactor commit_
 
@@ -870,9 +893,11 @@ magic-carpet-chat/
   src/bounties.rs     list, detail, claim timeline, form cards
   src/chat.rs         Chat pane, Anthropic SSE
   src/palette.rs src/icons.rs src/timefmt.rs
+  src/a11y.rs         Accessible::a11y: id, role and label in one call
   worker/src/index.ts celld ChatCell (server chat, not wired in)
   scripts/make-app.sh unsigned .app + READ ME FIRST
-  docs/               this atlas
+  scripts/a11y-check.sh  launches the app, checks the accessibility ids
+  docs/               this atlas; a11y-ids.md is the id contract
 ```
 
 ## How this file is maintained

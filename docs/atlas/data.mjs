@@ -30,9 +30,11 @@ export const META = {
   src/bounties.rs     list, detail, claim timeline, form cards
   src/chat.rs         Chat pane, Anthropic SSE
   src/palette.rs src/icons.rs src/timefmt.rs
+  src/a11y.rs         Accessible::a11y: id, role and label in one call
   worker/src/index.ts celld ChatCell (server chat, not wired in)
   scripts/make-app.sh unsigned .app + READ ME FIRST
-  docs/               this atlas`,
+  scripts/a11y-check.sh  launches the app, checks the accessibility ids
+  docs/               this atlas; a11y-ids.md is the id contract`,
 };
 
 export const DECISIONS = [
@@ -50,6 +52,7 @@ export const DECISIONS = [
   { axis: 'Chat backend', decision: 'The desktop chat calls api.anthropic.com directly. The worker exists for clients that should not hold a key and is not called from src/.', adr: 'src/chat.rs:29, worker/README.md:4-6' },
   { axis: 'Chat cell', decision: 'One turn per conversation cell, 409 for a second POST. A finally block releases the cell on every ending the runtime can see; a 30 s stale clock covers the one it cannot, a client hangup. No auth: the tailnet is the perimeter.', adr: 'worker/src/index.ts:12-14, 55-56, 130-134, 318-325' },
   { axis: 'Packaging', decision: 'Ship an unsigned .app with a READ ME FIRST for Gatekeeper rather than sign and notarize.', adr: 'scripts/make-app.sh:8-17' },
+  { axis: 'Accessibility', decision: 'Every control and every state a test reads is an AccessKit node with a stable kebab-case id (AXIdentifier on macOS, AccessibleId on AT-SPI), its role and its visible text as label. The e2e driver reads and presses the tree instead of screenshots. Rows are keyed by data (pubkey, bounty id, event id), not position, except chat bubbles, which only append; no secret reaches a label.', adr: 'src/a11y.rs, docs/a11y-ids.md' },
 ];
 
 export const GROUPS = [
@@ -231,6 +234,13 @@ export const NODES = [
     steps: [['Init order', 'gpui_kit::init, Theme Dark, palette::apply, bind_keys, http client.'], ['Icons', 'Screen::icon names map to icons/mc/*.svg; the colour is passed in.'], ['Bundle', 'install the binary and icon.icns, write Info.plist and PkgInfo, write READ ME FIRST.txt.'], ['Ship', 'ditto zip plus the txt at the zip root.']],
     cond: ['make-app.sh says the bundle id must match src/config.rs and a directories crate; neither exists. Which should the id track?', 'README.md still describes a 400-line chat toy with MODEL in main.rs; DEMO.md omits the ~/.config/anthropic/key fallback. Rewrite both?', 'aws-lc-rs compiles in although ring is the provider; reqwest\'s rustls-tls feature pulls it too, so a gpui-kit feature alone cannot drop it.'] },
 
+  { id: 'AX', code: 'AX', name: 'Accessibility tree', short: 'A11Y', group: 'sup', gx: 18, gy: 14, w: 2.5, d: 2, h: 24, kind: 'box',
+    one: 'Every screen is an AccessKit tree: each control and readable state has a stable id, a role and its visible text as label, so tests drive the app by id instead of by pixels.',
+    what: 'gpui 0.3.4 reports an element to AccessKit only when it has a global element id and a role. The app sets both through one helper. Buttons are Button, screens and tabs are Tab (macOS reports a tab\'s selection, not a button\'s), status and error lines are Label, rows with controls are Group so macos-harness numbers their children. The tree activates when an assistive client asks; nothing is built otherwise. docs/a11y-ids.md lists every id.',
+    how: '<code>Accessible::a11y(id, role, label)</code> in <code>src/a11y.rs</code> sets <code>accessibility_id</code>, <code>role</code> and <code>aria_label</code>; on a plain Div it also sets the gpui id. gpui-component\'s Input takes <code>accessibility_id</code> directly; its Textarea does not, so the chat composer sits in a <code>chat-composer</code> group. gpui presses a node by clicking its centre, so a control must be on screen to be pressed. <code>scripts/a11y-check.sh</code> walks the main screens with macos-harness.',
+    steps: [['Activate', 'macOS asks the window for its accessibility children; gpui forces a frame and builds the tree.'], ['Read', 'macos-harness get_app_state prints each node with its ID.'], ['Press', 'click by element index: gpui clicks the node\'s centre.'], ['Type', 'set_value or type_text into a TextInput.']],
+    cond: ['gpui 0.3.4 has no disabled flag; inactive step buttons say "unavailable" in their description. Enough for the e2e driver?', 'On Linux the tree needs a session D-Bus, at-spi2-core\'s accessibility bus and org.a11y.Status.IsEnabled = true; the cua box has none of these set up yet.'] },
+
   // ---------------- Not built, or moving ----------------
   { id: 'UB', code: 'UB', name: 'Unbuilt screens', short: 'NOT BUILT', group: 'off', ghost: true, gx: 21.5, gy: 8, w: 2, d: 2, h: 40, kind: 'screen',
     one: 'Payments, Claimants, Leaderboards, Tags and Settings render "This screen is not built yet." The search field looks live and is not; so do four of the Account page\'s five tabs.',
@@ -410,7 +420,7 @@ export const CH = [
     lede: `The cmd-8 pane streams Claude straight from Anthropic with the owner's key; a worker in the repo does the same job on a separate tailnet box, and nothing connects them.`,
     story: `<p>Both send the whole transcript with model claude-sonnet-5, no system prompt, and read the same Server-Sent Events. The desktop keeps the transcript in memory and streams on the window's own executor; the worker keeps it in a per-conversation SQLite cell with a complete flag and a one-turn lock. <mark>The desktop never calls the worker</mark>; it exists for clients that should not hold a key.</p>`,
     flow: [['CP', 'AN', 'POST /v1/messages', { stream: true }], ['AN', 'CP', 'SSE deltas', { text: 'Hel' }], ['CC', 'AN', 'POST /v1/messages, after a tailnet POST /chat/:id', { history: 'SQLite' }], ['AN', 'CC', 'SSE, saved as it arrives', { complete: 0 }]] },
-  { id: 'floor', title: 'Under the floor, and what is moving', reveal: ['PK', 'UB', 'NA'],
+  { id: 'floor', title: 'Under the floor, and what is moving', reveal: ['PK', 'AX', 'UB', 'NA'],
     lede: `One UI dependency, a copied palette, an unsigned bundle; five placeholder screens; and an uncommitted refactor that changes the key store.`,
     story: `<p>gpui-kit 0.6.0 is the whole UI stack, ring is pinned because two TLS providers are in the graph, and five screens say "not built yet". <mark>The working tree is mid-refactor</mark>: accounts.json replaces the keychain, N accounts replace the two slots, an account setup screen replaces onboarding, and the Accounts/Account screens carry the Trust tab.</p>`,
     flow: [['PK', 'SH', 'palette, icons, shortcuts', { theme: 'Dark', icons: 11 }], ['NR', 'UB', 'cmd-3, 4, 5, 7', { text: 'This screen is not built yet.' }], ['NA', 'KS', 'accounts.json replaces the keychain', { mode: '0600', accounts: 'N' }]] },
