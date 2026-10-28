@@ -26,6 +26,7 @@ use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated
 use magic_carpet_chat::secrets::{self, Secret};
 
 use crate::account::{self, AccountPage, Tab};
+use crate::a11y::Accessible;
 use crate::account_setup::{self, AccountSetup, Path as SetupPath, ReadySummary};
 use crate::bounties;
 use crate::chat::Chat;
@@ -2880,6 +2881,7 @@ impl Shell {
             .shadow(vec![
                 BoxShadow::new(px(0.), px(4.), wash(ACCENT_GLOW)).blur_radius(px(16.)),
             ])
+            .a11y("rail-logo", Role::Button, "Dashboard")
             .on_click(cx.listener(|this, _, w, cx| this.go(Screen::Dashboard, w, cx)))
             .child(img(crate::icons::icon("logo")).size_full())
     }
@@ -2909,6 +2911,12 @@ impl Shell {
                 .cursor_pointer()
                 .bg(if on { rgb(BG_NAV_ON) } else { rgb(BG_RAIL) })
                 .hover(|this| this.bg(rgb(BG_NAV_ON)))
+                .a11y(
+                    format!("rail-{}", screen.label().to_lowercase()),
+                    Role::Tab,
+                    screen.label(),
+                )
+                .aria_selected(on)
                 .child(glyph(screen.icon(), if on { TEXT } else { TEXT_MUTED }))
         };
 
@@ -2924,12 +2932,14 @@ impl Shell {
             .child(self.logo(cx))
             .child(div().w(px(32.)).h(px(1.)).bg(rgb(LINE)))
             .children(self.views.iter().enumerate().map(|(ix, (pubkey, view))| {
-                let ring = if self.active.as_deref() == Some(pubkey.as_str()) {
+                let current = self.active.as_deref() == Some(pubkey.as_str());
+                let ring = if current {
                     rgb(ACCENT)
                 } else {
                     rgb(BG_NAV_ON)
                 };
                 let pubkey = pubkey.clone();
+                let a11y_id = format!("rail-account-{pubkey}");
                 div()
                     .id(("account", ix))
                     .flex_shrink_0()
@@ -2939,6 +2949,8 @@ impl Shell {
                         BoxShadow::new(px(0.), px(0.), rgb(BG_RAIL).into()).spread_radius(px(2.)),
                         BoxShadow::new(px(0.), px(0.), ring.into()).spread_radius(px(4.)),
                     ])
+                    .a11y(a11y_id, Role::Tab, display_name(view))
+                    .aria_selected(current)
                     .child(Self::account_marker(view, ix, 42., 15.))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.set_account(&pubkey, window, cx);
@@ -2961,6 +2973,7 @@ impl Shell {
                     .text_size(px(20.))
                     .text_color(rgb(TEXT_DIM))
                     .hover(|this| this.border_color(rgb(ACCENT)).text_color(rgb(TEXT)))
+                    .a11y("rail-add-account", Role::Button, "Add account")
                     .child("+")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_account_setup(false, window, cx)
@@ -2969,6 +2982,15 @@ impl Shell {
             .child(div().flex_1())
             .child(
                 v_flex()
+                    .a11y(
+                        "rail-relay",
+                        Role::Label,
+                        if self.relay_connected {
+                            "Relay connected"
+                        } else {
+                            "Relay disconnected"
+                        },
+                    )
                     .items_center()
                     .gap(px(4.))
                     .child(div().size(px(8.)).rounded_full().bg(rgb(
@@ -3000,6 +3022,7 @@ impl Shell {
     // --------------------------------------------------------- nav sidebar
 
     fn stat_card(
+        id: &'static str,
         label: &'static str,
         value: SharedString,
         unit: Option<&'static str>,
@@ -3018,6 +3041,7 @@ impl Shell {
             .border_color(rgb(BORDER))
             .child(
                 div()
+                    .a11y(format!("{id}-title"), Role::Label, label)
                     .text_size(px(9.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT_DIM))
@@ -3031,6 +3055,7 @@ impl Shell {
                     .font_family(MONO)
                     .child(
                         div()
+                            .a11y(id, Role::Label, value.clone())
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(hue))
@@ -3043,6 +3068,7 @@ impl Shell {
             .when_some(note, |this, note| {
                 this.child(
                     div()
+                        .a11y(format!("{id}-note"), Role::Label, note.clone())
                         .mt(px(1.))
                         .text_size(px(10.5))
                         .text_color(rgb(TEXT_DIM))
@@ -3066,6 +3092,7 @@ impl Shell {
         // The address payouts go to, as the relays have it (or the Coinos
         // wallet this app opened). Claimants asked where their sats land.
         let address = view.and_then(|v| v.payout_address()).map(SharedString::new);
+        let (name_label, identity_label) = (name.clone(), identity.clone());
         let active = self.active.clone();
         let remove_armed = active.is_some() && self.confirm_remove == active;
         let sats_left = active.as_deref().and_then(|p| self.remove_warning(p));
@@ -3139,6 +3166,7 @@ impl Shell {
                     .child(
                         h_flex()
                             .id("account-header")
+                            .a11y("sidebar-account", Role::Button, name_label)
                             .gap(px(8.))
                             .items_center()
                             .px(px(11.))
@@ -3151,12 +3179,22 @@ impl Shell {
                                     .min_w(px(0.))
                                     .child(
                                         div()
+                                            .a11y(
+                                                "sidebar-account-name",
+                                                Role::Label,
+                                                name.clone(),
+                                            )
                                             .text_size(px(13.5))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child(name),
                                     )
                                     .child(
                                         div()
+                                            .a11y(
+                                                "sidebar-account-npub",
+                                                Role::Label,
+                                                identity_label,
+                                            )
                                             .mt(px(1.))
                                             .font_family(MONO)
                                             .text_size(px(10.5))
@@ -3166,6 +3204,11 @@ impl Shell {
                                     .when_some(address, |this, address| {
                                         this.child(
                                             div()
+                                                .a11y(
+                                                    "sidebar-account-address",
+                                                    Role::Label,
+                                                    address.clone(),
+                                                )
                                                 .mt(px(1.))
                                                 .font_family(MONO)
                                                 .text_size(px(10.5))
@@ -3177,6 +3220,15 @@ impl Shell {
                                         this.child(
                                             div()
                                                 .id("remove-account")
+                                                .a11y(
+                                                    "sidebar-remove-account",
+                                                    Role::Button,
+                                                    if remove_armed {
+                                                        "Click again to remove"
+                                                    } else {
+                                                        "Remove this account"
+                                                    },
+                                                )
                                                 .mt(px(3.))
                                                 .text_size(px(10.))
                                                 .text_color(rgb(if remove_armed {
@@ -3204,6 +3256,11 @@ impl Shell {
                                     .when_some(sats_left, |this, warning| {
                                         this.child(
                                             div()
+                                                .a11y(
+                                                    "sidebar-remove-warning",
+                                                    Role::Label,
+                                                    warning.clone(),
+                                                )
                                                 .mt(px(2.))
                                                 .text_size(px(10.))
                                                 .text_color(rgb(AMBER))
@@ -3217,6 +3274,7 @@ impl Shell {
                                 // the account's Trust tab.
                                 div()
                                     .id("account-step")
+                                    .a11y("sidebar-account-step", Role::Button, "Next account")
                                     .text_color(rgb(TEXT_DIM))
                                     .child("›")
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3248,6 +3306,13 @@ impl Shell {
                 };
                 h_flex()
                     .id(SharedString::from(screen.label()))
+                    .a11y(
+                        format!("nav-{}", screen.label().to_lowercase()),
+                        Role::Tab,
+                        screen.label(),
+                    )
+                    .aria_selected(on)
+                    .when_some(badge.clone(), |this, badge| this.aria_description(badge))
                     .gap(px(10.))
                     .items_center()
                     .px(px(11.))
@@ -3268,6 +3333,7 @@ impl Shell {
             }))
             .child(div().flex_1())
             .child(Self::stat_card(
+                "sidebar-open",
                 "OPEN BOUNTIES",
                 open_value,
                 None,
@@ -3276,6 +3342,7 @@ impl Shell {
                 note,
             ))
             .child(Self::stat_card(
+                "sidebar-promised",
                 "PROMISED",
                 committed,
                 Some("sats"),
@@ -3284,6 +3351,7 @@ impl Shell {
                 Some("in open bounties".into()),
             ))
             .child(Self::stat_card(
+                "sidebar-paid",
                 "PAID SO FAR",
                 settled,
                 Some("sats"),
@@ -3313,11 +3381,16 @@ impl Shell {
                     .flex_1()
                     .min_w(px(170.))
                     .text_size(px(12.5))
-                    .child(Input::new(&self.search)),
+                    .child(
+                        Input::new(&self.search)
+                            .accessibility_id("top-search")
+                            .aria_label("Search"),
+                    ),
             )
             .when_some(armed, |this, armed| {
                 this.child(if armed {
                     h_flex()
+                        .a11y("top-auto-pay", Role::Label, "Auto-pay armed")
                         .flex_shrink_0()
                         .gap(px(9.))
                         .items_center()
@@ -3334,6 +3407,7 @@ impl Shell {
                         .child("Auto-pay armed")
                 } else {
                     h_flex()
+                        .a11y("top-auto-pay", Role::Label, "Auto-pay off")
                         .flex_shrink_0()
                         .gap(px(9.))
                         .items_center()
@@ -3361,12 +3435,22 @@ impl Shell {
             .gap(px(6.))
             .child(
                 div()
+                    .a11y(
+                        format!("placeholder-{}-title", screen.label().to_lowercase()),
+                        Role::Heading,
+                        screen.label(),
+                    )
                     .text_size(px(21.))
                     .font_weight(FontWeight::BOLD)
                     .child(screen.label()),
             )
             .child(
                 div()
+                    .a11y(
+                        format!("placeholder-{}", screen.label().to_lowercase()),
+                        Role::Label,
+                        "Coming soon.",
+                    )
                     .text_size(px(12.5))
                     .text_color(rgb(TEXT_MUTED))
                     .child("Coming soon."),
@@ -3423,10 +3507,17 @@ impl Shell {
                 };
                 let panel = match self.active_view() {
                     Some(view) => wallet::panel(view, false, Some(&self.send_inputs), cx),
-                    None => dashboard::muted(
-                        "No account — press + in the rail to add one.",
-                        TEXT_MUTED,
-                    ),
+                    // dashboard::muted, with a node.
+                    None => div()
+                        .a11y(
+                            "wallet-no-account",
+                            Role::Label,
+                            "No account — press + in the rail to add one.",
+                        )
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("No account — press + in the rail to add one.")
+                        .into_any_element(),
                 };
                 div()
                     .id("wallet")
@@ -3444,6 +3535,7 @@ impl Shell {
                             .gap(px(14.))
                             .child(
                                 div()
+                                    .a11y("wallet-title", Role::Heading, title.clone())
                                     .text_size(px(21.))
                                     .font_weight(FontWeight::BOLD)
                                     .child(SharedString::from(title)),
