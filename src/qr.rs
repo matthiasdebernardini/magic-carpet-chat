@@ -5,6 +5,7 @@ use std::sync::Arc;
 use gpui_kit::*;
 use qrcode::{Color, QrCode};
 
+use crate::a11y::Accessible as _;
 use crate::dashboard::muted;
 use crate::palette::*;
 
@@ -58,6 +59,33 @@ pub fn view(code: Option<Arc<QrCode>>, edge: f32) -> AnyElement {
     .flex_shrink_0()
     .rounded(px(8.))
     .into_any_element()
+}
+
+/// [`view`] as an image node: `label` says what the code encodes in words,
+/// `description` what scanning it does. A code that could not be drawn is a
+/// label node carrying the error text instead.
+pub fn labeled(
+    code: Option<Arc<QrCode>>,
+    edge: f32,
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+) -> AnyElement {
+    if code.is_none() {
+        return div()
+            .text_size(px(12.5))
+            .text_color(rgb(RED))
+            .child("Could not draw the QR code.")
+            .a11y(id, Role::Label, "Could not draw the QR code.")
+            .into_any_element();
+    }
+    div()
+        .size(px(edge))
+        .flex_shrink_0()
+        .child(view(code, edge))
+        .a11y(id, Role::Image, label)
+        .aria_description(description)
+        .into_any_element()
 }
 
 #[cfg(test)]
