@@ -25,6 +25,11 @@ APP_BIN = "/usr/local/bin/magic-carpet-chat-e2e"   # run.sh installs here; the d
 WALLET = "node /usr/local/lib/node_modules/brainstorm/node_modules/.bin/agent-wallet"
 FAKE_URL, RELAY_URL = "http://127.0.0.1:8787", "ws://127.0.0.1:10547"
 BS_URL = "http://127.0.0.1:8788"        # fake Brainstorm (same fake_instance.py)
+# The e2e session bus inside mc: the app registers its AccessKit tree on the
+# accessibility bus this bus's at-spi-bus-launcher hands out, and atspi.py
+# reads it there. Box.a11y_up gives the bus its own XDG_RUNTIME_DIR, so that
+# socket is not the demo desktop's (/root/.cache/at-spi/bus_1).
+A11Y_ENV = f"DBUS_SESSION_BUS_ADDRESS=unix:path={CDIR}/a11y-bus"
 
 sys.path.insert(0, MC)
 sys.path.insert(0, E2E)
@@ -84,6 +89,31 @@ def dx(script, input=None, env_names=(), env=None, detach=False, timeout=120):
 
 SIDEBAR = (70, 95, 290, 240)   # account chip: name, npub, address, remove link, sats warning
 CONTENT = (70, 90, 1280, 960)  # the window below its title bars
+
+
+def atspi(cmd, target=None, name=None, has=(), secs=None, within=None):
+    """atspi.py in the mc container (box only). Returns its JSON; raises
+    RuntimeError with the helper's reason when the node is not exactly one,
+    is outside the window, or a wait times out."""
+    args = [cmd] + ([target] if target else []) + ([str(secs)] if secs is not None else [])
+    if name is not None:
+        args += ["--name", name]
+    for h in has:
+        args += ["--has", h]
+    if within:
+        args += ["--within", within]
+    try:
+        r = dx(f"{A11Y_ENV} python3 {CDIR}/atspi.py " + " ".join(shlex.quote(a) for a in args),
+               timeout=(secs or 0) + 30)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"atspi {cmd} {target}: docker exec timed out")
+    try:
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"atspi {cmd} {target}: no answer (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+    if "error" in out:
+        raise RuntimeError(f"atspi {cmd}: {out['error']}")
+    return out
 
 
 def fine_lines(data, box=SIDEBAR, scale=4, thr=60):
@@ -209,14 +239,63 @@ def ocr_phrase_all(data, phrase, fold=False):
 
 class FineDriver(Driver):
     """agent.Driver plus `click_fine` (sidebar OCR) and `click_pill`
-    (accent buttons by colour — OCR cannot read their dark-on-violet text)."""
+    (accent buttons by colour — OCR cannot read their dark-on-violet text),
+    and, on the box, the accessibility-tree kinds (docs/a11y-ids.md):
+
+      ("press", t)     press the control through AT-SPI (its "click" action)
+      ("click_id", t)  click the control's centre with xdotool: a text input
+                       has no action, so this focuses it for "type"
+      ("wait_id", t)   wait until the control is in the tree
+
+    t is an id, a "~regex" id, or {"id": ..., "name": exact name, "has":
+    [name substrings], "secs": wait timeout, "soft": True}. Exactly one node
+    must match, and press/click_id refuse a control outside the window. A
+    soft wait_id returns on timeout instead of raising."""
 
     # Named rail targets -> window-local point. The box coordinates were
     # measured on the suite's first build; the current rail puts the first
     # avatar higher, which OmacDriver overrides below.
     AVATARS = {"house": (34, 190), "claimant": (34, 245), "plus": (34, 300)}
 
+    # The window of the binary under test, by pid: the demo app's window has
+    # the same title.
+    APP_WINDOW = f"$(xdotool search --all --pid $(pidof -s {os.path.basename(APP_BIN)}) --name 'Magic Carpet' | head -1)"
+
+    def a11y(self, cmd, target=None, **kw):
+        return atspi(cmd, target, **kw)
+
+    async def window_box(self):
+        """(x, y, w, h) of the app window on the display. xwininfo, not
+        xdotool getwindowgeometry, which is off by the window frame."""
+        r = await self.x(f"xwininfo -id {self.APP_WINDOW}")
+        v = dict(re.findall(r"(Absolute upper-left X|Absolute upper-left Y|Width|Height):\s+(-?\d+)", r.stdout))
+        if len(v) != 4:
+            raise RuntimeError("no app window for xwininfo")
+        return (int(v["Absolute upper-left X"]), int(v["Absolute upper-left Y"]), int(v["Width"]), int(v["Height"]))
+
     async def act(self, kind, arg):
+        if kind in ("press", "click_id", "wait_id"):
+            t = arg if isinstance(arg, dict) else {"id": arg}
+            if kind == "wait_id":
+                try:
+                    out = self.a11y("wait", t["id"], name=t.get("name"), has=t.get("has", ()), secs=t.get("secs", 10))
+                except RuntimeError as e:
+                    if not t.get("soft"):
+                        raise
+                    return f"wait_id {t['id']}: {e}"
+                return f"wait_id {out['id']} ({out['waited']} s)"
+            wx, wy, ww, wh = await self.window_box()
+            if kind == "press":
+                out = self.a11y("press", t["id"], name=t.get("name"), within=f"{ww}x{wh}")
+                return f"press {out['id']} {out['name']!r}"
+            out = self.a11y("rect", t["id"], name=t.get("name"), within=f"{ww}x{wh}")
+            r = out["rect"]
+            cx, cy = r["x"] + r["w"] // 2, r["y"] + r["h"] // 2
+            dw, dh = (int(v) for v in (await self.x("xdotool getdisplaygeometry")).stdout.split())
+            if not (0 <= wx + cx < dw and 0 <= wy + cy < dh):
+                raise RuntimeError(f"click_id: {out['id']} is off the display at ({wx + cx},{wy + cy})")
+            await self.x(f"xdotool mousemove --window {self.APP_WINDOW} {cx} {cy} click 1")
+            return f"click_id {out['id']} -> ({cx},{cy}) in the window"
         if kind == "avatar":
             await self.sb.mouse.click(*self.AVATARS[arg])
             return None
@@ -290,8 +369,31 @@ class Box:
         self.cdir = CDIR   # so collect() can address both targets uniformly
         dx(f"mkdir -p {CDIR}/rec {CDIR}/logs && chmod 700 {CDIR}")
         run(["docker", "cp", os.path.join(E2E, "fake_instance.py"), f"mc:{CDIR}/fake_instance.py"], check=True)
+        run(["docker", "cp", os.path.join(E2E, "atspi.py"), f"mc:{CDIR}/atspi.py"], check=True)
         if dx(f"test -x {CDIR}/nak").returncode != 0:
             run(["docker", "cp", os.path.join(HOME, ".local/bin/nak"), f"mc:{CDIR}/nak"], check=True)
+
+    def a11y_up(self):
+        """The e2e session bus, its accessibility bus and IsEnabled, for R
+        (the one scenario that drives by id); kept while they still answer.
+        True when all three are up."""
+        if dx("python3 -c 'import gi; gi.require_version(\"Atspi\", \"2.0\")'").returncode != 0:
+            print("a11y: python3-gi / gir1.2-atspi-2.0 missing in mc; R cannot drive by id", flush=True)
+            return False
+        # The bus activates at-spi-bus-launcher itself on the first
+        # org.a11y.Bus call, with the daemon's environment: its own
+        # XDG_RUNTIME_DIR keeps the accessibility socket off the desktop's.
+        ping = "dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId >/dev/null 2>&1"
+        dx(f"export {A11Y_ENV}; {ping} || {{ rm -f {CDIR}/a11y-bus; mkdir -p {CDIR}/xdg && chmod 700 {CDIR}/xdg && "
+           f"XDG_RUNTIME_DIR={CDIR}/xdg dbus-daemon --session --address=$DBUS_SESSION_BUS_ADDRESS --fork --nopidfile; }}")
+        bus = "gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus"
+        for _ in range(20):
+            if dx(f"{A11Y_ENV} {bus} --method org.freedesktop.DBus.Properties.Set "
+                  f"org.a11y.Status IsEnabled '<true>' >/dev/null 2>&1").returncode == 0:
+                return True
+            time.sleep(0.25)
+        print("a11y: the accessibility bus never came up; R cannot drive by id", flush=True)
+        return False
 
     def app_version(self):
         r = dx(f"strings {APP_BIN} | grep -m1 -oE 'magic-carpet-chat/[0-9]+\\.[0-9]+\\.[0-9]+(-rc[0-9]+)?'; sha256sum {APP_BIN} | cut -c1-16")
@@ -338,7 +440,7 @@ class Box:
     def app_alive(self):
         return dx("pgrep -x magic-carpet-ch").returncode == 0
 
-    def launch(self, name, run_id, target="fake", seed=False, nsecs=None, extra_env=None):
+    def launch(self, name, run_id, target="fake", seed=False, nsecs=None, extra_env=None, a11y=False):
         """Relaunch with a fresh MC_STORE_DIR. seed copies the demo store
         (/root/mc-store/accounts.json, which holds the claimant's Coinos
         login) into it, container-internal, never read here. `nsecs` overrides
@@ -355,6 +457,10 @@ class Box:
             "MC_ISSUER_NPUB": self.keys["house"]["npub"], "MC_BASE_URL": base, "MC_RELAY_URL": relay,
             "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "DISPLAY": ":1",
         })
+        if a11y:   # R: the e2e session bus, so the app's AccessKit tree reaches atspi.py
+            env["DBUS_SESSION_BUS_ADDRESS"] = A11Y_ENV.split("=", 1)[1]
+        else:
+            env.pop("DBUS_SESSION_BUS_ADDRESS", None)
         if target == "fake":
             # Not for "instance": a new account's kind-0 goes to the
             # MC_TRUST_RELAYS set when it is set, and must reach public relays.
@@ -362,7 +468,7 @@ class Box:
         env.update(extra_env or {})
         env.pop("ANTHROPIC_API_KEY", None)
         dx(f"exec {APP_BIN} > {CDIR}/logs/{name}.app.log 2>&1", detach=True,
-           env_names=tuple(k for k in env if k.startswith("MC_") or k in ("DISPLAY", "RUST_BACKTRACE")),
+           env_names=tuple(k for k in env if k.startswith("MC_") or k in ("DISPLAY", "RUST_BACKTRACE", "DBUS_SESSION_BUS_ADDRESS")),
            env=env)
         wid = ""
         for _ in range(60):
@@ -513,6 +619,9 @@ class OmacDriver(FineDriver):
     async def x(self, cmd):
         return await self.sb.shell.run(f"DISPLAY=:0 {cmd}", timeout=60)
 
+    def a11y(self, cmd, target=None, **kw):
+        raise RuntimeError("AT-SPI driving is box-only (R does not run on omac)")
+
     async def act(self, kind, arg):
         wid = self.sb.wid
         if kind == "key":
@@ -528,6 +637,8 @@ class OmacDriver(FineDriver):
             addr = self.sb.addr
             hy_eval(f'local w=hl.get_window("{addr}") hl.dispatch(hl.dsp.focus({{window=w}}))')
             await self.x("xdotool mousemove 20 740")
+        elif kind in ("press", "click_id", "wait_id"):
+            self.a11y(kind)
         else:
             return await super().act(kind, arg)
 

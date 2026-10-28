@@ -392,46 +392,76 @@ def has_failed(screen):
 
 
 # ---------------------------------------------------------------- R (paid)
-# Rail slots on the box with the house first: the 2nd avatar slot is also
-# where "+" sits while only the house exists; the 3rd is "+" with two accounts.
-SLOT2, SLOT3 = ("avatar", "claimant"), ("avatar", "plus")
+# R drives the app through its accessibility tree (atspi.py, box only): each
+# step's candidates press controls and focus fields by their stable ids
+# (docs/a11y-ids.md), and the waits are for the ids that mark the next
+# state. Jev still picks the candidate and judges every postcondition
+# from the screenshot, so a press that reaches the wrong control fails the
+# step. Labels carry no text over AT-SPI, so the wallet, auto-pay and payment
+# wording is still read from the screen.
+RAIL_ACCOUNT = "~rail-account-[0-9a-f]{64}"
+BOUNTY_ROW = "~bounty-row-[0-9a-f-]{36}"
+CLAIM_CARD = "~claim-[0-9a-f]{64}"
+# Switching accounts lands on the Dashboard; the sidebar's Bounties tab is
+# the way back, and bounties-new carries the issuer/claimant wording.
+TO_BOUNTIES = [("wait_id", "nav-bounties"), ("press", "nav-bounties"), PARK]
 
 
-def create_account(who, stamp, plus):
-    """Steps that add one app-made account (and its Coinos wallet) and leave
-    account setup by the Dashboard. `plus` is the "+" click for this rail."""
+def a11y_name(sc, target, name=None):
+    """The control's AT-SPI name, or None unless exactly one node matches."""
+    try:
+        return sc.suite.driver.a11y("name", target, name=name)["name"]
+    except RuntimeError as e:
+        sc.notes.append(f"a11y: {e}"[:300])
+        return None
+
+
+def a11y_count(sc, target, name=None):
+    try:
+        return sc.suite.driver.a11y("exists", target, name=name)["count"]
+    except RuntimeError as e:
+        sc.notes.append(f"a11y: {e}"[:300])
+        return -1
+
+
+def create_account(who, stamp):
+    """Steps that add one app-made account (and its Coinos wallet)."""
     name = f"E2E Newcomer {who} {stamp}"
     return [
         Step(f"Open account setup from the '+' in the left rail and choose 'Create a new account' for newcomer {who}.",
-             [Cand("plus-then-create", "Click the '+' in the left rail, then the 'Create a new account' button.",
-                   [FOCUS, plus, ("wait", 1.5), PARK, ("click_text", "Create a new account"), ("wait", 1), PARK])],
+             [Cand("press-add-then-create", "Press the rail's 'Add account' (+) button, then the 'Create a new account' button.",
+                   [("press", "rail-add-account"), ("wait_id", "setup-create"), ("press", "setup-create"),
+                    ("wait_id", "setup-name"), PARK])],
              "The 'Create a new account' card is open with a 'Name (optional)' input and a 'Create — Enter' button.",
              tries=1, settle=1, cues=("Name (optional)", "Create — Enter", "Create a new account", "I already have a key")),
-        # tries=1: a second Enter would be a second account and wallet.
+        # tries=1: a second Create is a second account and wallet.
         Step(f"Type the name '{name}' and create the account.",
-             [Cand("name-then-enter", "Type the name (the input is already focused), then press Enter.",
-                   [FOCUS, ("type", name), ("wait", 0.4), ("key", "Return"), ("wait", 1)]),
-              Cand("name-then-button", "Type the name (the input is already focused), then click 'Create — Enter'.",
-                   [FOCUS, ("type", name), ("wait", 0.4), ("click_text", "Create — Enter"), ("wait", 1)])],
+             # Enter, not the button: it keeps the focus in the name input, where the
+             # later Enter that leaves setup has to land.
+             [Cand("name-then-enter", "Click into the Name input, type the name, then press Enter.",
+                   [FOCUS, ("click_id", "setup-name"), ("type", name), ("wait", 0.4), ("key", "Return"), ("wait", 1)])],
              "The account is being created, or the ready panel shows 'Coinos wallet ready'.",
              tries=1, settle=10, cues=("Coinos wallet ready", "Creating", "Create — Enter", "Couldn't")),
     ]
 
 
-async def newcomer(sc, who, stamp, plus):
-    steps = create_account(who, stamp, plus)
+async def newcomer(sc, who, stamp):
+    steps = create_account(who, stamp)
     if not await sc.step(steps[0], must_act=True, label=f"newcomer {who} setup"):
         return False
     if not await sc.step(steps[1], must_act=True, label=f"newcomer {who} create"):
         return False
-    # Live coinos.io plus a kind-0 publish: allow a minute.
-    screen = await sc.wait_for(["Coinos wallet ready"], ["failed"], timeout=60, every=4, label=f"newcomer {who} wallet")
+    # Live coinos.io plus a kind-0 publish: allow a minute. "Copy password"
+    # exists only after a Coinos signup in this session; the wording itself
+    # is a Label, so the screen confirms it.
+    await sc.suite.driver.act("wait_id", {"id": "wallet-copy-password", "secs": 60, "soft": True})
+    screen = await sc.wait_for(["Coinos wallet ready"], ["failed"], timeout=15, every=4, label=f"newcomer {who} wallet")
     if not sc.check_screen(f"newcomer {who}: Coinos wallet ready", ["Coinos wallet ready"], ["failed"], screen=screen):
         return False
     # Driven directly: the judge kept re-observing instead of pressing Enter.
-    # The ready panel's Dashboard button is below the fold at 1280x960; Enter
-    # leaves setup once the account is ready.
-    for kind, arg in (FOCUS, ("key", "Return"), ("wait", 1.5)):
+    # The ready panel's Dashboard button is below the fold at 1280x960 (and
+    # gpui cannot press it there); Enter in the setup input leaves setup.
+    for kind, arg in (FOCUS, ("key", "Return"), ("wait_id", {"id": "dash-heading", "soft": True})):
         await sc.suite.driver.act(kind, arg)
     label = f"newcomer {who} dashboard"
     met = await sc.step(Step("Confirm the Dashboard is shown.", [Cand("wait", "Wait 2 seconds.", [("wait", 2)])],
@@ -457,9 +487,14 @@ async def scenario_r(sc):
     meta["float_before_r"] = sc.box.float_sats()
     if not sc.check("float at least 250 sats (two payouts plus fees)", (meta["float_before_r"] or 0) >= 250, f"{meta['float_before_r']} sats"):
         return
+    # R drives by accessibility id: no bus, no R (before any account exists).
+    if not sc.check("accessibility bus up (python3-gi, at-spi, IsEnabled)", sc.box.a11y_up()):
+        return
     # Only the house starts in the store; the newcomers are made in the app.
-    store = sc.box.launch("R", sc.suite.run_id, target="instance", seed=False, nsecs=sc.box.keys["house"]["sec"])
+    store = sc.box.launch("R", sc.suite.run_id, target="instance", seed=False, nsecs=sc.box.keys["house"]["sec"], a11y=True)
     try:
+        if not await a11y_preflight(sc):
+            return
         await newcomers_flow(sc, name, stamp, store)
     finally:
         meta["float_after_r"] = sc.box.float_sats()
@@ -467,89 +502,177 @@ async def scenario_r(sc):
         sc.check("float dropped by two payouts, not more", 150 < spent <= 300, f"{meta['float_before_r']} -> {meta['float_after_r']} sats")
 
 
+async def a11y_preflight(sc):
+    """Before any newcomer is made: xwininfo is there, the app's window is
+    measurable, and its tree is on the bus (the rail's + is in it)."""
+    d = sc.suite.driver
+    from suite import dx
+    ok = sc.check("xwininfo in mc", dx("command -v xwininfo").returncode == 0)
+    try:
+        box = await d.window_box()
+        ok = sc.check("app window measured", True, str(box)) and ok
+    except RuntimeError as e:
+        ok = sc.check("app window measured", False, str(e)) and ok
+    try:
+        await d.act("wait_id", {"id": "rail-add-account", "secs": 20})
+        ok = sc.check("app tree on the accessibility bus (rail-add-account)", True) and ok
+    except RuntimeError as e:
+        ok = sc.check("app tree on the accessibility bus (rail-add-account)", False, str(e)) and ok
+    return ok
+
+
+def fill_by_id(name, cap):
+    """The seven bounty fields, each focused by its id: reward 100, `cap`,
+    min rank 2. Enter only in the last field, where it submits (Enter in
+    the others just moves on)."""
+    words = name.replace("-", " ")
+    do = [FOCUS]
+    for fid, text in (("item-singular", name), ("item-plural", name + "s"),
+                      ("description", f"{words}s for the e2e suite"), ("criteria", f"A {words} name, one per claim"),
+                      ("amount", "100"), ("cap", cap), ("min-rank", "2")):
+        do += [("click_id", f"bounty-form-{fid}"), ("key", "ctrl+a"), ("type", text), ("wait", 0.3)]
+    do += [("key", "Return"), ("stamp", "submitted"),
+           ("wait_id", {"id": "bounty-detail-title", "name": name, "secs": 45, "soft": True})]
+    return Cand("fill-and-publish",
+                f"Click each of the seven fields and type it: singular '{name}', plural, description, criteria, reward 100, cap {cap}, min rank 2; Enter in the last field publishes.",
+                do)
+
+
 async def newcomers_flow(sc, name, stamp, store):
-    import dataclasses, importlib
-    import demo_settled
-    replace = dataclasses.replace
-    if not await newcomer(sc, "A", stamp, SLOT2):
+    if not await newcomer(sc, "A", stamp):
         return
-    if not await newcomer(sc, "B", stamp, SLOT3):
+    if not await newcomer(sc, "B", stamp):
         return
     sc.check("house plus two app-made accounts with Coinos wallets",
              sc.box.accounts_in_store(store) == 3 and sc.box.wallet_accounts_in_store(store) == 2,
              f"{sc.box.accounts_in_store(store)} accounts, {sc.box.wallet_accounts_in_store(store)} app-made with a wallet")
     # The house issues one bounty that pays two claims, then closes.
-    os.environ["LIST_NAME"], os.environ["CLAIM_ITEM"] = name, f"E2E Newcomer A {stamp}"
-    import demo_bounty, demo_claim
-    for m in (demo_bounty, demo_claim):
-        importlib.reload(m)   # they read LIST_NAME / CLAIM_ITEM at import
-    b = demo_bounty.STEPS
+    house_tab = Cand("press-house-tab", "Press the house issuer's account tab in the left rail, then the sidebar's Bounties tab.",
+                     [("press", f"rail-account-{sc.box.keys['house']['pub']}")] + TO_BOUNTIES
+                     + [("wait_id", {"id": "bounties-new", "has": ["New DList + bounty"]})])
     if not await sc.step(Step("Show the Bounties screen with the house issuer selected (its header button reads 'New DList + bounty').",
-                              [HOUSE, BOUNTIES], "The Bounties screen is shown and its header button reads 'New DList + bounty'.",
-                              settle=2, cues=HOUSE_CUES), must_act=True, label="house on bounties"):
+                              [house_tab], "The Bounties screen is shown and its header button reads 'New DList + bounty'.",
+                              settle=1, cues=HOUSE_CUES), must_act=True, label="house on bounties"):
         return
-    if not sc.check_screen("house selected", ["New DList + bounty"], ["Submit a bounty claim"]):
+    new_name = a11y_name(sc, "bounties-new") or ""
+    ok = sc.check_screen("house selected", ["New DList + bounty"], ["Submit a bounty claim"])
+    if not (sc.check("house selected (bounties-new)", "New DList + bounty" in new_name, repr(new_name)) and ok):
         return
-    if not await sc.steps_(b[:3]):
+    if not await sc.step(Step("Open the new bounty form as the house issuer.",
+                              [Cand("press-new-bounty", "Press the '+ New DList + bounty' button.",
+                                    [("press", "bounties-new"), ("wait_id", "bounty-form-item-singular"), PARK])],
+                              "A form titled 'New DList + bounty' is open.", settle=1, cues=("New DList", "Cancel")),
+                         label="open form"):
         return
-    # Gate: FILL ends in Enter, which in a claim form would claim and pay.
-    if not sc.check_screen("the house's New DList + bounty form is open", ["New DList + bounty", "Cancel (esc)"],
-                           ["Claim an item on", "Submit a bounty claim"]):
+    # Gate: the last Enter publishes; in a claim form it would claim and pay.
+    form = a11y_name(sc, "bounty-form")
+    ok = sc.check_screen("the house's New DList + bounty form is open", ["New DList + bounty", "Cancel (esc)"],
+                         ["Claim an item on", "Submit a bounty claim"])
+    ok = sc.check("bounty-form is the house's new list, no claim-form",
+                  form == "New DList + bounty" and a11y_count(sc, "claim-form") == 0, f"bounty-form {form!r}") and ok
+    if not ok:
         await sc.suite.driver.act("key", "Escape")
         return
     # cap 200 = two payouts of 100; tries=1: a retried Enter is a second bounty.
-    publish = replace(b[3], tries=1, cands=[fill(name, cap="200")] + b[3].cands[1:])
+    publish = Step("Fill the bounty form and publish it.",
+                   [fill_by_id(name, "200"), Cand("cancel-form", "Press the form's 'Cancel (esc)' button.", [("press", "bounty-form-cancel")])],
+                   "The new bounty is listed and auto-pay is armed.", tries=1, settle=1,
+                   cues=(name, "Auto-pay armed", "watching for claims"))
     if not await sc.step(publish, must_act=True, label="publish bounty"):
         return
+    # top-auto-pay is in the tree while a bounty is focused; its wording is a Label.
+    await sc.suite.driver.act("wait_id", {"id": "top-auto-pay", "secs": 20, "soft": True})
     await sc.wait_for(["Auto-pay armed"], timeout=20, every=3, label="auto-pay armed")
     if not sc.check_screen("auto-pay armed on the new bounty", ["Auto-pay armed"]):
         return
-    for who, slot in (("A", SLOT2), ("B", SLOT3)):
+    for who in ("A", "B"):
         item = f"E2E Newcomer {who} {stamp}"
-        os.environ["CLAIM_ITEM"] = item
-        importlib.reload(demo_claim)
-        c = demo_claim.ALL
-        # Pick the newcomer by rail slot: demo_claim's own select step names
-        # the second avatar only, which is A.
         select = Step(f"Select newcomer {who} in the left rail and show Bounties (the header button reads 'Submit a bounty claim').",
-                      [Cand(f"newcomer-{who}-avatar", f"Click newcomer {who}'s avatar in the left rail, then press super+2 for Bounties.",
-                            [FOCUS, slot, ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])],
-                      "The Bounties header button reads 'Submit a bounty claim'.", settle=3,
+                      [Cand(f"press-newcomer-{who}-tab", f"Press newcomer {who}'s account tab in the left rail, then the sidebar's Bounties tab.",
+                            [("press", {"id": RAIL_ACCOUNT, "name": item})] + TO_BOUNTIES
+                            + [("wait_id", {"id": "bounties-new", "has": ["Submit a bounty claim"]})])],
+                      "The Bounties header button reads 'Submit a bounty claim'.", settle=1,
                       cues=("Submit a bounty claim", "New DList + bounty"))
         if not await sc.step(select, must_act=True, label=f"select newcomer {who}"):
             return
-        # Gate on the sidebar's account name (the main pane also lists A's
-        # claim on B's turn, so only the sidebar OCR pass is read for names).
+        # Gate on the account: the sidebar chip's name, from the tree and from
+        # the sidebar OCR pass (the main pane also lists A's claim on B's turn).
         other = "B" if who == "A" else "A"
         sidebar = sc.screen.split("\n[sidebar]\n")[-1] if "\n[sidebar]\n" in sc.screen else ""
+        chip = a11y_name(sc, "sidebar-account")
         ok = sc.check_screen(f"newcomer {who} selected (header)", ["Submit a bounty claim"], ["New DList + bounty"])
         ok = sc.check_screen(f"newcomer {who} selected (sidebar name)", [item], [f"E2E Newcomer {other} {stamp}"], screen=sidebar) and ok
+        ok = sc.check(f"newcomer {who} selected (sidebar-account)", chip == item, repr(chip)) and ok
         if not ok:
             await sc.suite.driver.act("key", "Escape")
             return
         # Baseline from the Bounties pane, before the claim form can hide A's card.
         n_settled = sc.count("Payment settled")
-        if not await sc.step(c[1], label=f"open claim form {who}"):
+        open_form = Step("Open the claim form for this run's bounty.",
+                         # The list runs oldest first, so this run's row can sit
+                         # below the fold, where it cannot be pressed; the bounty
+                         # stays selected from its creation.
+                         [Cand("claim-on-selected", f"'{name}' is already open in the detail pane: press the '+ Submit a bounty claim' button.",
+                               [("wait_id", {"id": "bounty-detail-title", "name": name, "secs": 3}),
+                                ("press", "bounties-new"), ("wait_id", "claim-form-item-name"), PARK]),
+                          Cand("press-row-then-claim", f"Press the '{name}' row in the bounty list, then the '+ Submit a bounty claim' button.",
+                               [("press", {"id": BOUNTY_ROW, "name": name}), ("wait_id", {"id": "bounty-detail-title", "name": name}),
+                                ("press", "bounties-new"), ("wait_id", "claim-form-item-name"), PARK])],
+                         "A claim form is open (a 'Cancel' control is visible and the 'Submit a bounty claim' button is gone).",
+                         settle=1, cues=("Cancel", "Submit a bounty claim"))
+        if not await sc.step(open_form, label=f"open claim form {who}"):
             return
         # Gate: the claim form must be on this run's bounty, or we'd pay another one.
-        if not sc.check_screen(f"newcomer {who}: claim form is on this run's bounty", [f"Claim an item on {name}"]):
+        form = a11y_name(sc, "claim-form") or ""
+        ok = sc.check_screen(f"newcomer {who}: claim form is on this run's bounty", [f"Claim an item on {name}"])
+        # The exact label (src/bounties.rs claim form): this run's list and
+        # its 100-sat reward, proven before the paying Enter.
+        want = f"Claim an item on {name} · 100 sats per item"
+        ok = sc.check(f"newcomer {who}: claim-form names this run's list and 100 sats", form == want, repr(form)) and ok
+        if not ok:
             await sc.suite.driver.act("key", "Escape")
             sc.notes.append(f"claim form for {who} was not on this run's bounty; cancelled, nothing claimed")
             return
-        # tries=1: a second submit is a second payout.
-        # The pane lists every claim, so A's settled card is on screen when B
-        # acts: count occurrences against what was there before this submit.
-        if not await sc.step(replace(c[2], tries=1), must_act=True, label=f"submit claim {who}"):
+        # tries=1: a second submit is a second payout. No cancel candidate:
+        # the gate has passed, and a cancel here strands an open auto-pay bounty.
+        submit = Step("Submit the claim.",
+                      [Cand("type-item-and-submit", f"Click into the Item name input, type '{item}' and press Enter to publish the claim.",
+                            [FOCUS, ("click_id", "claim-form-item-name"), ("type", item), ("wait", 0.3), ("key", "Return"),
+                             ("wait_id", {"id": CLAIM_CARD, "name": item, "secs": 20, "soft": True})])],
+                      "The claim card shows 'Claim submitted'.", tries=1, settle=1, cues=("Claim submitted", item))
+        if not await sc.step(submit, must_act=True, label=f"submit claim {who}"):
             return
-        await sc.step(replace(c[3], tries=6), label=f"wait for settlement {who}")
-        screen = await sc.wait_for(["Payment settled", "Payment receipt"], ["Auto-pay failed"], timeout=150, every=10, label=f"settle poll {who}")
-        if has_failed(screen):
+        # This claim's card, by its item name; its receipt row appears once
+        # the zap receipt is in (the payment wording is a Label: the screen).
+        card = None
+        try:
+            card = sc.suite.driver.a11y("name", CLAIM_CARD, name=item)["id"]
+        except RuntimeError as e:
+            sc.notes.append(f"a11y: newcomer {who}'s claim card: {e}"[:300])
+        wait, tries = Cand("wait-for-settlement", "Wait 20 seconds for the auto-pay watcher to pay and the zap receipt to arrive.", [("wait", 20)]), 6
+        if card:
+            wait, tries = Cand("wait-for-receipt", "Wait up to 150 seconds for this claim's card to show its payment receipt.",
+                               [("wait_id", {"id": f"{card}-receipt", "secs": 150, "soft": True})]), 2
+        await sc.step(Step("Wait for the payment to settle.", [wait],
+                           "The claim card shows 'Payment settled' or 'Zap receipt'.", settle=1, tries=tries,
+                           cues=("Payment settled", "Zap receipt", "Auto-pay failed")), label=f"wait for settlement {who}")
+        screen = sc.screen
+        if not (card and a11y_count(sc, f"{card}-receipt") == 1):
+            # The receipt row did not confirm: the old screen poll.
+            screen = await sc.wait_for(["Payment settled", "Payment receipt"], ["Auto-pay failed"], timeout=150, every=10, label=f"settle poll {who}")
+        if has_failed(screen) or has_failed(sc.screen):
             sc.notes.append(f"Auto-pay failed on newcomer {who}'s claim card; not retried, not reset")
-        await sc.step(demo_settled.STEPS[0], label=f"settled after refresh {who}")
+        await sc.step(Step("Show the bounty's claim card with its latest payment state.",
+                           [Cand("refresh-bounties", "Press the sidebar's Bounties tab, then super+r to refetch.",
+                                 [("press", "nav-bounties"), FOCUS, ("key", "super+r")])],
+                           "The claim card shows 'Payment settled' or 'Zap receipt'.", settle=4,
+                           cues=("Payment settled", "Zap receipt")), label=f"settled after refresh {who}")
         both = sc.screen + "\n" + screen
         sc.check_screen(f"newcomer {who}: claim item on screen, no Auto-pay failed", [item, "Payment receipt"], ["Auto-pay failed"], screen=both)
         n = max(sc.count("Payment settled", sc.screen), sc.count("Payment settled", screen))
         sc.check(f"newcomer {who}: a new Payment settled card ({n} now, {n_settled} before)", n >= n_settled + 1)
+        if card:
+            sc.check(f"newcomer {who}: this claim's card has its receipt row", a11y_count(sc, f"{card}-receipt") == 1, card[:16])
 
 
 # ------------------------------------------------------------ L..Q: trust
