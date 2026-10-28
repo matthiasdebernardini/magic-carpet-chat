@@ -16,6 +16,7 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::events::{self, Receipt};
+use crate::trust::INSTANCE_MIN_RANK;
 
 pub const API_BASE: &str = "https://magic-carpet.brainstorm.world";
 
@@ -131,6 +132,10 @@ pub struct Bounty {
     pub derived_status: Option<String>,
     #[serde(rename = "paymentState", default)]
     pub payment_state: Option<PaymentState>,
+    /// The issuer's rank of the viewer, sent only by the eligible list
+    /// (magic-carpet-v2/src/api/bounties.js:310). A number, int or float.
+    #[serde(rename = "issuerRank", default)]
+    pub issuer_rank: Option<f64>,
 }
 
 fn truthy(value: &Option<serde_json::Value>) -> bool {
@@ -157,6 +162,29 @@ impl Bounty {
             .or(self.status.as_deref())
             .unwrap_or("unknown")
     }
+
+    /// The rank a claimant needs before this bounty pays: the instance floor,
+    /// raised to `auto_pay_min_rank` (server default 3) when auto-pay is on.
+    /// Mirrors magic-carpet-v2/src/services/paymentService.js:45 and the
+    /// column default at src/db/bounties.js:35.
+    pub fn effective_min_rank(&self) -> u64 {
+        if self.auto_pay_on() {
+            INSTANCE_MIN_RANK.max(self.auto_pay_min_rank.unwrap_or(3))
+        } else {
+            INSTANCE_MIN_RANK
+        }
+    }
+}
+
+/// The eligible list as the viewer can act on it. The server keeps the
+/// viewer's own bounties (rank 100 for self) and anything rank 2 passes
+/// (magic-carpet-v2/src/api/bounties.js:309), so own bounties and bounties
+/// whose effective minimum the viewer's rank misses are dropped here.
+pub fn claimable_by(list: Vec<Bounty>, viewer: &str) -> Vec<Bounty> {
+    list.into_iter()
+        .filter(|b| b.issuer_pubkey != viewer)
+        .filter(|b| b.issuer_rank.unwrap_or(0.0) >= b.effective_min_rank() as f64)
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -331,8 +359,11 @@ struct BountyListResponse {
 /// Split from the network call so the list parse is testable offline, like
 /// [`parse_detail`].
 pub(crate) fn parse_bounty_list(json: &str) -> Result<Vec<Bounty>, ApiError> {
-    let resp: BountyListResponse =
-        serde_json::from_str(json).map_err(|e| ApiError::Decode(e.to_string()))?;
+    bounty_list(serde_json::from_str(json).map_err(|e| ApiError::Decode(e.to_string()))?)
+}
+
+/// The `success` check every bounty-list reply goes through.
+fn bounty_list(resp: BountyListResponse) -> Result<Vec<Bounty>, ApiError> {
     if !resp.success {
         return Err(ApiError::Rejected(resp.error.unwrap_or_else(|| {
             "The Magic Carpet server gave no reason.".into()
@@ -522,6 +553,22 @@ impl Api {
             });
         }
         parse_bounty_list(&text)
+    }
+
+    /// GET /api/bounties/eligible?viewer=… — open bounties whose issuer
+    /// ranks the viewer at 2 or more, each with `issuerRank`. Needs a prior
+    /// `login` as `viewer` on this same `Api`: 401 without a session, 403 when
+    /// the viewer is not the session pubkey
+    /// (magic-carpet-v2/src/api/bounties.js:294-320).
+    pub async fn eligible_bounties(&self, viewer: &str) -> Result<Vec<Bounty>, ApiError> {
+        let response = self
+            .http
+            .get(format!("{}/api/bounties/eligible", self.base))
+            .query(&[("viewer", viewer)])
+            .send()
+            .await
+            .map_err(|e| ApiError::Http(e.to_string()))?;
+        bounty_list(Self::read(response).await?)
     }
 
     pub async fn get_bounty(&self, id: &str) -> Result<BountyDetail, ApiError> {
@@ -731,5 +778,97 @@ mod tests {
 
         let err = parse_bounty_list(r#"{"success":false,"error":"nope"}"#).unwrap_err();
         assert!(matches!(err, ApiError::Rejected(ref m) if m == "nope"));
+    }
+
+    fn eligible_row(issuer: &str, rank: serde_json::Value, extra: serde_json::Value) -> Bounty {
+        let mut row = serde_json::json!({
+            "id": format!("{issuer}-{rank}"),
+            "issuer_pubkey": issuer,
+            "list_coordinate": "39998:aa:us-city",
+            "amount_sats": 100,
+            "issuerRank": rank,
+        });
+        if let (Some(row), Some(extra)) = (row.as_object_mut(), extra.as_object()) {
+            row.extend(extra.clone());
+        }
+        serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn issuer_rank_reads_as_int_float_or_absent() {
+        let none = serde_json::json!({});
+        assert_eq!(
+            eligible_row("aa", 3.into(), none.clone()).issuer_rank,
+            Some(3.0)
+        );
+        assert_eq!(
+            eligible_row("aa", serde_json::json!(2.5), none.clone()).issuer_rank,
+            Some(2.5)
+        );
+        assert_eq!(
+            eligible_row("aa", serde_json::Value::Null, none).issuer_rank,
+            None
+        );
+        let fixture: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let bounty: Bounty = serde_json::from_value(fixture["bounty"].clone()).unwrap();
+        assert_eq!(bounty.issuer_rank, None);
+    }
+
+    #[test]
+    fn the_effective_minimum_follows_the_server_payment_rule() {
+        let min = |extra| eligible_row("aa", 2.into(), extra).effective_min_rank();
+        assert_eq!(min(serde_json::json!({})), 2);
+        assert_eq!(
+            min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 5})),
+            2
+        );
+        assert_eq!(
+            min(serde_json::json!({"auto_pay": 1, "auto_pay_min_rank": 3})),
+            3
+        );
+        assert_eq!(
+            min(serde_json::json!({"auto_pay": 1, "auto_pay_min_rank": 1})),
+            2
+        );
+        assert_eq!(min(serde_json::json!({"auto_pay": 1})), 3);
+    }
+
+    #[test]
+    fn claimable_drops_own_bounties_and_ranks_below_the_auto_pay_minimum() {
+        let auto3 = serde_json::json!({"auto_pay": 1, "auto_pay_min_rank": 3});
+        let manual = serde_json::json!({});
+        let list = vec![
+            eligible_row("me", 100.into(), manual.clone()),
+            eligible_row("aa", 2.into(), auto3.clone()),
+            eligible_row("bb", 2.into(), manual),
+            eligible_row("cc", 3.into(), auto3),
+        ];
+        let ids: Vec<String> = claimable_by(list, "me").into_iter().map(|b| b.id).collect();
+        assert_eq!(ids, ["bb-2", "cc-3"]);
+    }
+
+    #[test]
+    fn an_eligible_reply_parses_through_the_list_path() {
+        let reply = serde_json::json!({
+            "success": true,
+            "bounties": [{
+                "id": "e1",
+                "issuer_pubkey": "aa",
+                "list_coordinate": "39998:aa:us-city",
+                "amount_sats": 21,
+                "status": "open",
+                "derivedStatus": "open",
+                "auto_pay": 1,
+                "auto_pay_min_rank": 3,
+                "issuerRank": 4,
+            }],
+        });
+        let list = parse_bounty_list(&reply.to_string()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].issuer_rank, Some(4.0));
+        assert_eq!(list[0].effective_min_rank(), 3);
+
+        let err = parse_bounty_list(r#"{"success":false}"#).unwrap_err();
+        assert!(matches!(err, ApiError::Rejected(_)));
     }
 }

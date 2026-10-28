@@ -7,11 +7,18 @@ The mode lives in $E2E_DIR/mode.json and is re-read on every request:
    "scan": ok|fail, "dup_coordinate": "<39998:pubkey:dtag or empty>",
    "graperank": "ok"|"429"|"403"|"503"|[answers consumed one per call],
    "setup": "ok"|"404", "delay_secs": 0,
-   "run": [steps of a graperank run, one per graperankResult poll]}
+   "run": [steps of a graperank run, one per graperankResult poll],
+   "eligible": {"<viewer hex>": [[id, coord, issuerRank, auto_pay_min_rank|null, criteria], ...]},
+   "eligible_delay": {"<viewer hex>": secs}}
 A run step is "waiting", "calculating", "publishing", "done" or "fail:<CODE>"
 (an `error.code` such as NO_ELIGIBLE_USERS). The default run is waiting ->
 calculating -> publishing -> done; the last step repeats. Each accepted
 graperank POST starts the run over.
+GET /api/bounties/eligible needs the sid cookie login-user set: 401 without
+one, 403 when ?viewer= is not the session pubkey, like
+magic-carpet-v2/src/api/bounties.js:294-320. A null auto_pay_min_rank is a
+manual-pay row. GET /api/bounties/<id> answers an id the eligible route
+served with that row, even after the mode drops it.
 Writing the mode file resets the create counter. Every request is appended to
 $E2E_DIR/server.log; the suite reads that log for its request checks.
 
@@ -34,7 +41,9 @@ DIR = os.environ.get("E2E_DIR", "/tmp/e2e")
 MODE = os.path.join(DIR, "mode.json")
 LOG = os.path.join(DIR, "server.log")
 state = {"mtime": None, "creates": 0, "made": {}, "grape": [],   # made: bounties created here, by id
-         "polls": None, "finished": None}   # polls: graperankResult reads since the last accepted run
+         "polls": None, "finished": None,   # polls: graperankResult reads since the last accepted run
+         "eligible_seen": {}}   # eligible rows served, by id, without issuerRank (the detail route has none)
+SESSIONS = {}   # sid cookie -> the pubkey that logged in with it
 
 BS_PORT = int(os.environ.get("BS_PORT", "8788"))
 BS_PROVIDER = "c63c30b4e2f7966c3e329149dbdb5d5e0898b5cb4ddf1f97ed5011fe5b91c025"
@@ -45,7 +54,8 @@ BS_CHALLENGES = {}   # hex -> challenge, kept only until verify
 def mode():
     m = {"create": "ok", "hang_secs": 45, "scan": "ok", "dup_coordinate": "",
          "graperank": "ok", "setup": "ok", "delay_secs": 0,
-         "run": ["waiting", "calculating", "publishing", "done"]}
+         "run": ["waiting", "calculating", "publishing", "done"],
+         "eligible": {}, "eligible_delay": {}}
     try:
         st = os.stat(MODE)
         if st.st_mtime != state["mtime"]:
@@ -64,11 +74,18 @@ def log(line):
         f.write("%.3f %s\n" % (time.time(), line))
 
 
-def bounty(bid, coord, status="open", criteria="e2e"):
+def bounty(bid, coord, status="open", criteria="e2e", issuerRank=None, auto_pay=False, auto_pay_min_rank=None):
     parts = coord.split(":")
-    return {"id": bid, "issuer_pubkey": parts[1] if len(parts) >= 3 else "",
-            "list_coordinate": coord, "amount_sats": 100, "criteria": criteria,
-            "created_at": int(time.time()), "status": status, "derivedStatus": status}
+    b = {"id": bid, "issuer_pubkey": parts[1] if len(parts) >= 3 else "",
+         "list_coordinate": coord, "amount_sats": 100, "criteria": criteria,
+         "created_at": int(time.time()), "status": status, "derivedStatus": status}
+    if issuerRank is not None:
+        b["issuerRank"] = issuerRank
+    if auto_pay:
+        b["auto_pay"] = 1
+    if auto_pay_min_rank is not None:
+        b["auto_pay_min_rank"] = auto_pay_min_rank
+    return b
 
 
 class H(BaseHTTPRequestHandler):
@@ -105,10 +122,16 @@ class H(BaseHTTPRequestHandler):
             bs += list(state["made"].values())
             log("GET /api/bounties issuer=%s -> %d bounties" % (q.get("issuer", ["?"])[0][:8], len(bs)))
             return self.send(200, {"success": True, "bounties": bs})
+        # Before the "/api/bounties/<id>" branch, like the server's route order.
+        if u.path == "/api/bounties/eligible":
+            return self.eligible(m, q)
         if u.path.startswith("/api/bounties/"):
             bid = u.path.rsplit("/", 1)[1]
             log("GET /api/bounties/%s" % bid)
-            made = state["made"].get(bid) or bounty(bid, m["dup_coordinate"] or "39998:00:x")
+            # An id the eligible route served answers with its own coordinate
+            # and issuer, even after the mode drops it from the list.
+            made = (state["made"].get(bid) or state["eligible_seen"].get(bid)
+                    or bounty(bid, m["dup_coordinate"] or "39998:00:x"))
             return self.send(200, {"success": True, "bounty": made, "claims": []})
         if u.path == "/api/strfry/scan":
             f = q.get("filter", [""])[0]
@@ -119,6 +142,35 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"success": True, "events": []})
         log("GET %s -> 404" % u.path)
         self.send(404, {"error": "not found"})
+
+    def session(self):
+        """The pubkey behind this request's sid cookie, or None."""
+        sid = re.search(r"(?:^|;\s*)sid=([0-9a-f]+)", self.headers.get("Cookie") or "")
+        return SESSIONS.get(sid.group(1)) if sid else None
+
+    def eligible(self, m, q):
+        who = self.session()
+        viewer = (q.get("viewer", [who or ""])[0] or "").lower()
+        if not who:
+            log("GET /api/bounties/eligible viewer=%s session=none -> 401" % viewer[:8])
+            return self.send(401, {"success": False, "error": "Not authenticated"})
+        if not re.fullmatch(r"[0-9a-f]{64}", viewer):
+            log("GET /api/bounties/eligible viewer=%s session=%s -> 400" % (viewer[:8], who[:8]))
+            return self.send(400, {"success": False, "error": "viewer must be a 64-char hex pubkey"})
+        if viewer != who:
+            log("GET /api/bounties/eligible viewer=%s session=%s -> 403" % (viewer[:8], who[:8]))
+            return self.send(403, {"success": False, "error": "viewer must match session pubkey"})
+        rows = (m.get("eligible") or {}).get(viewer, [])
+        bs = [bounty(bid, coord, criteria=crit, issuerRank=rank, auto_pay=apm is not None, auto_pay_min_rank=apm)
+              for bid, coord, rank, apm, crit in rows]
+        for b in bs:
+            state["eligible_seen"][b["id"]] = {k: v for k, v in b.items() if k != "issuerRank"}
+        log("GET /api/bounties/eligible viewer=%s session=%s -> %d" % (viewer[:8], who[:8], len(bs)))
+        d = float((m.get("eligible_delay") or {}).get(viewer) or 0)
+        if d > 0:
+            time.sleep(d)
+            log("   eligible reply for %s after %.0f s" % (viewer[:8], d))
+        return self.send(200, {"success": True, "bounties": bs})
 
     def made(self, coord, b):
         """A created bounty, remembered so list and detail reads agree."""
@@ -134,8 +186,11 @@ class H(BaseHTTPRequestHandler):
             log("POST verify-user")
             return self.send(200, {"authorized": True, "challenge": uuid.uuid4().hex})
         if u.path == "/api/auth/login-user":
-            log("POST login-user")
-            return self.send(200, {"success": True}, [("Set-Cookie", "sid=%s; Path=/" % uuid.uuid4().hex)])
+            pubkey = ((b.get("event") or {}).get("pubkey") or "").lower()
+            sid = uuid.uuid4().hex
+            SESSIONS[sid] = pubkey
+            log("POST login-user pubkey=%s" % pubkey[:8])
+            return self.send(200, {"success": True}, [("Set-Cookie", "sid=%s; Path=/" % sid)])
         if u.path == "/api/strfry/publish":
             log("POST strfry/publish kind=%s" % b.get("event", {}).get("kind"))
             return self.send(200, {"success": True})
