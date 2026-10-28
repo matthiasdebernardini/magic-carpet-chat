@@ -1116,7 +1116,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
         let npub_text = SharedString::from(npub.clone());
         Some(
             h_flex()
-                .a11y(row_id.clone(), Role::ListItem, format!("{name} {npub}"))
+                .a11y(row_id.clone(), Role::Group, format!("{name} {npub}"))
                 .items_center()
                 .gap(px(10.))
                 .bg(rgb(BG_APP))
@@ -1262,7 +1262,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     h_flex()
                         .a11y(
                             row_id.clone(),
-                            Role::ListItem,
+                            Role::Group,
                             format!("{label} {hint_text}").trim().to_string(),
                         )
                         .items_center()

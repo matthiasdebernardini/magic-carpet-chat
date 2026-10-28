@@ -342,7 +342,7 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
         None => format!("dash-attention-{}", row.kind),
     };
     h_flex()
-        .a11y(row_id.clone(), Role::ListItem, row_key.clone())
+        .a11y(row_id.clone(), Role::Group, row_key.clone())
         .aria_description(row.description.clone())
         .gap(px(11.))
         .items_start()
@@ -486,7 +486,7 @@ fn activity_row(event: &ActivityItem, now: u64, id: String) -> AnyElement {
     );
 
     h_flex()
-        .a11y(id.clone(), Role::ListItem, event.text.clone())
+        .a11y(id.clone(), Role::Group, event.text.clone())
         .aria_description(meta.clone())
         .gap(px(11.))
         .items_start()

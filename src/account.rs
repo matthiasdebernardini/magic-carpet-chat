@@ -436,7 +436,7 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
         .rounded(px(14.))
         .px(px(20.))
         .py(px(18.))
-        .a11y(card_id.clone(), Role::ListItem, name.clone())
+        .a11y(card_id.clone(), Role::Group, name.clone())
         .child(Shell::account_marker(view, ix, 46., 16.))
         .child(
             v_flex()

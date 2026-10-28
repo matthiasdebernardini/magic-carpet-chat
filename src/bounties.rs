@@ -536,7 +536,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
     let item = claim.item_name().to_string();
     let by = format!("by {}", short_id(&claim.event.pubkey));
     v_flex()
-        .a11y(cid.clone(), Role::ListItem, item.clone())
+        .a11y(cid.clone(), Role::Group, item.clone())
         .px(px(14.))
         .py(px(11.))
         .rounded(px(10.))
