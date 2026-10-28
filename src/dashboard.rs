@@ -4,6 +4,8 @@
 //! (no account, relay down, list failures) and "Recent activity" is the feed
 //! the nostr runtime's updates write, newest first.
 
+use std::collections::HashMap;
+
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::component::{h_flex, v_flex};
@@ -11,6 +13,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use magic_carpet_chat::api;
 use magic_carpet_chat::nostr;
 
+use crate::a11y::Accessible;
 use crate::account::Tab;
 use crate::palette::*;
 use crate::shell::{ActivityItem, Load, Shell, account_hue, display_name, initials};
@@ -96,6 +99,10 @@ pub fn remote_avatar(
 
 /// A count in a soft accent pill — the badge beside "Needs attention".
 pub fn count_badge(count: impl Into<SharedString>) -> impl IntoElement {
+    badge_div(count.into())
+}
+
+fn badge_div(count: SharedString) -> Div {
     div()
         .px(px(7.))
         .py(px(1.))
@@ -105,10 +112,12 @@ pub fn count_badge(count: impl Into<SharedString>) -> impl IntoElement {
         .text_size(px(10.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(ACCENT_LIGHT))
-        .child(count.into())
+        .child(count)
 }
 
+/// `id` is the screen-wide prefix: `<id>-heading`, `<id>-count`, `<id>-list`.
 fn card(
+    id: &'static str,
     title: &'static str,
     badge: Option<String>,
     rows: Vec<AnyElement>,
@@ -131,11 +140,22 @@ fn card(
                     div()
                         .text_size(px(14.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
+                        .child(title)
+                        .a11y(format!("{id}-heading"), Role::Heading, title),
                 )
-                .when_some(badge, |this, badge| this.child(count_badge(badge))),
+                .when_some(badge, |this, badge| {
+                    this.child(badge_div(badge.clone().into()).a11y(
+                        format!("{id}-count"),
+                        Role::Label,
+                        badge,
+                    ))
+                }),
         )
-        .child(v_flex().children(rows))
+        .child(
+            v_flex()
+                .children(rows)
+                .a11y(format!("{id}-list"), Role::List, title),
+        )
 }
 
 /// What a row's button does. Navigation rows open the account's Trust tab;
@@ -163,6 +183,8 @@ impl Action {
 /// A derived "Needs attention" row. `avatar` marks the account a row is
 /// about — initials, hue pair, and the name for the title tooltip.
 struct Attention {
+    /// Stable kebab slug of what this row is about; part of its a11y id.
+    kind: &'static str,
     dot: u32,
     title: String,
     description: String,
@@ -171,8 +193,9 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(dot: u32, title: String, description: String) -> Self {
+    fn new(kind: &'static str, dot: u32, title: String, description: String) -> Self {
         Self {
+            kind,
             dot,
             title,
             description,
@@ -207,6 +230,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
     // claiming. The bounty list needs none: it is the house issuer's.
     if shell.active_view().is_none() {
         rows.push(Attention::new(
+            "read-only",
             TEXT_DIM,
             "Read-only — add an account to claim".into(),
             "Click the + button in the left bar to create an account or paste a \
@@ -216,6 +240,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
     }
     if !shell.relay_connected {
         rows.push(Attention::new(
+            "relay-disconnected",
             AMBER,
             "Relay disconnected".into(),
             format!(
@@ -226,7 +251,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
     }
     if let Load::Failed(message) = &shell.bounties {
         rows.push(
-            Attention::new(RED, "Bounty list unavailable".into(), message.clone())
+            Attention::new("bounty-list-unavailable", RED, "Bounty list unavailable".into(), message.clone())
                 .action(Action::Refresh),
         );
     }
@@ -238,25 +263,29 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         };
         let pubkey = || view.pubkey.clone();
         if let Some(verdict) = state.needs_map() {
-            let description = match verdict {
-                MapVerdict::Missing => {
-                    "No kind-10040 event found — other apps can’t locate your rank provider."
-                }
-                MapVerdict::Deactivated => {
-                    "Your Treasure Map is empty, so other apps can’t find your score provider. Click Fix to republish it."
-                }
-                MapVerdict::NoRankRow => {
-                    "Your Treasure Map has no rank entry, so apps can’t look up your rank. Click Fix to see what is missing."
-                }
+            let (kind, description) = match verdict {
+                MapVerdict::Missing => (
+                    "map-missing",
+                    "No kind-10040 event found — other apps can’t locate your rank provider.",
+                ),
+                MapVerdict::Deactivated => (
+                    "map-deactivated",
+                    "Your Treasure Map is empty, so other apps can’t find your score provider. Click Fix to republish it.",
+                ),
+                MapVerdict::NoRankRow => (
+                    "map-no-rank-row",
+                    "Your Treasure Map has no rank entry, so apps can’t look up your rank. Click Fix to see what is missing.",
+                ),
             };
             rows.push(
-                Attention::new(AMBER, "Publish your Treasure Map".into(), description.into())
+                Attention::new(kind, AMBER, "Publish your Treasure Map".into(), description.into())
                     .action(Action::OpenTrust(pubkey()))
                     .for_account(view, ix),
             );
         } else if let Some(message) = state.map_unreadable() {
             rows.push(
                 Attention::new(
+                    "map-unreadable",
                     AMBER,
                     "Couldn’t check your Treasure Map".into(),
                     message.to_string(),
@@ -268,6 +297,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         if state.no_follows() {
             rows.push(
                 Attention::new(
+                    "no-follows",
                     AMBER,
                     "Follow someone".into(),
                     "Trust scores can’t be calculated for an empty follow list.".into(),
@@ -279,6 +309,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         if state.no_verified_follower() {
             rows.push(
                 Attention::new(
+                    "no-verified-follower",
                     AMBER,
                     "Gain a follower".into(),
                     "You need at least one verified follower for a trust score.".into(),
@@ -306,7 +337,13 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
     // The title keys the avatar's element id; it moves into the row text
     // before the avatar closure runs, so take a copy up front.
     let row_key = row.title.clone();
+    let row_id = match &row.avatar {
+        Some((_, _, _, pubkey)) => format!("dash-attention-{pubkey}-{}", row.kind),
+        None => format!("dash-attention-{}", row.kind),
+    };
     h_flex()
+        .a11y(row_id.clone(), Role::ListItem, row_key.clone())
+        .aria_description(row.description.clone())
         .gap(px(11.))
         .items_start()
         .py(px(11.))
@@ -332,7 +369,8 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                             div()
                                 .text_size(px(13.))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(SharedString::from(row.title)),
+                                .child(SharedString::from(row.title))
+                                .a11y(format!("{row_id}-title"), Role::Label, row_key.clone()),
                         )
                         .when_some(row.avatar, |this, (letters, hue, name, pubkey)| {
                             this.child(
@@ -352,7 +390,12 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                         .mt(px(2.))
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_MUTED))
-                        .child(SharedString::from(row.description)),
+                        .child(SharedString::from(row.description.clone()))
+                        .a11y(
+                            format!("{row_id}-description"),
+                            Role::Label,
+                            row.description,
+                        ),
                 ),
         )
         .when(has_action, |this| {
@@ -377,6 +420,7 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                     .text_size(px(11.5))
                     .text_color(rgb(ACCENT_LIGHT))
                     .child(label)
+                    .a11y(format!("{row_id}-action"), Role::Button, label)
                     .on_click(cx.listener(move |this, _, window, cx| match &row.action {
                         Action::Refresh => this.refresh(cx),
                         Action::RetryTrust(pubkey) => {
@@ -419,12 +463,22 @@ fn all_clear(shell: &Shell) -> AnyElement {
                 .min_w(px(0.))
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_MUTED))
-                .child(SharedString::from(text.to_string())),
+                .child(SharedString::from(text.to_string()))
+                .a11y("dash-attention-clear", Role::Label, text),
         )
         .into_any_element()
 }
 
-fn activity_row(event: &ActivityItem, now: u64) -> AnyElement {
+/// ActivityItem carries no event id, so the key is its timestamp plus an
+/// FNV-1a hash of its text; identical items get a `-<n>` suffix in order.
+fn activity_key(event: &ActivityItem) -> String {
+    let hash = event.text.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    });
+    format!("dash-activity-{}-{hash:x}", event.at)
+}
+
+fn activity_row(event: &ActivityItem, now: u64, id: String) -> AnyElement {
     let meta = format!(
         "{} UTC · {}",
         timefmt::hhmmss_utc(event.at),
@@ -432,6 +486,8 @@ fn activity_row(event: &ActivityItem, now: u64) -> AnyElement {
     );
 
     h_flex()
+        .a11y(id.clone(), Role::ListItem, event.text.clone())
+        .aria_description(meta.clone())
         .gap(px(11.))
         .items_start()
         .py(px(10.))
@@ -459,7 +515,8 @@ fn activity_row(event: &ActivityItem, now: u64) -> AnyElement {
                         .mt(px(1.))
                         .text_size(px(11.))
                         .text_color(rgb(TEXT_DIM))
-                        .child(SharedString::from(meta)),
+                        .child(SharedString::from(meta.clone()))
+                        .a11y(format!("{id}-meta"), Role::Label, meta),
                 ),
         )
         .into_any_element()
@@ -473,6 +530,11 @@ fn empty_activity() -> AnyElement {
         .text_size(px(12.5))
         .text_color(rgb(TEXT_DIM))
         .child("Nothing yet. New claims and payments show up here.")
+        .a11y(
+            "dash-activity-empty",
+            Role::Label,
+            "Nothing yet. New claims and payments show up here.",
+        )
         .into_any_element()
 }
 
@@ -502,10 +564,17 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
     let activity_elements: Vec<AnyElement> = if shell.activity.is_empty() {
         vec![empty_activity()]
     } else {
+        let mut seen: HashMap<String, usize> = HashMap::new();
         shell
             .activity
             .iter()
-            .map(|event| activity_row(event, now))
+            .map(|event| {
+                let key = activity_key(event);
+                let n = seen.entry(key.clone()).or_insert(0);
+                *n += 1;
+                let id = if *n == 1 { key } else { format!("{key}-{n}") };
+                activity_row(event, now, id)
+            })
             .collect()
     };
 
@@ -528,13 +597,15 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                     div()
                         .text_size(px(21.))
                         .font_weight(FontWeight::BOLD)
-                        .child("Dashboard"),
+                        .child("Dashboard")
+                        .a11y("dash-heading", Role::Heading, "Dashboard"),
                 )
                 .child(
                     div()
                         .text_size(px(12.5))
                         .text_color(rgb(TEXT_MUTED))
-                        .child(SharedString::from(summary)),
+                        .child(SharedString::from(summary.clone()))
+                        .a11y("dash-summary", Role::Label, summary),
                 )
                 .child(div().flex_1())
                 .child(
@@ -561,6 +632,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                                 .text_color(rgb(TEXT_DIM))
                         })
                         .child(action_label)
+                        .a11y("dash-new-item", Role::Button, action_label)
                         .on_click(cx.listener(|this, _, window, cx| this.new_item(window, cx))),
                 ),
         )
@@ -568,8 +640,8 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
             h_flex()
                 .gap(px(16.))
                 .items_start()
-                .child(card("Needs attention", badge, attention_elements))
-                .child(card("Recent activity", None, activity_elements)),
+                .child(card("dash-attention", "Needs attention", badge, attention_elements))
+                .child(card("dash-activity", "Recent activity", None, activity_elements)),
         )
 }
 
