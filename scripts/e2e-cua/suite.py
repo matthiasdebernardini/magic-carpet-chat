@@ -247,14 +247,16 @@ class FineDriver(Driver):
             # for the calc/publish buttons. Pills above the anchor's line are
             # ignored, so a pill on an earlier row (Recalculate, a Follow
             # row) is never taken. Or {"text": phrase, "below": y}: the
-            # anchor is the phrase's first line below window y.
+            # anchor is the phrase's first line below window y ("fold": True
+            # for a key, see ocr_phrase_all).
             data = shot_bytes(await self.sb.screenshot())
             pills = accent_pills(data)
             if not pills:
                 raise RuntimeError("click_pill: no accent pill on screen")
             text = arg["text"] if isinstance(arg, dict) else arg
             below = arg.get("below", -1) if isinstance(arg, dict) else -1
-            pos = next((p for p in ocr_phrase_all(data, text) if p[1] > below), None)
+            fold = arg.get("fold", False) if isinstance(arg, dict) else False
+            pos = next((p for p in ocr_phrase_all(data, text, fold=fold) if p[1] > below), None)
             if pos is None:
                 raise RuntimeError(f"click_pill: anchor {arg!r} not on screen")
             ax, ay = pos

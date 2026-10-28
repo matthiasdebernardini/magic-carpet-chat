@@ -287,7 +287,9 @@ async def remove_armed_flow(sc, who, expect_sats=False):
         return
     await sc.step(Step(f"Arm the 'Remove…' button on the {who}'s Identity card ('Remove this account' card at the bottom), once.",
                        [Cand("arm-card", "Click the 'Remove…' button on the right of the 'Remove this account' card, once.",
-                             [FOCUS, ("click_text", {"text": "Remove", "near": "Deletes the nsec"}), ("wait", 1), PARK])],
+                             # The npub QR card pushes this card below the fold.
+                             [FOCUS, ("scroll", "down"), ("wait", 3),
+                              ("click_text", {"text": "Remove", "near": "Deletes the nsec"}), ("wait", 1), PARK])],
                        "The card's button and the sidebar link read 'Click again to remove'.", tries=1, settle=2,
                        cues=("Click again to remove", "Remove", "Deletes the nsec")), must_act=True, label=f"{who} arm card")
     n = sc.count("click again to remove")
@@ -304,12 +306,12 @@ async def scenario_h(sc):
     await sc.step(Step("Show Bounties with the house issuer selected.", [HOUSE, BOUNTIES],
                        "The Bounties screen is shown and its header button reads 'New DList + bounty'.", settle=2, cues=HOUSE_CUES), label="house")
     await remove_armed_flow(sc, "house")
-    # The avatar click is idempotent; a retried super+] would toggle back.
-    await sc.step(Step("Select the claimant account and show Bounties (the claimant's header button reads 'Submit a bounty claim').",
-                       [Cand("claimant-avatar", "Click the second avatar in the left rail, then press super+2 for Bounties.",
-                             [FOCUS, ("avatar", "claimant"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])],
-                       "The Bounties header button reads 'Submit a bounty claim'.", settle=3,
-                       cues=("Submit a bounty claim", "New DList + bounty")), label="claimant")
+    # Direct: the avatar click is idempotent, and the judge halted here on a
+    # weak pick (p 0.44-0.50, abstain ~0.4) in two runs. The literal header
+    # check below decides.
+    for kind, arg in [FOCUS, ("avatar", "claimant"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)]:
+        await sc.suite.driver.act(kind, arg)
+    await sc.wait_for(["Submit a bounty claim"], timeout=30, every=3, label="claimant")
     sc.check_screen("claimant selected", ["Submit a bounty claim"])
     await remove_armed_flow(sc, "claimant", expect_sats=True)
     sc.check("nothing was removed", sc.box.accounts_in_store(sc.store) == 2, f"{sc.box.accounts_in_store(sc.store)} accounts in store")
@@ -1001,7 +1003,7 @@ async def scenario_u(sc):
     if not await sc.step(Step(
             f"Click 'Follow' on the result row '{short}' (not the recommended row).",
             [Cand("follow-pasted", "Click the 'Follow' button on the result row of the pasted npub.",
-                  [FOCUS, ("click_pill", {"text": short, "below": row_below}), ("wait", 1), PARK])],
+                  [FOCUS, ("click_pill", {"text": short, "below": row_below, "fold": True}), ("wait", 1), PARK])],
             "A confirmation box offers 'Start a new follow list' and 'Cancel'.",
             tries=3, settle=6, cues=("Start a new follow list", "Following", "Saved on")),
             must_act=True, label="follow pasted"):
