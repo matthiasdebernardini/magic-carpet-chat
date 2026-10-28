@@ -27,13 +27,14 @@ fn base_from(env: Option<&str>) -> String {
         .unwrap_or_else(|| "https://api.brainstorm.world".to_string())
 }
 
-/// One `/search/byText` result. `pubkey` is always 64 lowercase hex —
+/// One `/search/pubkeys` result. `pubkey` is always 64 lowercase hex —
 /// anything else the endpoint returned never makes it out of the parser.
+/// The endpoint returns only keys; the other fields start empty and are
+/// filled from the key's kind-0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
     pub pubkey: String,
     pub name: Option<String>,
-    pub display_name: Option<String>,
     pub nip05: Option<String>,
     pub picture: Option<String>,
 }
@@ -52,22 +53,25 @@ fn is_hex64(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// `data.results[]` of a `/search/byText` answer. `None` when the body is
+/// `results[]` of a `/search/pubkeys` answer. `None` when the body is
 /// not the expected envelope; hits with an off-shape pubkey are skipped.
 pub fn parse_search(body: &str) -> Option<Vec<SearchHit>> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let results = value.get("data")?.get("results")?.as_array()?;
-    let mut hits = Vec::new();
+    let results = value.get("results")?.as_array()?;
+    let mut hits: Vec<SearchHit> = Vec::new();
     for result in results {
         let Some(pubkey) = field(result, "pubkey").filter(|p| is_hex64(p)) else {
             continue;
         };
+        // Ranked best-first: a repeated key keeps its first, best place.
+        if hits.iter().any(|hit| hit.pubkey == pubkey) {
+            continue;
+        }
         hits.push(SearchHit {
             pubkey: pubkey.to_string(),
-            name: field(result, "name").map(String::from),
-            display_name: field(result, "display_name").map(String::from),
-            nip05: field(result, "nip05").map(String::from),
-            picture: field(result, "picture").map(String::from),
+            name: None,
+            nip05: None,
+            picture: None,
         });
     }
     Some(hits)
@@ -443,17 +447,16 @@ pub async fn get_setup(hex: &str) -> Result<Option<Vec<Vec<String>>>, &'static s
     setup_rows(&body).map(Some).ok_or(GENERIC)
 }
 
-/// `GET {base}/search/byText` (no auth): the follow step's profile search.
-/// Fixed failure text; a malformed 200 reads as an error, not as "no hits".
-pub async fn search_by_text(query: &str) -> Result<Vec<SearchHit>, &'static str> {
-    let url = format!("{}/search/byText", base());
+/// `POST {base}/search/pubkeys` (ORE-05, no auth): the follow step's profile
+/// search. Fixed failure text; a malformed 200 reads as an error, not as "no
+/// hits". No pov is sent, so a 202 should not happen; it reads as the
+/// generic failure like any other non-200.
+pub async fn search_pubkeys(query: &str) -> Result<Vec<SearchHit>, &'static str> {
+    let url = format!("{}/search/pubkeys", base());
     let (status, body) = send(
-        http()?.get(url).query(&[
-            ("text", query),
-            ("onlyRanked", "true"),
-            ("ownPubkey", "false"),
-            ("maxHits", "12"),
-        ]),
+        http()?
+            .post(url)
+            .json(&serde_json::json!({ "query": query, "limit": 12 })),
     )
     .await
     .map_err(|f| match f {
@@ -485,21 +488,25 @@ mod tests {
     #[test]
     fn parse_search_reads_results_and_skips_bad_pubkeys() {
         let key = "82341f88".to_string() + &"0".repeat(56);
+        let other = "3bf0c63f".to_string() + &"1".repeat(56);
         let body = format!(
-            r#"{{"code":200,"data":{{"query":"jack","numResults":3,"results":[
-                {{"name":"jack","pubkey":"{key}","picture":"https://x/p.png","nip05":"jack@primal.net","display_name":"jack (n/acc)"}},
-                {{"name":"bad","pubkey":"not-hex"}},
-                {{"pubkey":"{key}","name":null}}
-            ]}}}}"#
+            r#"{{"results":[
+                {{"pubkey":"{key}","rank":0.93}},
+                {{"pubkey":"not-hex","rank":0.5}},
+                {{"rank":0.4}},
+                {{"pubkey":"{other}","rank":0.1}},
+                {{"pubkey":"{key}","rank":0.05}}
+            ],"ttl":60}}"#
         );
         let hits = parse_search(&body).expect("a real answer parses");
-        assert_eq!(hits.len(), 2, "the bad pubkey is skipped");
-        assert_eq!(hits[0].name.as_deref(), Some("jack"));
-        assert_eq!(hits[0].display_name.as_deref(), Some("jack (n/acc)"));
-        assert_eq!(hits[0].nip05.as_deref(), Some("jack@primal.net"));
-        assert_eq!(hits[1].name, None);
+        assert_eq!(hits.len(), 2, "the bad pubkeys are skipped and the repeat dropped");
+        assert_eq!(hits[0].pubkey, key);
+        assert_eq!(hits[1].pubkey, other);
+        assert_eq!(hits[0].name, None);
+        assert_eq!(parse_search(r#"{"results":[]}"#), Some(Vec::new()));
         // Not the envelope → None, not an empty list.
         assert_eq!(parse_search("{}"), None);
+        assert_eq!(parse_search(r#"{"error":"query field is missing or empty"}"#), None);
         assert_eq!(parse_search("[]"), None);
         assert_eq!(parse_search("not json"), None);
     }

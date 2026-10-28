@@ -23,7 +23,8 @@ The same process also serves a fake Brainstorm on 127.0.0.1:$BS_PORT (8788):
   GET  /user/graperankResult           -> the run's next step (data null before any accepted run)
   GET  /user/history                   -> last_time_calculated_graperank: when a poll last answered done
   GET  /setup/{hex}                    -> mode "setup": six rows like the live body, or 404
-  GET  /search/byText                  -> canned data.results profiles filtered by text
+  POST /search/pubkeys                 -> canned {results:[{pubkey,rank}]} filtered by body.query
+                                          (names and photos live in kind-0s the suite seeds on the relay)
   GET  /pic/alice.png                  -> a 64x64 PNG of sixteen flat colours (Alice's picture)"""
 import json, os, re, struct, threading, time, uuid, zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -174,14 +175,15 @@ def colour_png():
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
-BS_PIC = "http://127.0.0.1:%d/pic/alice.png" % BS_PORT
+# The pubkeys are the public secp256k1 test keys 1, 2 and 3 (their secrets are
+# in scenarios.py): the app only shows a name from a kind-0 the key signed.
 BS_SEARCH = [
-    {"pubkey": "a" * 64, "name": "alice", "display_name": "Alice E2E",
-     "nip05": "alice@e2e.test", "picture": BS_PIC},
-    {"pubkey": "b" * 64, "name": "bob", "display_name": "Bob E2E",
-     "nip05": "bob@e2e.test", "picture": ""},
-    {"pubkey": "c" * 64, "name": "carol", "display_name": "Carol E2E",
-     "nip05": "carol@e2e.test", "picture": ""},
+    {"pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+     "name": "alice", "display_name": "Alice E2E"},
+    {"pubkey": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+     "name": "bob", "display_name": "Bob E2E"},
+    {"pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "name": "carol", "display_name": "Carol E2E"},
 ]
 
 
@@ -306,11 +308,6 @@ class B(BaseHTTPRequestHandler):
                 "last_time_calculated_graperank": iso(fin) if fin else None,
                 "last_time_triggered_graperank": None,
                 "created_at": iso(time.time()), "updated_at": iso(time.time())}})
-        if u.path == "/search/byText":
-            text = (q.get("text") or q.get("q") or [""])[0].lower()
-            hits = [p for p in BS_SEARCH if text in p["name"] or text in p["display_name"].lower()]
-            log("BS GET /search/byText %r -> %d" % (text[:20], len(hits)))
-            return self.send(200, {"code": 200, "data": {"results": hits}})
         log("BS GET %s -> 404" % u.path)
         self.send(404, {"error": "not found"})
 
@@ -330,6 +327,14 @@ class B(BaseHTTPRequestHandler):
             if ok:
                 return self.send(200, {"data": {"token": "tok-%s" % uuid.uuid4()}})
             return self.send(401, {"error": "bad login event"})
+        if u.path == "/search/pubkeys":
+            text = str(b.get("query") or "").strip().lower()
+            if not text:
+                return self.send(400, {"error": "query field is missing or empty"})
+            hits = [{"pubkey": p["pubkey"], "rank": 1.0 - i / 10} for i, p in enumerate(BS_SEARCH)
+                    if text in p["name"] or text in p["display_name"].lower()]
+            log("BS POST /search/pubkeys %r -> %d" % (text[:20], len(hits)))
+            return self.send(200, {"results": hits})
         if u.path == "/user/followList":
             ev = b.get("signed_event") or b.get("event") or b
             ptags = sum(1 for t in (ev.get("tags") or []) if isinstance(t, list) and t and t[0] == "p")

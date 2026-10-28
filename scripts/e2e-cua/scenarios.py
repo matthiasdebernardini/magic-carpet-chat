@@ -608,6 +608,21 @@ def publish_owner_profile(box, owner, run_id):
         {"name": f"E2E Owner {run_id[-4:]}", "display_name": f"E2E Owner {run_id[-4:]}"}))
 
 
+# The people the fake's /search/pubkeys returns. The fake serves only keys, so
+# their names and pictures are kind-0s published to the local relay. The
+# secrets are the public secp256k1 test keys 1, 2 and 3, worth nothing.
+SEARCH_PEOPLE = [
+    ("0" * 63 + "1", {"name": "alice", "display_name": "Alice E2E", "picture": "http://127.0.0.1:8788/pic/alice.png"}),
+    ("0" * 63 + "2", {"name": "bob", "display_name": "Bob E2E"}),
+    ("0" * 63 + "3", {"name": "carol", "display_name": "Carol E2E"}),
+]
+
+
+def publish_search_profiles(box):
+    for sec, profile in SEARCH_PEOPLE:
+        nak_publish(box, sec, 0, json.dumps(profile))
+
+
 # The sidebar chip opens the active account's page on its Trust tab
 # (shell.rs, `open_account(.., Tab::Trust)`), so the chip click is the whole
 # action. A second OCR click on the tab used to follow it and raised whenever
@@ -1059,6 +1074,7 @@ async def scenario_t(sc):
     acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({})
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
+    publish_search_profiles(sc.box)
     sc.box.launch("T", sc.suite.run_id, nsecs=acct["sec"],
                   extra_env={"MC_ISSUER_NPUB": owner["npub"]})
     if not await open_trust(sc):

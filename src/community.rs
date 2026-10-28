@@ -193,11 +193,10 @@ fn follow_error_text(error: &FollowErr) -> String {
     }
 }
 
-/// A hit's label: display name, else name, else a shortened npub.
+/// A hit's label: its kind-0 name (display name first), else a shortened npub.
 fn hit_label(hit: &SearchHit) -> String {
-    hit.display_name
+    hit.name
         .as_deref()
-        .or(hit.name.as_deref())
         .map(str::to_string)
         .unwrap_or_else(|| {
             nostr_sdk::prelude::PublicKey::from_hex(&hit.pubkey)
@@ -320,7 +319,6 @@ impl Shell {
                 state.search_results = Some(Ok(vec![SearchHit {
                     pubkey: target.clone(),
                     name: None,
-                    display_name: None,
                     nip05: None,
                     picture: None,
                 }]));
@@ -556,10 +554,11 @@ impl Shell {
                 state.search_results = Some(result);
             }
             CommunityPart::ProfileName {
-                seq: _,
+                seq,
                 target,
                 name,
                 picture,
+                nip05,
             } => {
                 let Some(state) = self.community.get_mut(&pubkey) else {
                     return;
@@ -567,11 +566,14 @@ impl Shell {
                 // The kind-0 may land after the click captured the short
                 // npub, or after a follow cleared the results: update the
                 // target wherever it is held.
-                if let Some(Ok(hits)) = &mut state.search_results
+                // A reply to a replaced query must not touch the new rows.
+                if seq == state.search_seq
+                    && let Some(Ok(hits)) = &mut state.search_results
                     && let Some(hit) = hits.iter_mut().find(|hit| hit.pubkey == target)
                 {
                     hit.name = name.clone();
                     hit.picture = picture.clone();
+                    hit.nip05 = nip05;
                 }
                 if let Some(name) = name {
                     for (key, label) in state

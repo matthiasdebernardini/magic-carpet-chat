@@ -222,7 +222,7 @@ pub enum Command {
     /// instance, then the trust relays. Emits `Update::Owner`. No pubkey or
     /// generation: there is one owner and the answer is never stale.
     FetchOwner,
-    /// The follow step's profile search (`/search/byText`). `seq` lets the
+    /// The follow step's profile search (`/search/pubkeys`; names and photos follow as `ProfileName`s). `seq` lets the
     /// UI drop the reply to a query it already replaced.
     SearchProfiles {
         pubkey: String,
@@ -477,12 +477,13 @@ pub enum CommunityPart {
         seq: u64,
         result: Result<Vec<SearchHit>, String>,
     },
-    /// A `FetchProfileName` reply; both are `None` when no kind-0 was found.
+    /// A `FetchProfileName` reply; all are `None` when no kind-0 was found.
     ProfileName {
         seq: u64,
         target: String,
         name: Option<String>,
         picture: Option<String>,
+        nip05: Option<String>,
     },
     /// A `Follow` outcome.
     Followed(Result<FollowOk, FollowErr>),
@@ -926,14 +927,40 @@ async fn run(
             } => {
                 let updates = updates.clone();
                 tokio::spawn(async move {
-                    let result = brainstorm::search_by_text(&query)
+                    let result = brainstorm::search_pubkeys(&query)
                         .await
                         .map_err(str::to_string);
+                    // The rows show as bare keys first; their names and
+                    // photos follow once one relay query has read the lot.
+                    let targets: Vec<String> = match &result {
+                        Ok(hits) => hits.iter().map(|hit| hit.pubkey.clone()).collect(),
+                        Err(_) => Vec::new(),
+                    };
                     let _ = updates.unbounded_send(Update::Community {
-                        pubkey,
+                        pubkey: pubkey.clone(),
                         generation,
                         part: CommunityPart::SearchResults { seq, result },
                     });
+                    let mut profiles = trust_relay_profiles(&targets).await;
+                    for target in targets {
+                        let Profile {
+                            name,
+                            picture,
+                            nip05,
+                            ..
+                        } = profiles.remove(&target).unwrap_or_default();
+                        let _ = updates.unbounded_send(Update::Community {
+                            pubkey: pubkey.clone(),
+                            generation,
+                            part: CommunityPart::ProfileName {
+                                seq,
+                                target,
+                                name,
+                                picture,
+                                nip05,
+                            },
+                        });
+                    }
                 });
             }
             Command::FetchProfileName {
@@ -944,7 +971,12 @@ async fn run(
             } => {
                 let updates = updates.clone();
                 tokio::spawn(async move {
-                    let Profile { name, picture, .. } = trust_relay_profile(&target).await;
+                    let Profile {
+                        name,
+                        picture,
+                        nip05,
+                        ..
+                    } = trust_relay_profile(&target).await;
                     let _ = updates.unbounded_send(Update::Community {
                         pubkey,
                         generation,
@@ -953,6 +985,7 @@ async fn run(
                             target,
                             name,
                             picture,
+                            nip05,
                         },
                     });
                 });
@@ -1110,6 +1143,7 @@ async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<String>, ()> {
 struct Profile {
     name: Option<String>,
     picture: Option<String>,
+    nip05: Option<String>,
     lud16: Option<String>,
 }
 
@@ -1126,6 +1160,7 @@ impl Profile {
         Self {
             name: field("display_name").or_else(|| field("name")),
             picture: field("picture"),
+            nip05: field("nip05"),
             lud16: field("lud16"),
         }
     }
@@ -2294,25 +2329,59 @@ async fn fetch_owner(updates: mpsc::UnboundedSender<Update>) {
 /// The newest kind-0 the trust relays hold for `pubkey_hex`, as far as it
 /// goes; empty when none answers.
 async fn trust_relay_profile(pubkey_hex: &str) -> Profile {
-    let Ok(public) = PublicKey::parse(pubkey_hex) else {
-        return Profile::default();
-    };
+    trust_relay_profiles(&[pubkey_hex.to_string()])
+        .await
+        .remove(pubkey_hex)
+        .unwrap_or_default()
+}
+
+/// The newest verified kind-0 per pubkey, from one query to the trust
+/// relays. A pubkey no relay answered for is absent from the map.
+async fn trust_relay_profiles(pubkeys: &[String]) -> HashMap<String, Profile> {
+    let publics: Vec<PublicKey> = pubkeys
+        .iter()
+        .filter_map(|hex| PublicKey::parse(hex).ok())
+        .collect();
+    if publics.is_empty() {
+        return HashMap::new();
+    }
     let urls = trust_relays();
     let client = Client::default();
     for url in &urls {
         let _ = client.add_relay(url.as_str()).await;
     }
     client.connect().and_wait(Duration::from_secs(5)).await;
-    let filter = Filter::new().kind(Kind::Metadata).author(public).limit(5);
+    let filter = Filter::new()
+        .kind(Kind::Metadata)
+        .authors(publics.iter().copied())
+        .limit(publics.len() * 5);
     let results = read_per_relay(&client, &urls, filter).await;
     client.disconnect().await;
     let (_, events) = answered(results);
-    events
+    newest_profiles(events.into_iter().map(|(_, event)| event), &publics)
+}
+
+/// The newest signature-verified kind-0 per author, parsed; events by
+/// anyone outside `wanted` or with a bad signature are dropped.
+fn newest_profiles(
+    events: impl IntoIterator<Item = Event>,
+    wanted: &[PublicKey],
+) -> HashMap<String, Profile> {
+    let mut newest: HashMap<String, Event> = HashMap::new();
+    for event in events {
+        let hex = event.pubkey.to_hex();
+        if !wanted.contains(&event.pubkey)
+            || event.verify().is_err()
+            || newest.get(&hex).is_some_and(|kept| kept.created_at >= event.created_at)
+        {
+            continue;
+        }
+        newest.insert(hex, event);
+    }
+    newest
         .into_iter()
-        .filter(|(_, event)| event.pubkey.to_hex() == pubkey_hex && event.verify().is_ok())
-        .max_by_key(|(_, event)| event.created_at)
-        .map(|(_, event)| parse_profile(&event.content))
-        .unwrap_or_default()
+        .map(|(hex, event)| (hex, parse_profile(&event.content)))
+        .collect()
 }
 
 /// What the follow panel's search box holds when it is a key and not a name.
@@ -3142,6 +3211,33 @@ mod tests {
             other.to_hex()
         );
         assert_eq!(issuer_pubkey_from(Some(&other.to_hex())), other.to_hex());
+    }
+
+    #[test]
+    fn newest_profiles_keeps_the_newest_verified_kind_0_of_each_wanted_author() {
+        let kind0 = |keys: &Keys, name: &str, at: u64| {
+            EventBuilder::new(Kind::Metadata, format!(r#"{{"name":"{name}"}}"#))
+                .custom_created_at(Timestamp::from_secs(at))
+                .finalize(keys)
+                .unwrap()
+        };
+        let (alice, outsider) = (Keys::generate(), Keys::generate());
+        let forged = {
+            let event = kind0(&alice, "Forged", 500);
+            let json = event.as_json().replace("Forged", "Forgex");
+            Event::from_json(json).unwrap()
+        };
+        let events = vec![
+            kind0(&alice, "Old", 100),
+            kind0(&alice, "New", 200),
+            kind0(&alice, "Older", 50),
+            kind0(&outsider, "Outside", 300),
+            forged,
+        ];
+        let found = newest_profiles(events, &[alice.public_key()]);
+        assert_eq!(found.len(), 1, "the outsider is dropped");
+        let profile = &found[&alice.public_key().to_hex()];
+        assert_eq!(profile.name.as_deref(), Some("New"), "newest wins, forged is dropped");
     }
 
     #[test]
