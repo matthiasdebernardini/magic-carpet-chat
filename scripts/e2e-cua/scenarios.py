@@ -665,7 +665,7 @@ async def follow_owner(sc, expect_confirm):
         return await sc.step(Step(
             "Approve the first follow list: click 'Start a new follow list' in the confirmation box.",
             [Cand("confirm-first-list", "Click the 'Start a new follow list' button beside 'Cancel' in the confirmation box.",
-                  [FOCUS, ("click_pill", "cancel"), ("wait", 1), PARK])],
+                  [FOCUS, ("click_pill", CONFIRM_ANCHOR), ("wait", 1), PARK])],
             "The recommended row reads '✓ Following' and a 'Saved on N of M Nostr servers' line is shown.",
             tries=4, settle=8, cues=("Following", "Saved on", "Start a new follow list")),
             must_act=True, label="confirm first list")
@@ -690,7 +690,9 @@ async def publish_map(sc):
     ok = await sc.step(Step(
         "Click 'Publish my Treasure Map' in step 3.",
         [Cand("publish-map", "Click the 'Publish my Treasure Map' button.",
-              [FOCUS, ("click_pill", "Publish your Treasure Map"), ("wait", 1), PARK])],
+              # Step 3 sits below the fold under the Recalculate row.
+              [FOCUS, ("scroll_until", {"text": "Publish your Treasure Map", "reach": 90}), PARK,
+               ("click_pill", "Publish your Treasure Map"), ("wait", 1), PARK])],
         "The publish started: 'Fetching tag data' shows, or the card already reads 'Located'.",
         tries=3, settle=6,
         cues=("Fetching tag data", "Located", "Publish my Treasure Map")),
@@ -825,21 +827,26 @@ async def scenario_o(sc):
     screen = await sc.wait_for(["Please wait a few minutes before recalculating"],
                                ["Brainstorm confirmed"], timeout=25, every=3, label="429 wording")
     sc.check_screen("429 wording", ["Please wait a few minutes before recalculating"], screen=screen)
-    sc.box.mark("O 403")
-    await calculate(sc, done_cond="Step 2 shows the error 'Please wait a few minutes "
-                    "before recalculating' and the 'Calculate my trust scores' button.",
-                    label="calc 403", tries=1)
-    screen = await sc.wait_for(["Please wait a few minutes before recalculating"],
-                               ["Brainstorm confirmed"], timeout=25, every=3, label="403 wording")
-    sc.check_screen("403 wording", ["Please wait a few minutes before recalculating"], screen=screen)
-    sc.box.mark("O 503")
-    await calculate(sc, done_cond="Step 2 shows the error 'The Brainstorm server is "
-                    "temporarily unavailable' and the 'Calculate my trust scores' button.",
-                    label="calc 503", tries=1)
-    screen = await sc.wait_for(["The Brainstorm server is temporarily unavailable"],
-                               ["Brainstorm confirmed"], timeout=25, every=3, label="503 wording")
-    sc.check_screen("503 wording", ["The Brainstorm server is temporarily unavailable"],
-                    ["Brainstorm confirmed"])
+    # Presses 2 and 3 are direct: the 429 text is still on screen, so Jev saw
+    # nothing to do and abstained. Each waits for its own '-> status' log line,
+    # then lets the app repaint before the wording is read.
+    for marker, status, wording in (("O 403", "403", "Please wait a few minutes before recalculating"),
+                                    ("O 503", "503", "The Brainstorm server is temporarily unavailable")):
+        sc.box.mark(marker)
+        await sc.suite.driver.act(*FOCUS)
+        await sc.suite.driver.act("click_pill", "Ask Brainstorm to calculate")
+        await sc.suite.driver.act(*PARK)
+        end = time.time() + 25
+        while time.time() < end and not any(
+                l.startswith("BS POST /user/graperank") and l.endswith(f"-> {status}")
+                for l in sc.log_after(marker)):
+            await asyncio.sleep(1)
+        sc.check(f"{status} request reached the fake", any(
+            l.startswith("BS POST /user/graperank") and l.endswith(f"-> {status}")
+            for l in sc.log_after(marker)), sc.log_after(marker))
+        await asyncio.sleep(4)   # the error line from the previous press is replaced by now
+        screen = await sc.wait_for([wording], ["Brainstorm confirmed"], timeout=25, every=3, label=f"{status} wording")
+        sc.check_screen(f"{status} wording", [wording], ["Brainstorm confirmed"], screen=screen)
     lines = sc.box.server_log().splitlines()
     grapes = [l for l in lines if "/user/graperank" in l]
     follows = [l for l in lines if "followList" in l]
@@ -941,6 +948,12 @@ def type_into(box, text):
     return [FOCUS, ("click", box), ("wait", 0.5), ("key", "ctrl+a"), ("type", text), ("wait", 2), PARK]
 
 
+# The first-list box's first line: the amber 'Start a new follow list' pill is
+# the nearest pill at or below it. 'cancel' is no anchor: it first shows in
+# this box's sentence, nearer the pasted row's Follow pill than the amber one.
+CONFIRM_ANCHOR = "No follow list was found"
+
+
 def row_has_follow(data, pos):
     """An accent pill (the Follow button) on the row at `pos`, right of it.
     OCR cannot read the button's dark-on-violet label."""
@@ -975,7 +988,7 @@ async def scenario_u(sc):
         tries=3, settle=4, cues=(short, "No profiles match", "Searching", "private key")),
         must_act=True, label="paste npub")
     data, _ = await sc.snap("pasted row")
-    rows = [p for p in ocr_phrase_all(data, short) if p[1] > row_below]
+    rows = [p for p in ocr_phrase_all(data, short, fold=True) if p[1] > row_below]
     sc.check("the result row below the box is labelled by the short npub", rows, f"box y={box[1]:.0f}")
     sc.check_screen("no 'no match' line", [], ["No profiles match"])
     if not rows:
@@ -997,7 +1010,7 @@ async def scenario_u(sc):
         if not await sc.step(Step(
                 "Approve the first follow list: click 'Start a new follow list' in the confirmation box.",
                 [Cand("confirm-first-list", "Click the 'Start a new follow list' button beside 'Cancel' in the confirmation box.",
-                      [FOCUS, ("click_pill", "cancel"), ("wait", 1), PARK])],
+                      [FOCUS, ("click_pill", CONFIRM_ANCHOR), ("wait", 1), PARK])],
                 "A 'Saved on N of M Nostr servers' line is shown.",
                 tries=4, settle=8, cues=("Saved on", "Following", "Start a new follow list")),
                 must_act=True, label="confirm first list"):
@@ -1011,23 +1024,23 @@ async def scenario_u(sc):
 
 
 # ---------------------------------------------------------------- T
-def avatar_spread(data, phrase):
-    """How much of the round avatar left of `phrase`'s row the three
+AVATAR_X = (428, 464)   # the avatar sits at x 437-456 in a result row; its label starts at 466
+
+
+def avatar_spread(data, y):
+    """How much of the round avatar on the result row at window y the three
     commonest colours cover (2 bits per channel), from 0 to 1. An initials
     circle is one gradient fill and a letter (about 0.8 measured); the fake's
     sixteen-colour picture spreads over many (about 0.4). The avatar is the
-    saturated blob in a window just left of the label, shrunk by 3 px. None
+    saturated blob in a fixed window left of the label, shrunk by 3 px. None
     when nothing is found."""
     import io
     from collections import Counter
     from PIL import Image
-    pos = ocr_phrase_pos(data, phrase)
-    if pos is None:
-        return None
-    cx, cy = int(pos[0]), int(pos[1])
+    cy = int(y)
     im = Image.open(io.BytesIO(data)).convert("RGB")
     px = im.load()
-    sat = [(x, y) for y in range(cy - 14, cy + 15) for x in range(cx - 70, cx - 18)
+    sat = [(x, y) for y in range(cy - 14, cy + 15) for x in range(*AVATAR_X)
            if 0 <= x < im.width and 0 <= y < im.height and max(px[x, y]) - min(px[x, y]) > 60]
     if len(sat) < 40:
         return None
@@ -1064,18 +1077,24 @@ async def scenario_t(sc):
         must_act=True, label="search e2e")
     await asyncio.sleep(4)   # the picture loads after the row is drawn
     data, _ = await sc.snap("avatars")
-    rows = {name: ocr_phrase_pos(data, name) for name in ("Alice", "Bob")}
-    found = all(p is not None and p[1] > box[1] + 12 for p in rows.values())
-    with_follow = found and all(row_has_follow(data, p) for p in rows.values())
-    if sc.check("rows 'Alice' and 'Bob' below the box, each with a Follow button", with_follow, rows) and not met:
-        sc.accept_step("search e2e", "rows Alice and Bob with Follow buttons below the box")
+    # The rows are found by position: the Follow pills below the box, top to
+    # bottom, are Alice, Bob, Carol (OCR lost 'Bob' with the initials circle).
+    pills = sorted((p for p in accent_pills(data) if p[1] > box[1] + 12), key=lambda p: p[1])
+    if sc.check("three result rows (Alice, Bob, Carol), each with a Follow button, below the box",
+                len(pills) == 3, pills) and not met:
+        sc.accept_step("search e2e", "three result rows with Follow buttons below the box")
     sc.check("the fake served Alice's picture", "BS GET /pic/alice.png" in sc.log_after("search"))
-    pic, plain = avatar_spread(data, "Alice"), avatar_spread(data, "Bob")
+    if len(pills) != 3:
+        return
+    pic, plain = avatar_spread(data, pills[0][1]), avatar_spread(data, pills[1][1])
     sc.check("both avatars were found on screen", pic is not None and plain is not None,
              f"picture={pic} initials={plain}")
     if pic is not None and plain is not None:
+        # Relative, not fixed: the share drifts with where the row lands
+        # (0.38 and 0.59 for the same picture in two runs); initials measure
+        # 0.80-0.91, so the ceiling fails two initials circles.
         sc.check("Alice's avatar is a many-coloured picture, Bob's a one-colour initials circle",
-                 pic <= 0.5 and plain >= 0.7, f"top-3 colour share: picture={pic} initials={plain}")
+                 pic <= 0.72 and plain >= 0.7 and plain - pic >= 0.15, f"top-3 colour share: picture={pic} initials={plain}")
 
 
 # ---------------------------------------------------------------- V, W
@@ -1273,14 +1292,16 @@ async def scenario_w(sc):
     # The follow-first line sits right under the Recalculate button. Enabled,
     # the button is an accent pill there; disabled, it is a plain grey one.
     data, _ = await sc.snap("disabled recalculate")
-    line = ocr_phrase_pos(data, FOLLOW_FIRST)
-    if not sc.check("the follow-first line was located", line is not None):
+    # The follow-first line itself is too faint for the position OCR: anchor
+    # on the readable line above the button.
+    line = ocr_phrase_pos(data, "Followed someone new")
+    if not sc.check("the line above the Recalculate button was located", line is not None):
         return
-    above = [p for p in accent_pills(data) if line[1] - 60 < p[1] < line[1]]
-    sc.check("the Recalculate button is drawn disabled (no accent pill above the line)", not above, above)
+    below = [p for p in accent_pills(data) if line[1] < p[1] < line[1] + 80]
+    sc.check("the Recalculate button is drawn disabled (no accent pill under the line)", not below, below)
     sc.box.mark("W disabled")
     try:
-        await sc.suite.driver.act("click_text", {"text": "Recalculate", "near": FOLLOW_FIRST})
+        await sc.suite.driver.act("click_text", {"text": "Recalculate", "near": "Followed someone new"})
     except Exception as e:
         sc.check("the disabled Recalculate button was clicked", False, e)
         return

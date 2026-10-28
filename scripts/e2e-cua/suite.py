@@ -165,8 +165,14 @@ def ocr_phrase_pos(data, phrase):
     return hits[0] if hits else None
 
 
-def ocr_phrase_all(data, phrase):
-    """[(x, y)] of every line holding `phrase` in the 2x OCR, top to bottom."""
+# Look-alike glyphs tesseract swaps in random strings (npubs). One char each,
+# so folded offsets still line up with the words.
+OCR_FOLD = str.maketrans("01i|5286", "olllszbb")
+
+
+def ocr_phrase_all(data, phrase, fold=False):
+    """[(x, y)] of every line holding `phrase` in the 2x OCR, top to bottom.
+    fold matches look-alike glyphs, for keys rather than words."""
     import io
     from PIL import Image
     im = Image.open(io.BytesIO(data)).convert("L")
@@ -180,10 +186,12 @@ def ocr_phrase_all(data, phrase):
             continue
         lines.setdefault((p[2], p[3], p[4]), []).append(
             (p[11], float(p[6]) + float(p[8]) / 2, float(p[7]) + float(p[9]) / 2))
-    needle = phrase.lower()
+    needle = phrase.lower().translate(OCR_FOLD) if fold else phrase.lower()
     out = []
     for ws in sorted(lines.values(), key=lambda ws: (min(w[2] for w in ws), min(w[1] for w in ws))):
         joined = " ".join(w[0] for w in ws).lower()
+        if fold:
+            joined = joined.translate(OCR_FOLD)
         i = joined.find(needle)
         if i < 0:
             continue
@@ -217,11 +225,29 @@ class FineDriver(Driver):
             return None
         if kind == "snap":      # a raw evidence frame between actions, no OCR
             return await self.scenario.snap(arg)
+        if kind == "scroll_until":
+            # arg: {"text": anchor, "reach": px}. "scroll" is 12 wheel clicks
+            # and the slow Linux repaint makes the jump vary, so it can land
+            # past a button. From the top, step 3 clicks at a time until the
+            # anchor and an accent pill within `reach` below it are on screen.
+            for _ in range(2):
+                await super().act("scroll", "up")
+            await asyncio.sleep(3)
+            for _ in range(16):
+                data = shot_bytes(await self.sb.screenshot())
+                pos = next(iter(ocr_phrase_all(data, arg["text"])), None)
+                if pos is not None and any(pos[1] - 15 <= p[1] <= pos[1] + arg["reach"] for p in accent_pills(data)):
+                    return f"scroll_until {arg['text']!r} at y={pos[1]:.0f}"
+                await self.x("xdotool click --repeat 3 --delay 60 5")
+                await asyncio.sleep(2)
+            raise RuntimeError(f"scroll_until: {arg['text']!r} with a pill below never came on screen")
         if kind == "click_pill":
             # arg: an OCR anchor phrase (or its prefix): the accent pill
             # nearest it — same row for "RECOMMENDED", below a step heading
-            # for the calc/publish buttons. Or {"text": phrase, "below": y}:
-            # the anchor is the phrase's first line below window y.
+            # for the calc/publish buttons. Pills above the anchor's line are
+            # ignored, so a pill on an earlier row (Recalculate, a Follow
+            # row) is never taken. Or {"text": phrase, "below": y}: the
+            # anchor is the phrase's first line below window y.
             data = shot_bytes(await self.sb.screenshot())
             pills = accent_pills(data)
             if not pills:
@@ -232,6 +258,10 @@ class FineDriver(Driver):
             if pos is None:
                 raise RuntimeError(f"click_pill: anchor {arg!r} not on screen")
             ax, ay = pos
+            # A same-row pill's centre can sit a few px above the OCR line's.
+            pills = [p for p in pills if p[1] >= ay - 15]
+            if not pills:
+                raise RuntimeError(f"click_pill: no accent pill at or below anchor {arg!r}")
             # Same-row anchors (the recommended row) beat vertical distance.
             best = min(pills, key=lambda p: (abs(p[1] - ay) * 8) + abs(p[0] - ax))
             await self.sb.mouse.click(best[0], best[1])
