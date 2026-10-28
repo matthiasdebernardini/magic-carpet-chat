@@ -353,7 +353,7 @@ class Box:
         env.update({
             "MC_NSECS": nsecs or f"{self.keys['house']['sec']},{self.keys['claimant']['sec']}",
             "MC_ISSUER_NPUB": self.keys["house"]["npub"], "MC_BASE_URL": base, "MC_RELAY_URL": relay,
-            "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "DISPLAY": ":1", "RUST_BACKTRACE": "1",
+            "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "DISPLAY": ":1",
         })
         if target == "fake":
             # Not for "instance": a new account's kind-0 goes to the
@@ -633,7 +633,7 @@ class OmacBox:
             "DISPLAY": ":0",
             "MC_NSECS": nsecs or f"{self.keys['house']['sec']},{self.keys['claimant']['sec']}",
             "MC_ISSUER_NPUB": self.keys["house"]["npub"], "MC_BASE_URL": base, "MC_RELAY_URL": relay,
-            "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "RUST_BACKTRACE": "1",
+            "MC_STORE_DIR": store, "MC_SENTRY_DSN": "",
         })
         if target == "fake":
             env.update({"MC_BRAINSTORM_URL": BS_URL, "MC_TRUST_RELAYS": relay})
