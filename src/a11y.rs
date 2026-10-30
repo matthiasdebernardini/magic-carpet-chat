@@ -40,6 +40,17 @@ impl Accessible for Stateful<Div> {
         role: Role,
         label: impl Into<SharedString>,
     ) -> Stateful<Div> {
-        self.accessibility_id(id).role(role).aria_label(label)
+        let label = label.into();
+        let el = self.accessibility_id(id).role(role);
+        // AT-SPI names a Label from its value, not its label: without the
+        // value every Label reads as empty there. Linux only: on macOS a
+        // value makes a Label settable text and hides sibling Labels.
+        #[cfg(target_os = "linux")]
+        let el = if role == Role::Label {
+            el.aria_value(label.clone())
+        } else {
+            el
+        };
+        el.aria_label(label)
     }
 }

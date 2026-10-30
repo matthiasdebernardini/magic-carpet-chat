@@ -760,6 +760,8 @@ fn ring_badge(size: f32, mark: &'static str, width: f32, edge: u32, fg: u32) -> 
 }
 
 /// A coloured note with a leading mark — the green ✓, amber !, purple i.
+/// `label` is the note's text as plain words: `text` can be styled.
+#[allow(clippy::too_many_arguments)]
 fn note_box(
     id: &'static str,
     mark: &'static str,
@@ -767,12 +769,12 @@ fn note_box(
     fill: u32,
     edge: u32,
     text_color: u32,
+    label: &'static str,
     text: impl IntoElement,
 ) -> Stateful<Div> {
     h_flex()
         .id(id)
-        .accessibility_id(id)
-        .role(Role::Label)
+        .a11y(id, Role::Label, label)
         .gap(px(10.))
         .items_start()
         .bg(wash(fill))
@@ -1940,8 +1942,8 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                 0x4ecb8d33,
                 0xb7e9d0,
                 "Your trusted community has been calculated.",
+                "Your trusted community has been calculated.",
             )
-            .aria_label("Your trusted community has been calculated.")
             .into_any_element(),
             true,
         ),
@@ -1956,7 +1958,8 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                     0xf2b54433,
                     0xe8d9b0,
                     "We cannot find the document (a nostr kind 10040 event) telling us that your community's trust scores have been calculated and are available to use. Good news: you can do the three needed steps right here.",
-                ).aria_label("We cannot find the document (a nostr kind 10040 event) telling us that your community's trust scores have been calculated and are available to use. Good news: you can do the three needed steps right here."))
+                    "We cannot find the document (a nostr kind 10040 event) telling us that your community's trust scores have been calculated and are available to use. Good news: you can do the three needed steps right here.",
+                ))
                 .child(steps(shell, pubkey, cx))
                 .into_any_element(),
             false,
@@ -2070,6 +2073,7 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                         0x8f7df80d,
                         0x8f7df833,
                         0xc9c7d8,
+                        "There may be additional actions to take before this account is fully ready to use — such as topping up your wallet. The Dashboard will list those steps under Needs attention.",
                         {
                             let text = "There may be additional actions to take before this account is fully ready to use — such as topping up your wallet. The Dashboard will list those steps under Needs attention.";
                             let bold = text.find("Needs attention").unwrap()..text.len();
@@ -2082,8 +2086,7 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                                 },
                             )])
                         },
-                    )
-                    .aria_label("There may be additional actions to take before this account is fully ready to use — such as topping up your wallet. The Dashboard will list those steps under Needs attention."))
+                    ))
                     .child(if found {
                         dashboard_button(
                             "community-dashboard",

@@ -67,8 +67,8 @@ set of these ids with macos-harness.
 
 ## Linux (AT-SPI)
 
-Read from gpui-pre-linux 0.3.4 and accesskit_unix 0.22.1; not yet tried on a
-Linux host.
+Read from gpui-pre-linux 0.3.4 and accesskit_unix 0.22.1, and used by the e2e
+suite on the cua box (`scripts/e2e-cua/atspi.py`, X11 under xfce).
 
 - Both the X11 and the Wayland window create an `accesskit_unix::Adapter`
   (no app change or feature flag needed). It runs on its own async-io thread.
@@ -84,6 +84,10 @@ Linux host.
   toolkit-accessibility true`). The app can start before or after the switch.
 - The ids are AT-SPI `AccessibleId` (at-spi2-core 2.34 or later;
   `Atspi.Accessible.get_accessible_id()` in pyatspi/gi).
+- AT-SPI names a Label from its value, not its label. The app gives every
+  Label its text as value too, on Linux only (`src/a11y.rs`; on macOS a value
+  makes a Label settable text). A build before that change reads every Label
+  as an empty name; other roles are named from their label.
 - Press with the Action interface (`do_action`, "click"), not coordinates:
   under Wayland the app cannot know its window position, so extents are
   window-relative at best. gpui still clicks the node's centre, so the node
