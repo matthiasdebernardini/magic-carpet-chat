@@ -10,6 +10,7 @@
 //! [`accepts`] drops a late one. All the network work is the runtime's —
 //! this file only sends Commands and renders Updates.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui_kit::component::{
@@ -21,13 +22,16 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use magic_carpet_chat::brainstorm::SearchHit;
-use magic_carpet_chat::nostr::{self, Command, CommunityPart, FollowErr, FollowOk, SetupState};
+use magic_carpet_chat::brainstorm::{self, RunState, SearchHit};
+use magic_carpet_chat::nostr::{
+    self, Command, CommunityPart, FollowErr, FollowOk, PastedKey, SetupState, parse_pasted_key,
+};
 use magic_carpet_chat::trust::Designation;
 use nostr_sdk::prelude::ToBech32 as _;
 
 use crate::account_setup::quiet_button;
-use crate::dashboard::{MONO, avatar, muted};
+use crate::a11y::Accessible as _;
+use crate::dashboard::{MONO, remote_avatar};
 use crate::palette::*;
 use crate::shell::{Shell, short_npub};
 use crate::timefmt;
@@ -42,6 +46,29 @@ pub(crate) enum Calc {
     Busy,
     Done(SetupState),
     Failed(String),
+}
+
+/// The Recalculate button's run. `Running` holds the state the poll last
+/// read; a done or failed run is final and frees the button.
+#[derive(Debug, Clone)]
+pub(crate) enum Recalc {
+    Idle,
+    /// The POSTs are out; no run state read yet.
+    Sending,
+    Running(RunState),
+    /// The run never started (fixed wording); nothing retries it.
+    Failed(String),
+}
+
+impl Recalc {
+    /// A run is being asked for or is still going: the button is disabled.
+    pub(crate) fn busy(&self) -> bool {
+        match self {
+            Recalc::Sending => true,
+            Recalc::Running(state) => !state.is_final(),
+            Recalc::Idle | Recalc::Failed(_) => false,
+        }
+    }
 }
 
 /// The publish step's progress. A success needs no `Done` to hold: the
@@ -66,6 +93,8 @@ pub(crate) struct CommunityState {
     pub search_results: Option<Result<Vec<SearchHit>, String>>,
     /// A search is in flight.
     pub searching: bool,
+    /// The box holds a private key: no row, a fixed line instead.
+    pub pasted_private: bool,
     /// Bumped per `SearchProfiles` sent; replies carry it back, stale seqs
     /// drop.
     pub search_seq: u64,
@@ -75,6 +104,8 @@ pub(crate) struct CommunityState {
     pub debounce: Option<Task<()>>,
     /// Follows made this session, the chips: (hex pubkey, label).
     pub follows: Vec<(String, String)>,
+    /// The picture URL of each followed key that had one, for the chips.
+    pub pictures: HashMap<String, String>,
     /// The follow in flight: (hex, label). `None` means the row is idle.
     pub pending: Option<(String, String)>,
     /// The last follow's failure, fixed text.
@@ -91,9 +122,16 @@ pub(crate) struct CommunityState {
     pub search_focused: bool,
     pub calc: Calc,
     pub map: Map,
+    pub recalc: Recalc,
+    /// When the last run finished, from `/user/history`: `None` until read,
+    /// `Some(None)` when Brainstorm has no finished run.
+    pub last_finished: Option<Option<u64>>,
     /// Keeps the search-input subscription alive.
     _sub: Subscription,
 }
+
+/// The search box's placeholder, also its accessibility label.
+const SEARCH_PLACEHOLDER: &str = "Search profiles to follow…";
 
 /// The stale-reply guard: the update belongs to `pubkey`'s panel only while
 /// that panel exists (`panel` is its generation) and a newer one has not
@@ -159,11 +197,10 @@ fn follow_error_text(error: &FollowErr) -> String {
     }
 }
 
-/// A hit's label: display name, else name, else a shortened npub.
+/// A hit's label: its kind-0 name (display name first), else a shortened npub.
 fn hit_label(hit: &SearchHit) -> String {
-    hit.display_name
+    hit.name
         .as_deref()
-        .or(hit.name.as_deref())
         .map(str::to_string)
         .unwrap_or_else(|| {
             nostr_sdk::prelude::PublicKey::from_hex(&hit.pubkey)
@@ -174,7 +211,8 @@ fn hit_label(hit: &SearchHit) -> String {
         })
 }
 
-/// A stable hue per pubkey for the initial-tile avatar (no remote images).
+/// A stable hue per pubkey for the initial-tile avatar, shown while a
+/// picture loads or when there is none.
 fn hit_hue(pubkey: &str) -> (u32, u32) {
     const HUES: [(u32, u32); 5] = [
         (ACCENT, ACCENT_DEEP),
@@ -205,7 +243,7 @@ impl Shell {
         self.community_generation = self.community_generation.saturating_add(1).max(1);
         let key = pubkey.to_string();
         let search = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Search profiles to follow…");
+            let mut input = InputState::new(window, cx).placeholder(SEARCH_PLACEHOLDER);
             input.set_editor_style(gpui_kit::base::input::InputEditorStyle {
                 muted_foreground: rgb(TEXT_DIM).into(),
                 foreground: rgb(TEXT).into(),
@@ -216,9 +254,9 @@ impl Shell {
         let sub = cx.subscribe_in(
             &search,
             window,
-            move |this: &mut Shell, _, event, _window, cx| {
+            move |this: &mut Shell, _, event, window, cx| {
                 match event {
-                    InputEvent::Change => this.community_search_changed(&key, cx),
+                    InputEvent::Change => this.community_search_changed(&key, window, cx),
                     InputEvent::Focus | InputEvent::Blur => {
                         if let Some(state) = this.community.get_mut(&key) {
                             state.search_focused = matches!(event, InputEvent::Focus);
@@ -236,10 +274,12 @@ impl Shell {
                 search,
                 search_results: None,
                 searching: false,
+                pasted_private: false,
                 search_seq: 0,
                 last_query: String::new(),
                 debounce: None,
                 follows: Vec::new(),
+                pictures: HashMap::new(),
                 pending: None,
                 follow_error: None,
                 confirm_first: None,
@@ -248,6 +288,8 @@ impl Shell {
                 search_focused: false,
                 calc: Calc::Idle,
                 map: Map::Idle,
+                recalc: Recalc::Idle,
+                last_finished: None,
                 _sub: sub,
             },
         );
@@ -259,11 +301,57 @@ impl Shell {
 
     /// A keystroke in the panel's search box: debounce 300 ms, then send
     /// `SearchProfiles`. Under two trimmed characters asks nothing.
-    fn community_search_changed(&mut self, pubkey: &str, cx: &mut Context<Self>) {
+    fn community_search_changed(
+        &mut self,
+        pubkey: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(state) = self.community.get_mut(pubkey) else {
             return;
         };
         let query = state.search.read(cx).value().trim().to_string();
+        state.pasted_private = false;
+        match parse_pasted_key(&query) {
+            Some(PastedKey::Public(target)) => {
+                // A pasted key skips Brainstorm: one row now, its name when
+                // the kind-0 arrives.
+                state.debounce = None;
+                state.search_seq += 1;
+                state.searching = false;
+                state.last_query = String::new();
+                state.search_results = Some(Ok(vec![SearchHit {
+                    pubkey: target.clone(),
+                    name: None,
+                    nip05: None,
+                    picture: None,
+                }]));
+                let _ = self.commands.unbounded_send(Command::FetchProfileName {
+                    pubkey: pubkey.to_string(),
+                    generation: state.generation,
+                    seq: state.search_seq,
+                    target,
+                });
+                cx.notify();
+                return;
+            }
+            Some(PastedKey::Private) => {
+                state.debounce = None;
+                state.search_seq += 1;
+                state.searching = false;
+                state.last_query = String::new();
+                state.search_results = None;
+                state.pasted_private = true;
+                // The key must not stay on screen; `set_value` emits no
+                // Change, so the line below the box survives.
+                state
+                    .search
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                cx.notify();
+                return;
+            }
+            None => {}
+        }
         if query.len() < 2 {
             state.debounce = None;
             state.search_results = None;
@@ -281,7 +369,7 @@ impl Shell {
                     return;
                 };
                 let query = state.search.read(cx).value().trim().to_string();
-                if query.len() < 2 {
+                if query.len() < 2 || parse_pasted_key(&query).is_some() {
                     return;
                 }
                 state.search_seq += 1;
@@ -316,6 +404,20 @@ impl Shell {
         if state.pending.is_some() {
             return;
         }
+        let picture = match &state.search_results {
+            Some(Ok(hits)) => hits.iter().find(|hit| hit.pubkey == target),
+            _ => None,
+        }
+        .and_then(|hit| hit.picture.clone())
+        .or_else(|| {
+            self.owner
+                .as_ref()
+                .filter(|(hex, ..)| *hex == target)
+                .and_then(|(_, _, _, picture)| picture.clone())
+        });
+        if let Some(picture) = picture {
+            state.pictures.insert(target.clone(), picture);
+        }
         state.pending = Some((target.clone(), label));
         state.follow_error = None;
         state.confirm_first = None;
@@ -349,12 +451,13 @@ impl Shell {
         cx.notify();
     }
 
-    /// "Calculate my trust scores" — the UI dims it until ≥1 follow.
+    /// "Calculate my trust scores" — the UI dims it until ≥1 follow and
+    /// while a Recalculate is in flight.
     pub(crate) fn community_calculate(&mut self, pubkey: &str, cx: &mut Context<Self>) {
         let Some(state) = self.community.get_mut(pubkey) else {
             return;
         };
-        if matches!(state.calc, Calc::Busy) {
+        if matches!(state.calc, Calc::Busy) || state.recalc.busy() {
             return;
         }
         state.calc = Calc::Busy;
@@ -363,6 +466,37 @@ impl Shell {
             generation: state.generation,
         });
         cx.notify();
+    }
+
+    /// "Recalculate": one `Recalculate` command. Refused while a run is in
+    /// flight, while step 2's Calculate is, and while the account follows
+    /// no one — the UI draws the button disabled for all three.
+    pub(crate) fn community_recalculate(&mut self, pubkey: &str, cx: &mut Context<Self>) {
+        let follows = has_follows(self, pubkey);
+        let Some(state) = self.community.get_mut(pubkey) else {
+            return;
+        };
+        if !follows || state.recalc.busy() || matches!(state.calc, Calc::Busy) {
+            return;
+        }
+        state.recalc = Recalc::Sending;
+        let _ = self.commands.unbounded_send(Command::Recalculate {
+            pubkey: pubkey.to_string(),
+            generation: state.generation,
+        });
+        cx.notify();
+    }
+
+    /// Ask when the account's last run finished. The runtime only asks
+    /// Brainstorm for an account this app already sent a follow list for.
+    pub(crate) fn community_run_history(&mut self, pubkey: &str) {
+        let Some(state) = self.community.get(pubkey) else {
+            return;
+        };
+        let _ = self.commands.unbounded_send(Command::FetchRunHistory {
+            pubkey: pubkey.to_string(),
+            generation: state.generation,
+        });
     }
 
     /// "Try again" on a missing setup answer — a plain `/setup` GET, never
@@ -423,6 +557,44 @@ impl Shell {
                 state.searching = false;
                 state.search_results = Some(result);
             }
+            CommunityPart::ProfileName {
+                seq,
+                target,
+                name,
+                picture,
+                nip05,
+            } => {
+                let Some(state) = self.community.get_mut(&pubkey) else {
+                    return;
+                };
+                // The kind-0 may land after the click captured the short
+                // npub, or after a follow cleared the results: update the
+                // target wherever it is held.
+                // A reply to a replaced query must not touch the new rows.
+                if seq == state.search_seq
+                    && let Some(Ok(hits)) = &mut state.search_results
+                    && let Some(hit) = hits.iter_mut().find(|hit| hit.pubkey == target)
+                {
+                    hit.name = name.clone();
+                    hit.picture = picture.clone();
+                    hit.nip05 = nip05;
+                }
+                if let Some(name) = name {
+                    for (key, label) in state
+                        .pending
+                        .iter_mut()
+                        .chain(state.confirm_first.iter_mut())
+                        .chain(state.follows.iter_mut())
+                    {
+                        if *key == target {
+                            *label = name.clone();
+                        }
+                    }
+                }
+                if let Some(picture) = picture {
+                    state.pictures.insert(target, picture);
+                }
+            }
             CommunityPart::Followed(result) => {
                 let mut refresh = false;
                 if let Some(state) = self.community.get_mut(&pubkey) {
@@ -472,6 +644,19 @@ impl Shell {
                     };
                 }
             }
+            CommunityPart::Recalc(result) => {
+                if let Some(state) = self.community.get_mut(&pubkey) {
+                    state.recalc = match result {
+                        Ok(run) => Recalc::Running(run),
+                        Err(message) => Recalc::Failed(message),
+                    };
+                }
+            }
+            CommunityPart::LastFinished(finished) => {
+                if let Some(state) = self.community.get_mut(&pubkey) {
+                    state.last_finished = Some(finished);
+                }
+            }
             CommunityPart::SetupChecked(setup) => {
                 // The GET probes the same gate Calculate's probe set; fold
                 // it into Done so step 3 reacts.
@@ -503,6 +688,17 @@ impl Shell {
 }
 
 // --------------------------------------------------------------- the pieces
+
+/// A one-line state text — the same div as `dashboard::muted`, in the tree.
+fn state_line(id: impl Into<SharedString>, text: impl Into<SharedString>, color: u32) -> AnyElement {
+    let text = text.into();
+    div()
+        .text_size(px(12.5))
+        .text_color(rgb(color))
+        .a11y(id, Role::Label, text.clone())
+        .child(text)
+        .into_any_element()
+}
 
 fn panel_card() -> Div {
     v_flex()
@@ -564,15 +760,21 @@ fn ring_badge(size: f32, mark: &'static str, width: f32, edge: u32, fg: u32) -> 
 }
 
 /// A coloured note with a leading mark — the green ✓, amber !, purple i.
+/// `label` is the note's text as plain words: `text` can be styled.
+#[allow(clippy::too_many_arguments)]
 fn note_box(
+    id: &'static str,
     mark: &'static str,
     mark_color: u32,
     fill: u32,
     edge: u32,
     text_color: u32,
+    label: &'static str,
     text: impl IntoElement,
-) -> Div {
+) -> Stateful<Div> {
     h_flex()
+        .id(id)
+        .a11y(id, Role::Label, label)
         .gap(px(10.))
         .items_start()
         .bg(wash(fill))
@@ -596,14 +798,23 @@ fn note_box(
 /// The row's "Follow" button — solid accent, dark text; `busy` shows the
 /// spinner and swallows the click; `done` is the green-tinted "✓ Following".
 fn follow_button(
-    id: &'static str,
+    id: impl Into<SharedString>,
     busy: bool,
     done: bool,
     cx: &mut Context<Shell>,
     on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
 ) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let label = if busy {
+        "Following…"
+    } else if done {
+        "✓ Following"
+    } else {
+        "Follow"
+    };
     let button = div()
-        .id(id)
+        .id(id.clone())
+        .a11y(id, Role::Button, label)
         .flex_shrink_0()
         .px(px(12.))
         .py(px(4.))
@@ -666,6 +877,7 @@ fn step_title(title: &'static str, suffix: &'static str) -> StyledText {
 
 /// One step row: badge, title (with optional dim suffix), then the body.
 fn step(
+    slug: &'static str,
     number: u8,
     done: bool,
     dimmed: bool,
@@ -687,6 +899,11 @@ fn step(
     } else {
         ring_badge(22., num, 1.5, ACCENT, ACCENT_LIGHT)
     };
+    let state_label = if done {
+        "Done".to_string()
+    } else {
+        format!("Step {num}")
+    };
     h_flex()
         .gap(px(11.))
         .items_start()
@@ -694,6 +911,7 @@ fn step(
             div()
                 .mt(px(1.))
                 .when(dimmed, |this| this.opacity(0.55))
+                .a11y(format!("community-step-{slug}-state"), Role::Label, state_label)
                 .child(badge_el),
         )
         .child(
@@ -706,6 +924,11 @@ fn step(
                         .when(dimmed, |this| this.opacity(0.55))
                         .text_size(px(13.5))
                         .font_weight(FontWeight::SEMIBOLD)
+                        .a11y(
+                            format!("community-step-{slug}"),
+                            Role::Heading,
+                            format!("{title}{suffix}"),
+                        )
                         .child(step_title(title, suffix)),
                 )
                 .child(body),
@@ -714,20 +937,147 @@ fn step(
 
 // ------------------------------------------------------------- the render
 
+/// Whether the account follows anyone: a follow made in the panel this
+/// session, or Feature 1's read already counting follows.
+pub(crate) fn has_follows(shell: &Shell, pubkey: &str) -> bool {
+    shell
+        .community
+        .get(pubkey)
+        .is_some_and(|state| !state.follows.is_empty())
+        || matches!(
+            shell.trust.get(pubkey).map(|t| t.follows.last),
+            Some(Some(Some(n))) if n > 0
+        )
+}
+
+/// The Recalculate button with the run's live state and when the last run
+/// finished — on the Trust tab, and in step 1 right after a follow. `id`
+/// keeps the two copies apart when both are on screen.
+pub(crate) fn recalc_block(
+    shell: &Shell,
+    pubkey: &str,
+    id: &'static str,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    let Some(state) = shell.community.get(pubkey) else {
+        return div().into_any_element();
+    };
+    let follows = has_follows(shell, pubkey);
+    let enabled = follows && !state.recalc.busy() && !matches!(state.calc, Calc::Busy);
+    let key = pubkey.to_string();
+    let mut column = v_flex()
+        .gap(px(8.))
+        .child(step_button(id, "Recalculate", enabled, cx, move |this, _, cx| {
+            this.community_recalculate(&key, cx)
+        }));
+    let status_id = format!("{id}-status");
+    let last_id = format!("{id}-last-run");
+    if !follows {
+        column = column.child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(TEXT_DIM))
+                .a11y(format!("{id}-follow-first"), Role::Label, brainstorm::FOLLOW_FIRST)
+                .child(brainstorm::FOLLOW_FIRST),
+        );
+    }
+    let working = |text: String| {
+        let text = SharedString::from(text);
+        h_flex()
+            .gap(px(9.))
+            .items_center()
+            .child(Spinner::new().small().color(rgb(ACCENT).into()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_MUTED))
+                    .a11y(status_id.clone(), Role::Label, text.clone())
+                    .child(text),
+            )
+            .into_any_element()
+    };
+    let failed = |text: String| {
+        let text = SharedString::from(text);
+        div()
+            .text_size(px(12.5))
+            .text_color(rgb(AMBER))
+            .a11y(status_id.clone(), Role::Label, text.clone())
+            .child(text)
+            .into_any_element()
+    };
+    let line: Option<AnyElement> = match &state.recalc {
+        Recalc::Idle => None,
+        Recalc::Sending => Some(working(
+            "Sending your follow list to Brainstorm and asking for a recalculation…".into(),
+        )),
+        Recalc::Running(RunState::Waiting { ahead: 0 }) => Some(working(
+            "Waiting in Brainstorm's queue. Yours is next.".into(),
+        )),
+        Recalc::Running(RunState::Waiting { ahead }) => Some(working(format!(
+            "Waiting in Brainstorm's queue: {ahead} {} ahead of yours.",
+            if *ahead == 1 { "run" } else { "runs" }
+        ))),
+        Recalc::Running(RunState::Calculating) => {
+            Some(working("Calculating your scores…".into()))
+        }
+        Recalc::Running(RunState::Publishing) => Some(working(
+            "Publishing your scores so other apps can find them…".into(),
+        )),
+        Recalc::Running(RunState::Done) => Some(
+            h_flex()
+                .a11y(
+                    status_id.clone(),
+                    Role::Label,
+                    "Done. Your scores are recalculated and published.",
+                )
+                .gap(px(4.))
+                .items_start()
+                .text_size(px(12.5))
+                .text_color(rgb(0xb7e9d0))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(GREEN))
+                        .font_weight(FontWeight::BOLD)
+                        .child("✓"),
+                )
+                .child("Done. Your scores are recalculated and published.")
+                .into_any_element(),
+        ),
+        Recalc::Running(RunState::Failed(text)) => Some(failed((*text).to_string())),
+        Recalc::Failed(text) => Some(failed(text.clone())),
+    };
+    let finished = state.last_finished.map(|finished| {
+        let text = match finished {
+            Some(at) => format!(
+                "Last run finished {} — {}, {} UTC",
+                timefmt::relative(timefmt::now_unix(), at),
+                timefmt::month_day_year(at),
+                timefmt::hhmmss_utc(at)
+            ),
+            None => "No run has finished yet.".to_string(),
+        };
+        let text = SharedString::from(text);
+        div()
+            .text_size(px(12.))
+            .text_color(rgb(TEXT_DIM))
+            .a11y(last_id.clone(), Role::Label, text.clone())
+            .child(text)
+            .into_any_element()
+    });
+    column.children(line).children(finished).into_any_element()
+}
+
 /// The three steps and the skip line — the panel body shared by the setup
 /// card and the Trust tab's "Not located" map card.
 pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElement {
     let Some(state) = shell.community.get(pubkey) else {
-        return muted("Loading setup steps…", TEXT_MUTED);
+        return state_line("community-loading", "Loading setup steps…", TEXT_MUTED);
     };
-    let followed_now = !state.follows.is_empty();
-    // Step 2 also unlocks when Feature 1's read already counts follows.
-    let has_follows = followed_now
-        || matches!(
-            shell.trust.get(pubkey).map(|t| t.follows.last),
-            Some(Some(Some(n))) if n > 0
-        );
-    let step1_done = followed_now || has_follows;
+    let has_follows = has_follows(shell, pubkey);
+    let step1_done = has_follows;
 
     // ------------------------------------------------------------ step 1
 
@@ -736,7 +1086,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
         None
     } else {
         let (hex, npub) = match &shell.owner {
-            Some((hex, npub, _)) => (hex.clone(), npub.clone()),
+            Some((hex, npub, ..)) => (hex.clone(), npub.clone()),
             None => {
                 let hex = nostr::issuer_pubkey();
                 let npub = nostr_sdk::prelude::PublicKey::from_hex(&hex)
@@ -749,8 +1099,12 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
         let name = shell
             .owner
             .as_ref()
-            .and_then(|(_, _, name)| name.clone())
+            .and_then(|(_, _, name, _)| name.clone())
             .unwrap_or_else(|| "Magic Carpet owner".to_string());
+        let owner_picture = shell
+            .owner
+            .as_ref()
+            .and_then(|(_, _, _, picture)| picture.clone());
         let owner_followed = state.follows.iter().any(|(p, _)| *p == hex);
         let owner_busy = state
             .pending
@@ -759,8 +1113,12 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
         let target = hex.clone();
         let label = name.clone();
         let key = pubkey.to_string();
+        let row_id = format!("community-owner-{hex}");
+        let name_text = SharedString::from(name.clone());
+        let npub_text = SharedString::from(npub.clone());
         Some(
             h_flex()
+                .a11y(row_id.clone(), Role::Group, format!("{name} {npub}"))
                 .items_center()
                 .gap(px(10.))
                 .bg(rgb(BG_APP))
@@ -769,6 +1127,13 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 .rounded(px(9.))
                 .px(px(12.))
                 .py(px(8.))
+                .child(remote_avatar(
+                    owner_picture.as_deref(),
+                    name.chars().next().unwrap_or('?').to_uppercase().to_string(),
+                    hit_hue(&hex),
+                    20.,
+                    8.5,
+                ))
                 .child(
                     v_flex()
                         .flex_1()
@@ -787,7 +1152,8 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                                         .text_ellipsis()
                                         .text_size(px(12.5))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .child(SharedString::from(name)),
+                                        .a11y(format!("{row_id}-name"), Role::Label, name_text.clone())
+                                        .child(name_text),
                                 )
                                 .child(
                                     div()
@@ -801,6 +1167,11 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                                         .text_color(rgb(ACCENT_LIGHT))
                                         .text_size(px(9.))
                                         .font_weight(FontWeight::SEMIBOLD)
+                                        .a11y(
+                                            format!("{row_id}-badge"),
+                                            Role::Label,
+                                            "RECOMMENDED — YOUR OWNER NPUB",
+                                        )
                                         .child("RECOMMENDED — YOUR OWNER NPUB"),
                                 ),
                         )
@@ -812,11 +1183,12 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .child(SharedString::from(npub)),
+                                .a11y(format!("{row_id}-npub"), Role::Label, npub_text.clone())
+                                .child(npub_text),
                         ),
                 )
                 .child(follow_button(
-                    "community-follow-owner",
+                    format!("{row_id}-follow"),
                     owner_busy,
                     owner_followed,
                     cx,
@@ -844,6 +1216,8 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
         .text_size(px(12.5))
         .child(
             Input::new(&state.search)
+                .accessibility_id("community-search")
+                .aria_label(SEARCH_PLACEHOLDER)
                 .with_size(Size::Small)
                 .appearance(false)
                 .pl(px(0.))
@@ -871,7 +1245,28 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                         .as_deref()
                         .map(|value| value.strip_prefix("_@").unwrap_or(value).to_string())
                         .unwrap_or_default();
+                    let row_id = format!("community-hit-{}", hit.pubkey);
+                    let label_text = SharedString::from(label.clone());
+                    let hint_text = SharedString::from(hint);
+                    let hint_el = div()
+                        .font_family(MONO)
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(rgb(TEXT_DIM))
+                        .child(hint_text.clone());
+                    let hint_el = if hint_text.is_empty() {
+                        hint_el.into_any_element()
+                    } else {
+                        hint_el
+                            .a11y(format!("{row_id}-nip05"), Role::Label, hint_text.clone())
+                            .into_any_element()
+                    };
                     h_flex()
+                        .a11y(
+                            row_id.clone(),
+                            Role::Group,
+                            format!("{label} {hint_text}").trim().to_string(),
+                        )
                         .items_center()
                         .gap(px(10.))
                         .bg(rgb(BG_APP))
@@ -880,7 +1275,8 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                         .rounded(px(9.))
                         .px(px(12.))
                         .py(px(7.))
-                        .child(avatar(
+                        .child(remote_avatar(
+                            hit.picture.as_deref(),
                             label.chars().next().unwrap_or('?').to_uppercase().to_string(),
                             hit_hue(&hit.pubkey),
                             20.,
@@ -896,18 +1292,11 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                                 .whitespace_nowrap()
                                 .text_size(px(12.5))
                                 .font_weight(FontWeight::MEDIUM)
-                                .child(SharedString::from(label))
-                                .child(
-                                    div()
-                                        .font_family(MONO)
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::NORMAL)
-                                        .text_color(rgb(TEXT_DIM))
-                                        .child(SharedString::from(hint)),
-                                ),
+                                .child(label_text)
+                                .child(hint_el),
                         )
                         .child(follow_button(
-                            "community-follow-hit",
+                            format!("{row_id}-follow"),
                             busy,
                             false,
                             cx,
@@ -925,7 +1314,8 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 })
                 .collect();
             if shown.is_empty() && !state.searching {
-                Some(muted(
+                Some(state_line(
+                    "community-search-status",
                     format!(
                         "No profiles match \u{201c}{}\u{201d}. Try another name.",
                         state.last_query
@@ -933,16 +1323,37 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     TEXT_MUTED,
                 ))
             } else {
-                Some(v_flex().gap(px(6.)).children(shown).into_any_element())
+                Some(
+                    v_flex()
+                        .gap(px(6.))
+                        .a11y("community-hits", Role::List, "Search results")
+                        .children(shown)
+                        .into_any_element(),
+                )
             }
         }
-        Some(Err(_)) => Some(muted("Search is down. Try again in a moment.", TEXT_MUTED)),
+        Some(Err(_)) => Some(state_line(
+            "community-search-status",
+            "Search is down. Try again in a moment.",
+            TEXT_MUTED,
+        )),
+        None if state.pasted_private => Some(state_line(
+            "community-search-status",
+            "That's a private key. Paste an npub.",
+            TEXT_MUTED,
+        )),
         None if state.searching => Some(
             h_flex()
                 .gap(px(9.))
                 .items_center()
                 .child(Spinner::new().small().color(rgb(ACCENT).into()))
-                .child(div().text_size(px(12.5)).text_color(rgb(TEXT_MUTED)).child("Searching…"))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_MUTED))
+                        .a11y("community-search-status", Role::Label, "Searching…")
+                        .child("Searching…"),
+                )
                 .into_any_element(),
         ),
         None => None,
@@ -951,8 +1362,10 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
     let chips: Vec<AnyElement> = state
         .follows
         .iter()
-        .map(|(_, label)| {
+        .map(|(key, label)| {
+            let picture = state.pictures.get(key).map(String::as_str);
             h_flex()
+                .a11y(format!("community-followed-{key}"), Role::ListItem, label.clone())
                 .items_center()
                 .gap(px(6.))
                 .bg(wash(0x4ecb8d12))
@@ -965,6 +1378,13 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 .text_size(px(11.5))
                 .font_weight(FontWeight::MEDIUM)
                 .child(div().text_color(rgb(GREEN)).child("✓"))
+                .child(remote_avatar(
+                    picture,
+                    label.chars().next().unwrap_or('?').to_uppercase().to_string(),
+                    hit_hue(key),
+                    16.,
+                    7.5,
+                ))
                 .child(SharedString::from(label.clone()))
                 .into_any_element()
         })
@@ -985,6 +1405,11 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 div()
                     .text_size(px(12.5))
                     .text_color(rgb(0xe8d9b0))
+                    .a11y(
+                        "community-first-list-note",
+                        Role::Label,
+                        "No follow list was found for this key. If you have followed people with it before, cancel: a new list replaces the old one. If not, start a new follow list.",
+                    )
                     .child("No follow list was found for this key. If you have followed people with it before, cancel: a new list replaces the old one. If not, start a new follow list."),
             )
             .child(
@@ -993,6 +1418,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     .child(
                         div()
                             .id("community-first-list")
+                            .a11y("community-first-list", Role::Button, "Start a new follow list")
                             .px(px(16.))
                             .py(px(7.))
                             .rounded(px(9.))
@@ -1009,6 +1435,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     .child(
                         div()
                             .id("community-first-list-cancel")
+                            .a11y("community-first-list-cancel", Role::Button, "Cancel")
                             .px(px(16.))
                             .py(px(7.))
                             .rounded(px(9.))
@@ -1035,17 +1462,20 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
         .flatten()
         .unwrap_or(0);
     let already_line = (existing_follows > 0 && state.follows.is_empty()).then(|| {
+        let text = format!(
+            "You already follow {existing_follows} account{}. Go to step 2.",
+            if existing_follows == 1 { "" } else { "s" }
+        );
         div()
             .text_size(px(12.5))
             .text_color(rgb(TEXT_MUTED))
-            .child(format!(
-                "You already follow {existing_follows} account{}. Go to step 2.",
-                if existing_follows == 1 { "" } else { "s" }
-            ))
+            .a11y("community-already-follow", Role::Label, text.clone())
+            .child(text)
             .into_any_element()
     });
 
     let step1 = step(
+        "follow",
         1,
         step1_done,
         false,
@@ -1079,12 +1509,22 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                             div()
                                 .flex_shrink_0()
                                 .text_color(rgb(TEXT_MUTED))
+                                .a11y("community-follow-saved", Role::Label, lead.clone())
                                 .child(SharedString::from(lead.clone())),
                         )
                         .when(has_hosts, |this| {
                             this.child(
                                 div()
                                     .id("community-show-relays")
+                                    .a11y(
+                                        "community-show-relays",
+                                        Role::Button,
+                                        if state.show_relays {
+                                            "· hide servers"
+                                        } else {
+                                            "· show servers"
+                                        },
+                                    )
                                     .flex_shrink_0()
                                     .cursor_pointer()
                                     .text_size(px(11.))
@@ -1113,6 +1553,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                                 .font_family(MONO)
                                 .text_size(px(11.))
                                 .text_color(rgb(TEXT_DIM))
+                                .a11y("community-follow-saved-hosts", Role::Label, hosts.clone())
                                 .child(SharedString::from(hosts.clone())),
                         );
                     }
@@ -1123,17 +1564,26 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                                 .font_family(MONO)
                                 .text_size(px(11.))
                                 .text_color(rgb(TEXT_DIM))
+                                .a11y(
+                                    "community-follow-refused-hosts",
+                                    Role::Label,
+                                    format!("Not saved on: {refused}"),
+                                )
                                 .child(SharedString::from(format!("Not saved on: {refused}"))),
                         );
                     }
                 }
                 column.into_any_element()
             }))
+            .when(!state.follows.is_empty(), |this| {
+                this.child(recalc_block(shell, pubkey, "community-recalc", cx))
+            })
             .children(confirm_box)
             .children(state.follow_error.as_ref().map(|error| {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(RED))
+                    .a11y("community-follow-error", Role::Label, error.clone())
                     .child(SharedString::from(error.clone()))
                     .into_any_element()
             })),
@@ -1142,6 +1592,9 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
     // ------------------------------------------------------------ step 2
 
     let key = pubkey.to_string();
+    // A Recalculate in flight holds the account's run; a second POST beside
+    // it would spend Brainstorm's rate limit.
+    let can_calc = has_follows && !state.recalc.busy();
     let calc_body: AnyElement = match &state.calc {
         Calc::Busy => h_flex()
             .gap(px(9.))
@@ -1153,6 +1606,11 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     .min_w(px(0.))
                     .text_size(px(12.5))
                     .text_color(rgb(TEXT_MUTED))
+                    .a11y(
+                        "community-calc-status",
+                        Role::Label,
+                        "Asking the Brainstorm API… verifying the request was received",
+                    )
                     .child("Asking the Brainstorm API… verifying the request was received"),
             )
             .into_any_element(),
@@ -1174,6 +1632,11 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                         div()
                             .flex_1()
                             .min_w(px(0.))
+                            .a11y(
+                                "community-calc-status",
+                                Role::Label,
+                                "Brainstorm confirmed — your community's trust scores are in the process of being calculated and published (may take up to an hour if being done for the first time).",
+                            )
                             .child("Brainstorm confirmed — your community's trust scores are in the process of being calculated and published (may take up to an hour if being done for the first time)."),
                     ),
             )
@@ -1184,9 +1647,10 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                 div()
                     .text_size(px(12.5))
                     .text_color(rgb(AMBER))
+                    .a11y("community-calc-status", Role::Label, message.clone())
                     .child(SharedString::from(message.clone())),
             )
-            .child(calc_button("community-calc-retry", has_follows, cx, {
+            .child(calc_button("community-calc-retry", can_calc, cx, {
                 let key = key.clone();
                 move |this, _, cx| this.community_calculate(&key, cx)
             }))
@@ -1198,11 +1662,12 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_DIM))
+                        .a11y("community-calc-hint", Role::Label, "Follow an account first.")
                         .child("Follow an account first."),
                 );
             }
             column
-                .child(calc_button("community-calc", has_follows, cx, move |this, _, cx| {
+                .child(calc_button("community-calc", can_calc, cx, move |this, _, cx| {
                     this.community_calculate(&key, cx)
                 }))
                 .into_any_element()
@@ -1210,6 +1675,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
     };
 
     let step2 = step(
+        "calculate",
         2,
         matches!(state.calc, Calc::Done(_)),
         !has_follows,
@@ -1233,6 +1699,11 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     .min_w(px(0.))
                     .text_size(px(12.5))
                     .text_color(rgb(TEXT_MUTED))
+                    .a11y(
+                        "community-map-status",
+                        Role::Label,
+                        "Fetching tag data from api.brainstorm.world — rank provider pubkey, relay, and scores (rank, followers, hops…) — then signing and publishing…",
+                    )
                     .child("Fetching tag data from api.brainstorm.world — rank provider pubkey, relay, and scores (rank, followers, hops…) — then signing and publishing…"),
             )
             .into_any_element(),
@@ -1244,6 +1715,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_DIM))
+                        .a11y("community-map-hint", Role::Label, "Finish step 2 first.")
                         .child("Finish step 2 first."),
                 );
             }
@@ -1257,6 +1729,11 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT_MUTED))
+                                .a11y(
+                                    "community-map-status",
+                                    Role::Label,
+                                    "Brainstorm has no data for this account yet. The first calculation can take an hour. Try again later.",
+                                )
                                 .child("Brainstorm has no data for this account yet. The first calculation can take an hour. Try again later."),
                         )
                         .child(check_setup_link(pubkey, cx));
@@ -1267,6 +1744,11 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT_MUTED))
+                                .a11y(
+                                    "community-map-status",
+                                    Role::Label,
+                                    "Couldn't read the setup data. Try again.",
+                                )
                                 .child("Couldn't read the setup data. Try again."),
                         )
                         .child(check_setup_link(pubkey, cx));
@@ -1278,6 +1760,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(RED))
+                        .a11y("community-map-error", Role::Label, message.clone())
                         .child(SharedString::from(message.clone())),
                 );
             }
@@ -1288,6 +1771,7 @@ pub(crate) fn steps(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Any
     // Publishing flips the whole card to "calculated" on the re-read, so
     // the step itself never carries a done mark.
     let step3 = step(
+        "publish-map",
         3,
         false,
         !ready && !matches!(state.map, Map::Busy),
@@ -1314,6 +1798,7 @@ pub(crate) fn dashboard_button(
 ) -> Stateful<Div> {
     let button = div()
         .id(id)
+        .a11y(id, Role::Button, label)
         .self_start()
         .px(px(22.))
         .py(px(12.))
@@ -1338,32 +1823,7 @@ fn calc_button(
     cx: &mut Context<Shell>,
     on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
 ) -> Stateful<Div> {
-    let button = div()
-        .id(id)
-        .self_start()
-        .px(px(16.))
-        .py(px(9.))
-        .rounded(px(9.))
-        .bg(if enabled {
-            grad(ACCENT, ACCENT_DEEP)
-        } else {
-            rgb(BG_NAV_ON).into()
-        })
-        .text_size(px(12.5))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(if enabled {
-            rgb(BG_RAIL)
-        } else {
-            rgb(TEXT_MUTED)
-        });
-    if enabled {
-        button
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
-    } else {
-        button.cursor_not_allowed()
-    }
-    .child("Calculate my trust scores")
+    step_button(id, "Calculate my trust scores", enabled, cx, on_click)
 }
 
 fn map_button(
@@ -1372,8 +1832,21 @@ fn map_button(
     cx: &mut Context<Shell>,
     on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
 ) -> Stateful<Div> {
+    step_button(id, "Publish my Treasure Map", enabled, cx, on_click)
+}
+
+/// A step's action button: the gradient when enabled, a dim slab with no
+/// click handler when not.
+fn step_button(
+    id: &'static str,
+    label: &'static str,
+    enabled: bool,
+    cx: &mut Context<Shell>,
+    on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+) -> Stateful<Div> {
     let button = div()
         .id(id)
+        .a11y(id, Role::Button, label)
         .self_start()
         .px(px(16.))
         .py(px(9.))
@@ -1395,9 +1868,9 @@ fn map_button(
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
     } else {
-        button.cursor_not_allowed()
+        button.cursor_not_allowed().aria_description("unavailable")
     }
-    .child("Publish my Treasure Map")
+    .child(label)
 }
 
 /// The "Try again" link under a not-yet-ready setup answer — a `CheckSetup`
@@ -1406,6 +1879,7 @@ fn check_setup_link(pubkey: &str, cx: &mut Context<Shell>) -> Stateful<Div> {
     let key = pubkey.to_string();
     div()
         .id("community-check-setup")
+        .a11y("community-check-setup", Role::Button, "Try again")
         .cursor_pointer()
         .text_size(px(12.))
         .text_color(rgb(ACCENT_LIGHT))
@@ -1423,6 +1897,7 @@ fn skip_line(_cx: &mut Context<Shell>) -> AnyElement {
     div()
         .text_size(px(12.))
         .text_color(rgb(TEXT_DIM))
+        .a11y("community-skip", Role::Label, text)
         .child(
             InteractiveText::new(
                 "community-skip-link",
@@ -1460,11 +1935,13 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
     let (body, found) = match designation {
         Some(Designation::Set { .. }) => (
             note_box(
+                "community-note-calculated",
                 "✓",
                 GREEN,
                 0x4ecb8d12,
                 0x4ecb8d33,
                 0xb7e9d0,
+                "Your trusted community has been calculated.",
                 "Your trusted community has been calculated.",
             )
             .into_any_element(),
@@ -1474,11 +1951,13 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
             v_flex()
                 .gap(px(14.))
                 .child(note_box(
+                    "community-note-missing",
                     "!",
                     AMBER,
                     0xf2b54412,
                     0xf2b54433,
                     0xe8d9b0,
+                    "We cannot find the document (a nostr kind 10040 event) telling us that your community's trust scores have been calculated and are available to use. Good news: you can do the three needed steps right here.",
                     "We cannot find the document (a nostr kind 10040 event) telling us that your community's trust scores have been calculated and are available to use. Good news: you can do the three needed steps right here.",
                 ))
                 .child(steps(shell, pubkey, cx))
@@ -1494,11 +1973,16 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                         div()
                             .text_size(px(12.5))
                             .text_color(rgb(TEXT_MUTED))
+                            .a11y(
+                                "community-read-failed",
+                                Role::Label,
+                                failed.clone().unwrap_or_default(),
+                            )
                             .child(SharedString::from(failed.clone().unwrap_or_default())),
                     )
                     // A failed read proves nothing: no steps until a real
                     // answer lands.
-                    .child(quiet_button("community-check-again", "Check again").on_click(
+                    .child(quiet_button("community-check-again", "Check again").a11y("community-check-again", Role::Button, "Check again").on_click(
                         cx.listener(move |this, _, _, cx| {
                             this.fetch_trust(&key);
                             cx.notify();
@@ -1517,6 +2001,11 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                     div()
                         .text_size(px(13.))
                         .text_color(rgb(TEXT_MUTED))
+                        .a11y(
+                            "community-checking",
+                            Role::Label,
+                            "Checking the relays for your kind-10040 event…",
+                        )
                         .child("Checking the relays for your kind-10040 event…"),
                 )
                 .into_any_element(),
@@ -1538,6 +2027,7 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                             div()
                                 .text_size(px(15.))
                                 .font_weight(FontWeight::SEMIBOLD)
+                                .a11y("community-title", Role::Heading, "Your Trusted Community")
                                 .child("Your Trusted Community"),
                         ),
                 )
@@ -1566,6 +2056,7 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                         div()
                             .text_size(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
+                            .a11y("community-title", Role::Heading, "Your Trusted Community")
                             .child("Your Trusted Community"),
                     ),
             )
@@ -1576,11 +2067,13 @@ pub(crate) fn card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> Opti
                     .gap(px(14.))
                     .child(body)
                     .child(note_box(
+                        "community-note-info",
                         "i",
                         ACCENT_LIGHT,
                         0x8f7df80d,
                         0x8f7df833,
                         0xc9c7d8,
+                        "There may be additional actions to take before this account is fully ready to use — such as topping up your wallet. The Dashboard will list those steps under Needs attention.",
                         {
                             let text = "There may be additional actions to take before this account is fully ready to use — such as topping up your wallet. The Dashboard will list those steps under Needs attention.";
                             let bold = text.find("Needs attention").unwrap()..text.len();

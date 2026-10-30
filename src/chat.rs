@@ -10,6 +10,7 @@ use std::sync::Arc;
 use futures::{AsyncBufReadExt as _, AsyncReadExt as _, StreamExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use gpui_kit::Role as AxRole;
 use gpui_kit::component::{
     input::{InputEvent, Textarea, TextareaState},
     scroll::ScrollableElement as _,
@@ -20,6 +21,7 @@ use gpui_kit::http_client::{AsyncBody, HttpClient, Method, Request, StatusCode};
 use magic_carpet_chat::secrets::Secret;
 use serde_json::json;
 
+use crate::a11y::Accessible as _;
 use crate::palette::*;
 
 const MODEL: &str = "claude-sonnet-5";
@@ -179,10 +181,24 @@ impl Chat {
         cx.notify();
     }
 
-    fn render_message(&self, ix: usize, message: &Message) -> impl IntoElement {
+    fn render_message(&self, ix: usize, message: &Message, a11y: bool) -> impl IntoElement {
         let is_user = message.role == Role::User;
 
+        // Messages have no data id and only ever append, so the position is stable.
+        // The tree is built only while a11y is active, so parsing waits for it.
+        let label = if !a11y {
+            String::new()
+        } else if is_user {
+            message.text.clone()
+        } else if message.text.is_empty() {
+            "thinking…".to_string()
+        } else {
+            plain(&message.text)
+        };
+
         div()
+            .a11y(format!("chat-message-{ix}"), AxRole::ListItem, label)
+            .aria_description(if is_user { "user" } else { "assistant" })
             .w_full()
             .flex()
             .when(is_user, |this| this.justify_end())
@@ -225,12 +241,14 @@ impl Focusable for Chat {
 }
 
 impl Render for Chat {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let replying = self.streaming.is_some();
+        let a11y = window.is_a11y_active();
         let transcript = v_flex().gap(px(12.)).py(px(4.)).children(
             self.messages
                 .iter()
                 .enumerate()
-                .map(|(ix, message)| self.render_message(ix, message)),
+                .map(|(ix, message)| self.render_message(ix, message, a11y)),
         );
 
         v_flex()
@@ -246,6 +264,8 @@ impl Render for Chat {
                     .child(
                         div()
                             .id("transcript")
+                            .a11y("chat-transcript", AxRole::List, "Conversation")
+                            .when(replying, |this| this.aria_description("Claude is replying"))
                             .size_full()
                             .track_scroll(&self.scroll)
                             .overflow_y_scroll()
@@ -257,7 +277,11 @@ impl Render for Chat {
                 v_flex()
                     .gap(px(6.))
                     .pt(px(12.))
-                    .child(Textarea::new(&self.composer))
+                    .child(
+                        div()
+                            .a11y("chat-composer", AxRole::Group, "Message Claude…")
+                            .child(Textarea::new(&self.composer).aria_label("Message Claude…")),
+                    )
                     .child(
                         div()
                             .text_size(px(11.))
@@ -265,6 +289,44 @@ impl Render for Chat {
                             .child("Enter sends. Shift+Enter adds a line."),
                     ),
             )
+    }
+}
+
+/// The label of an assistant bubble: the text TextView shows, read from the
+/// parsed markdown (markers gone, code kept verbatim). The raw text if it won't parse.
+fn plain(markdown: &str) -> String {
+    let Ok(tree) = markdown::to_mdast(markdown, &markdown::ParseOptions::gfm()) else {
+        return markdown.to_string();
+    };
+    let mut out = String::new();
+    collect_text(&tree, &mut out);
+    out.trim_end().to_string()
+}
+
+fn collect_text(node: &markdown::mdast::Node, out: &mut String) {
+    use markdown::mdast::Node;
+
+    match node {
+        Node::Text(text) => out.push_str(&text.value),
+        Node::InlineCode(code) => out.push_str(&code.value),
+        Node::Code(code) => {
+            out.push_str(&code.value);
+            out.push('\n');
+        }
+        Node::Break(_) => out.push('\n'),
+        _ => {
+            for child in node.children().into_iter().flatten() {
+                collect_text(child, out);
+            }
+            // Block nodes end the line so neighbouring words do not run together.
+            match node {
+                Node::Paragraph(_) | Node::Heading(_) | Node::ListItem(_) | Node::TableRow(_) => {
+                    out.push('\n')
+                }
+                Node::TableCell(_) => out.push(' '),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -378,5 +440,32 @@ fn explain(status: StatusCode, body: &str) -> String {
             "Claude returned error {}: {detail} Try again in a moment.",
             status.as_u16()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NO_KEY, plain};
+
+    #[test]
+    fn plain_reads_the_text_a_bubble_shows() {
+        assert_eq!(
+            plain(NO_KEY),
+            "No API key. Save it in ~/.config/anthropic/key and send again, or set ANTHROPIC_API_KEY and restart the app."
+        );
+        assert_eq!(plain("a **bold** word"), "a bold word");
+        assert_eq!(plain("an *em* word"), "an em word");
+        assert_eq!(plain("a ~~del~~ word"), "a del word");
+        assert_eq!(plain("a `code_x` word"), "a code_x word");
+        assert_eq!(plain("_private and snake_case"), "_private and snake_case");
+        assert_eq!(plain("MAX_ and \\_x"), "MAX_ and _x");
+        assert_eq!(
+            plain("Done.\n\n_(cut off at the 64000-token limit)_"),
+            "Done.\n(cut off at the 64000-token limit)"
+        );
+        assert_eq!(
+            plain("Try:\n\n```rust\nlet a_b = 1;\n```\n\nthen run"),
+            "Try:\nlet a_b = 1;\nthen run"
+        );
     }
 }

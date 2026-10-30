@@ -24,13 +24,15 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use qrcode::{Color, QrCode};
+use qrcode::QrCode;
 
 use magic_carpet_chat::coinos::lnurl_pay;
 use magic_carpet_chat::nostr::{self, WalletCreated};
 
-use crate::dashboard::{MONO, muted};
+use crate::a11y::Accessible as _;
+use crate::dashboard::MONO;
 use crate::palette::*;
+use crate::qr;
 use crate::shell::{AccountView, ProfileRead, Shell};
 use crate::timefmt;
 
@@ -117,7 +119,7 @@ impl WalletState {
         }
         // No LNURL means no QR and no hint, exactly as if nothing was known.
         self.qr = lnurl_pay(address).map(|lnurl| {
-            let code = QrCode::new(format!("lightning:{lnurl}").as_bytes()).ok().map(Arc::new);
+            let code = qr::encode(&format!("lightning:{lnurl}"));
             (address.to_string(), code)
         });
     }
@@ -167,12 +169,22 @@ impl SendInputs {
 
 /// The QR square's edge, including the quiet zone.
 const QR_SIZE: f32 = 220.;
-/// LUD-01 asks for a 4-module quiet zone around the code.
-const QUIET_ZONE: usize = 4;
+
+/// A status, error or empty line: the same text as the dashboard's `muted`,
+/// with a node so tests can read it.
+fn line(id: &'static str, text: impl Into<SharedString>, color: u32) -> Stateful<Div> {
+    let text = text.into();
+    div()
+        .text_size(px(12.5))
+        .text_color(rgb(color))
+        .child(text.clone())
+        .a11y(id, Role::Label, text)
+}
 
 fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div> {
     let base = div()
         .id(id)
+        .a11y(id, Role::Button, label)
         .px(px(14.))
         .py(px(8.))
         .rounded(px(9.))
@@ -194,44 +206,6 @@ fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div>
     }
 }
 
-/// `lightning:<LNURL>` painted module by module: white square, one quad per
-/// dark module, no image crate and no asset. Modules snap to whole pixels so
-/// the grid has no hairline seams a camera could misread.
-fn qr(code: Option<Arc<QrCode>>) -> AnyElement {
-    let Some(code) = code else {
-        return muted("Could not draw the QR code.", RED);
-    };
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let width = code.width();
-            window.paint_quad(fill(bounds, rgb(0xffffff)));
-            let total = (width + 2 * QUIET_ZONE) as f32;
-            let cell = (bounds.size.width / total).floor();
-            // Centre the whole-pixel grid inside the square.
-            let inset = (bounds.size.width - cell * total) / 2.;
-            let origin = bounds.origin + point(inset, inset);
-            for y in 0..width {
-                for x in 0..width {
-                    if code[(x, y)] == Color::Dark {
-                        let corner = origin
-                            + point(
-                                cell * (x + QUIET_ZONE) as f32,
-                                cell * (y + QUIET_ZONE) as f32,
-                            );
-                        window
-                            .paint_quad(fill(Bounds::new(corner, size(cell, cell)), rgb(0x000000)));
-                    }
-                }
-            }
-        },
-    )
-    .size(px(QR_SIZE))
-    .flex_shrink_0()
-    .rounded(px(8.))
-    .into_any_element()
-}
-
 /// The tag's two words: the signed change ("+15", "−30") and "was N".
 pub fn delta_text(previous: u64, current: u64) -> (String, String) {
     let signed = if current >= previous {
@@ -247,11 +221,13 @@ pub fn delta_text(previous: u64, current: u64) -> (String, String) {
 fn delta_tag(delta: &BalanceDelta) -> AnyElement {
     let (signed, was) = delta_text(delta.previous, delta.current);
     let tone = if delta.current >= delta.previous { GREEN } else { RED };
+    let label = format!("{signed} {was}");
     h_flex()
         .gap(px(4.))
         .text_size(px(11.))
         .child(div().text_color(rgb(tone)).child(signed))
         .child(div().text_color(rgb(TEXT_MUTED)).child(was))
+        .a11y("wallet-balance-delta", Role::Label, label)
         .with_animation(
             ElementId::NamedInteger("wallet-delta".into(), delta.seq),
             // t^4 stays near zero for most of the run, so the tag holds at
@@ -268,19 +244,26 @@ fn delta_tag(delta: &BalanceDelta) -> AnyElement {
 fn balance_line(state: &WalletState, first_funding: bool) -> AnyElement {
     match (state.balance, first_funding) {
         (Some(sats), true) if sats > 0 => {
-            muted(format!("Received {} sats", timefmt::fmt_sats(sats)), GREEN)
+            line("wallet-balance", format!("Received {} sats", timefmt::fmt_sats(sats)), GREEN)
+                .into_any_element()
         }
-        (_, true) => muted("Waiting for sats… scan with your phone wallet", TEXT_MUTED),
+        (_, true) => line(
+            "wallet-balance",
+            "Waiting for sats… scan with your phone wallet",
+            TEXT_MUTED,
+        )
+        .into_any_element(),
         (Some(sats), false) => h_flex()
             .gap(px(8.))
             .items_baseline()
-            .child(muted(
+            .child(line(
+                "wallet-balance",
                 format!("Balance: {} sats", timefmt::fmt_sats(sats)),
                 if sats > 0 { GREEN } else { TEXT_MUTED },
             ))
             .when_some(state.delta.as_ref(), |this, delta| this.child(delta_tag(delta)))
             .into_any_element(),
-        (None, false) => muted("Balance: …", TEXT_MUTED),
+        (None, false) => line("wallet-balance", "Balance: …", TEXT_MUTED).into_any_element(),
     }
 }
 
@@ -295,14 +278,20 @@ fn send_block(state: &WalletState, inputs: &SendInputs, cx: &mut Context<Shell>)
                 .gap(px(8.))
                 .items_center()
                 .child(Spinner::new().small().color(rgb(TEXT_MUTED).into()))
-                .child(muted("Sending…", TEXT_MUTED))
+                .child(line("wallet-send-status", "Sending…", TEXT_MUTED))
                 .into_any_element(),
         ),
-        Some(SendState::Sent { to, sats }) => Some(muted(
-            format!("Sent {} sats to {to}", timefmt::fmt_sats(*sats)),
-            GREEN,
-        )),
-        Some(SendState::Failed(message)) => Some(muted(message.clone(), RED)),
+        Some(SendState::Sent { to, sats }) => Some(
+            line(
+                "wallet-send-status",
+                format!("Sent {} sats to {to}", timefmt::fmt_sats(*sats)),
+                GREEN,
+            )
+            .into_any_element(),
+        ),
+        Some(SendState::Failed(message)) => {
+            Some(line("wallet-send-error", message.clone(), RED).into_any_element())
+        }
     };
     v_flex()
         .gap(px(8.))
@@ -319,8 +308,20 @@ fn send_block(state: &WalletState, inputs: &SendInputs, cx: &mut Context<Shell>)
             h_flex()
                 .gap(px(8.))
                 .items_center()
-                .child(div().w(px(220.)).text_size(px(12.5)).child(Input::new(&inputs.to)))
-                .child(div().w(px(90.)).text_size(px(12.5)).child(Input::new(&inputs.sats)))
+                .child(
+                    div().w(px(220.)).text_size(px(12.5)).child(
+                        Input::new(&inputs.to)
+                            .accessibility_id("wallet-send-to")
+                            .aria_label("Send to a Lightning address"),
+                    ),
+                )
+                .child(
+                    div().w(px(90.)).text_size(px(12.5)).child(
+                        Input::new(&inputs.sats)
+                            .accessibility_id("wallet-send-sats")
+                            .aria_label("Amount in sats"),
+                    ),
+                )
                 .child(
                     button("wallet-send", "Send", true)
                         .when(sending, |this| this.opacity(0.5))
@@ -353,7 +354,7 @@ pub fn panel(
             .gap(px(8.))
             .items_center()
             .child(Spinner::new().small().color(rgb(TEXT_MUTED).into()))
-            .child(muted("Opening a Coinos wallet…", TEXT_MUTED))
+            .child(line("wallet-opening", "Opening a Coinos wallet…", TEXT_MUTED))
     } else if let Some(address) = address {
         v_flex()
             .gap(px(10.))
@@ -361,17 +362,26 @@ pub fn panel(
                 h_flex()
                     .gap(px(8.))
                     .items_center()
-                    .child(muted("Lightning address", TEXT_MUTED))
+                    .child(line("wallet-address-label", "Lightning address", TEXT_MUTED))
                     .child(
                         div()
                             .font_family(MONO)
                             .text_size(px(13.))
                             .text_color(rgb(TEXT))
-                            .child(SharedString::new(address)),
+                            .child(SharedString::new(address))
+                            .a11y("wallet-address", Role::Label, SharedString::new(address)),
                     ),
             )
             .when_some(state.qr.as_ref().map(|(_, code)| code.clone()), |this, code| {
-                this.child(qr(code)).child(muted(
+                this.child(qr::labeled(
+                    code,
+                    QR_SIZE,
+                    "wallet-qr",
+                    "Funding QR code",
+                    "A lightning: link that pays this account's Lightning address",
+                ))
+                .child(line(
+                    "wallet-qr-hint",
                     "Scan with Strike or any Lightning wallet to add sats.",
                     TEXT_MUTED,
                 ))
@@ -393,7 +403,8 @@ pub fn panel(
                     v_flex()
                         .gap(px(10.))
                         .items_start()
-                        .child(muted(
+                        .child(line(
+                            "wallet-username",
                             format!(
                                 "Coinos username: {}. Only needed on coinos.io.",
                                 created.username
@@ -420,7 +431,8 @@ pub fn panel(
                         ),
                 )
                 .when_some(other.clone(), |this, other| {
-                    this.child(muted(
+                    this.child(line(
+                        "wallet-other-address",
                         format!("Your profile pays {other}, not this wallet. This app does not replace it."),
                         AMBER,
                     ))
@@ -429,7 +441,8 @@ pub fn panel(
                     created.publish_error.clone().filter(|_| other.is_none()),
                     |this, error| {
                         let for_retry = pubkey.clone();
-                        this.child(muted(
+                        this.child(line(
+                            "wallet-publish-warning",
                             "The wallet exists, but the address is not on your profile yet. \
                              Claims will not be paid until it is.",
                             AMBER,
@@ -441,24 +454,26 @@ pub fn panel(
                                 }),
                             ),
                         )
-                        .child(muted(error, AMBER))
+                        .child(line("wallet-publish-error", error, AMBER))
                     },
                 )
             })
     } else if nostr::is_issuer(&pubkey) {
         // The house issuer's wallet is the prod payer's, managed elsewhere;
         // rewriting its lud16 from here would redirect the instance's payouts.
-        v_flex().gap(px(10.)).child(muted(
+        v_flex().gap(px(10.)).child(line(
+            "wallet-managed-elsewhere",
             "The house key's wallet is not managed here.",
             TEXT_MUTED,
         ))
     } else if view.profile == ProfileRead::Checking {
-        v_flex().child(muted("Checking your profile…", TEXT_MUTED))
+        v_flex().child(line("wallet-checking", "Checking your profile…", TEXT_MUTED))
     } else if view.profile == ProfileRead::Failed {
         // Unknown is not "none": offer no wallet until the read succeeds.
         v_flex()
             .gap(px(10.))
-            .child(muted(
+            .child(line(
+                "wallet-profile-error",
                 "Couldn't read this profile. Check your connection.",
                 AMBER,
             ))
@@ -470,7 +485,8 @@ pub fn panel(
         let for_create = pubkey.clone();
         v_flex()
             .gap(px(10.))
-            .child(muted(
+            .child(line(
+                "wallet-no-address",
                 "No Lightning address yet — claims are accepted but never paid.",
                 AMBER,
             ))
@@ -483,7 +499,7 @@ pub fn panel(
     };
 
     body.when_some(state.error.clone(), |this, error| {
-        this.child(muted(error, RED))
+        this.child(line("wallet-error", error, RED))
     })
     .into_any_element()
 }

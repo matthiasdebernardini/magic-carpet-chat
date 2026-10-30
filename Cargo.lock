@@ -4303,6 +4303,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre-reqwest-client",
  "lightning-invoice",
+ "markdown",
  "nostr-sdk",
  "qrcode",
  "rand 0.9.5",
@@ -4314,6 +4315,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
+ "ttf-parser",
  "unicode-normalization",
 ]
 

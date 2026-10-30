@@ -14,6 +14,7 @@ use gpui_kit::component::{h_flex, input::Input, v_flex};
 
 use magic_carpet_chat::api::{Bounty, Claim};
 
+use crate::a11y::Accessible as _;
 use crate::account::Tab;
 use crate::dashboard::{MONO, count_badge};
 use crate::palette::*;
@@ -36,8 +37,10 @@ fn status_hue(status: &str) -> u32 {
     }
 }
 
-fn pill(text: impl Into<SharedString>, hue: u32) -> impl IntoElement {
+fn pill(id: String, text: impl Into<SharedString>, hue: u32) -> impl IntoElement {
+    let text = text.into();
     div()
+        .a11y(id, Role::Label, text.clone())
         .px(px(8.))
         .py(px(2.))
         .rounded_full()
@@ -46,19 +49,22 @@ fn pill(text: impl Into<SharedString>, hue: u32) -> impl IntoElement {
         .text_size(px(10.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(hue))
-        .child(text.into())
+        .child(text)
 }
 
-fn hint(text: impl Into<SharedString>) -> impl IntoElement {
+fn hint(id: impl Into<SharedString>, text: impl Into<SharedString>) -> impl IntoElement {
+    let text = text.into();
     div()
+        .a11y(id, Role::Label, text.clone())
         .text_size(px(11.))
         .text_color(rgb(TEXT_DIM))
-        .child(text.into())
+        .child(text)
 }
 
 /// A dot + line + optional meta row, the same visual grammar as the activity
 /// feed, reused for the per-claim payment timeline.
-fn timeline_row(dot: u32, text: String, meta: Option<String>) -> AnyElement {
+fn timeline_row(id: String, dot: u32, text: String, meta: Option<String>) -> AnyElement {
+    let meta_id = format!("{id}-meta");
     h_flex()
         .gap(px(9.))
         .items_start()
@@ -75,10 +81,16 @@ fn timeline_row(dot: u32, text: String, meta: Option<String>) -> AnyElement {
             v_flex()
                 .flex_1()
                 .min_w(px(0.))
-                .child(div().text_size(px(12.)).child(SharedString::from(text)))
+                .child(
+                    div()
+                        .a11y(id, Role::Label, text.clone())
+                        .text_size(px(12.))
+                        .child(SharedString::from(text)),
+                )
                 .when_some(meta, |this, meta| {
                     this.child(
                         div()
+                            .a11y(meta_id, Role::Label, meta.clone())
                             .text_size(px(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .font_family(MONO)
@@ -108,8 +120,9 @@ fn qualify_chip(bounty: &Bounty) -> Option<String> {
     ))
 }
 
-fn qualify_pill(text: String) -> AnyElement {
+fn qualify_pill(id: String, text: String) -> AnyElement {
     div()
+        .a11y(id, Role::Label, text.clone())
         .self_start()
         .mt(px(5.))
         .px(px(8.))
@@ -132,6 +145,7 @@ fn bounty_row(
     cx: &mut Context<Shell>,
 ) -> AnyElement {
     let id = bounty.id.clone();
+    let row_id = format!("bounty-row-{}", bounty.id);
     let dtag = coordinate_dtag(&bounty.list_coordinate).to_string();
     let status = bounty.effective_status().to_string();
     let counts = bounty
@@ -139,8 +153,19 @@ fn bounty_row(
         .as_ref()
         .map(|s| format!("paid {}/{}", s.paid_reward_count, s.total_reward_slots));
 
+    let sats = format!(
+        "{} sats{}",
+        timefmt::fmt_sats(bounty.amount_sats),
+        if bounty.reward_per_item_on() {
+            " / item"
+        } else {
+            ""
+        }
+    );
     v_flex()
-        .id(SharedString::from(format!("bounty-{}", bounty.id)))
+        .id(SharedString::from(row_id.clone()))
+        .a11y(row_id.clone(), Role::ListItem, dtag.clone())
+        .aria_selected(selected)
         .px(px(12.))
         .py(px(10.))
         .rounded(px(10.))
@@ -172,7 +197,11 @@ fn bounty_row(
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(SharedString::from(dtag)),
                 )
-                .child(pill(status.clone(), status_hue(&status))),
+                .child(pill(
+                    format!("{row_id}-status"),
+                    status.clone(),
+                    status_hue(&status),
+                )),
         )
         .child(
             h_flex()
@@ -182,23 +211,28 @@ fn bounty_row(
                 .font_family(MONO)
                 .text_size(px(10.5))
                 .text_color(rgb(TEXT_MUTED))
-                .child(SharedString::from(format!(
-                    "{} sats{}",
-                    timefmt::fmt_sats(bounty.amount_sats),
-                    if bounty.reward_per_item_on() {
-                        " / item"
-                    } else {
-                        ""
-                    }
-                )))
+                .child(
+                    div()
+                        .a11y(format!("{row_id}-sats"), Role::Label, sats.clone())
+                        .child(SharedString::from(sats)),
+                )
                 .when_some(counts, |this, counts| {
-                    this.child(SharedString::from(counts))
+                    this.child(
+                        div()
+                            .a11y(format!("{row_id}-paid"), Role::Label, counts.clone())
+                            .child(SharedString::from(counts)),
+                    )
                 })
                 .when(bounty.auto_pay_on(), |this| {
-                    this.child(div().text_color(rgb(GREEN)).child("auto-pay"))
+                    this.child(
+                        div()
+                            .a11y(format!("{row_id}-auto-pay"), Role::Label, "auto-pay")
+                            .text_color(rgb(GREEN))
+                            .child("auto-pay"),
+                    )
                 }),
         )
-        .children(chip.map(qualify_pill))
+        .children(chip.map(|chip| qualify_pill(format!("{row_id}-qualify"), chip)))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.select(id.clone());
             cx.notify();
@@ -223,6 +257,8 @@ fn tab(
 ) -> AnyElement {
     div()
         .id(id)
+        .a11y(id, Role::Tab, label.clone())
+        .aria_selected(on)
         .px(px(10.))
         .py(px(5.))
         .rounded(px(7.))
@@ -246,7 +282,7 @@ fn tab(
 /// eligible as, so read-only mode shows the house list alone.
 fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let house = tab(
-        "tab-house",
+        "bounties-tab-house",
         tab_label("House bounties", &shell.bounties),
         shell.bounty_tab == BountyTab::House,
         BountyTab::House,
@@ -254,7 +290,7 @@ fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     );
     let eligible = shell.eligible.as_ref().map(|slot| {
         tab(
-            "tab-eligible",
+            "bounties-tab-eligible",
             tab_label("Eligible for me to claim", &slot.list),
             shell.bounty_tab == BountyTab::Eligible,
             BountyTab::Eligible,
@@ -262,6 +298,7 @@ fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         )
     });
     h_flex()
+        .a11y("bounties-tabs", Role::TabList, "Bounty lists")
         .flex_wrap()
         .gap(px(6.))
         .mb(px(8.))
@@ -275,6 +312,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let body: Vec<AnyElement> = match shell.shown_list() {
         Load::Loading => vec![
             div()
+                .a11y("bounties-loading", Role::Label, "Loading bounties…")
                 .py(px(20.))
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_DIM))
@@ -289,10 +327,23 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                     .py(px(20.))
                     .text_size(px(12.5))
                     .text_color(rgb(TEXT_DIM))
-                    .child("No open bounties match your rank right now.")
+                    .child(
+                        div()
+                            .a11y(
+                                "bounties-empty",
+                                Role::Label,
+                                "No open bounties match your rank right now.",
+                            )
+                            .child("No open bounties match your rank right now."),
+                    )
                     .child(
                         div()
                             .id("eligible-identity")
+                            .a11y(
+                                "bounties-eligible-identity",
+                                Role::Button,
+                                "Share your npub from Identity & keys so someone can vouch for you.",
+                            )
                             .cursor_pointer()
                             .text_color(rgb(ACCENT_LIGHT))
                             .child("Share your npub from Identity & keys so someone can vouch for you.")
@@ -309,18 +360,21 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
             v_flex()
                 .gap(px(8.))
                 .py(px(12.))
-                .child(
+                .child({
+                    let text = format!(
+                        "{} didn't load: {message} Click Retry.",
+                        if eligible { "Eligible bounties" } else { "Bounties" }
+                    );
                     div()
+                        .a11y("bounties-error", Role::Label, text.clone())
                         .text_size(px(12.5))
                         .text_color(rgb(RED))
-                        .child(SharedString::from(format!(
-                            "{} didn't load: {message} Click Retry.",
-                            if eligible { "Eligible bounties" } else { "Bounties" }
-                        ))),
-                )
+                        .child(SharedString::from(text))
+                })
                 .child(
                     div()
                         .id("retry-list")
+                        .a11y("bounties-retry", Role::Button, "Retry (⌘R)")
                         .px(px(11.))
                         .py(px(5.))
                         .rounded(px(7.))
@@ -337,6 +391,11 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         ],
         Load::Ready(list) if list.is_empty() => vec![
             div()
+                .a11y(
+                    "bounties-empty",
+                    Role::Label,
+                    "No bounties yet. ⌘N creates the first one.",
+                )
                 .py(px(20.))
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_DIM))
@@ -361,6 +420,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     // must stay DIRECT children so scroll_to_item's indices match the list.
     v_flex()
         .id("bounty-list")
+        .a11y("bounties-list", Role::List, "Bounties")
         .flex_1()
         .min_h(px(0.))
         .overflow_y_scroll()
@@ -374,9 +434,11 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
 // ----------------------------------------------------------------- detail
 
 fn claim_card(claim: &Claim) -> AnyElement {
+    let cid = format!("claim-{}", claim.event.id);
     let now = timefmt::now_unix();
     let claim_ts = claim.event.created_at.unwrap_or(0);
     let mut rows: Vec<AnyElement> = vec![timeline_row(
+        format!("{cid}-submitted"),
         TEXT_MUTED,
         "Claim submitted".into(),
         Some(format!(
@@ -392,6 +454,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
         .filter(|r| !r.is_empty())
     {
         rows.push(timeline_row(
+            format!("{cid}-blocked"),
             AMBER,
             format!("Auto-pay stopped: {reason}"),
             None,
@@ -407,6 +470,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
             if row.state != "attempting"
                 && let Some(started) = row.created_at.filter(|ts| *ts > 0) {
                     rows.push(timeline_row(
+                        format!("{cid}-attempted"),
                         ACCENT,
                         "Auto-pay attempted".into(),
                         Some(format!(
@@ -445,9 +509,10 @@ fn claim_card(claim: &Claim) -> AnyElement {
                 "failed" => (RED, format!("Auto-pay failed{why}")),
                 other => (TEXT_MUTED, format!("Payment status: {other}{why}")),
             };
-            rows.push(timeline_row(dot, text, meta));
+            rows.push(timeline_row(format!("{cid}-payment"), dot, text, meta));
         }
         None => rows.push(timeline_row(
+            format!("{cid}-payment"),
             TEXT_DIM,
             "No auto-payment row yet".into(),
             None,
@@ -461,13 +526,17 @@ fn claim_card(claim: &Claim) -> AnyElement {
             .map(|sats| format!("{} sats · ", timefmt::fmt_sats(sats)))
             .unwrap_or_default();
         rows.push(timeline_row(
+            format!("{cid}-receipt"),
             GREEN,
             format!("Payment receipt {}", short_id(&receipt.receipt_id)),
             Some(format!("{amount}{secs} s after the claim")),
         ));
     }
 
+    let item = claim.item_name().to_string();
+    let by = format!("by {}", short_id(&claim.event.pubkey));
     v_flex()
+        .a11y(cid.clone(), Role::Group, item.clone())
         .px(px(14.))
         .py(px(11.))
         .rounded(px(10.))
@@ -481,26 +550,25 @@ fn claim_card(claim: &Claim) -> AnyElement {
                 .mb(px(4.))
                 .child(
                     div()
+                        .a11y(format!("{cid}-item"), Role::Label, item.clone())
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(SharedString::from(claim.item_name().to_string())),
+                        .child(SharedString::from(item)),
                 )
                 .child(
                     div()
+                        .a11y(format!("{cid}-author"), Role::Label, by.clone())
                         .font_family(MONO)
                         .text_size(px(10.5))
                         .text_color(rgb(TEXT_DIM))
-                        .child(SharedString::from(format!(
-                            "by {}",
-                            short_id(&claim.event.pubkey)
-                        ))),
+                        .child(SharedString::from(by)),
                 ),
         )
         .children(rows)
         .into_any_element()
 }
 
-fn fact(label: &'static str, value: String) -> AnyElement {
+fn fact(id: &'static str, label: &'static str, value: String) -> AnyElement {
     v_flex()
         .child(
             div()
@@ -511,6 +579,7 @@ fn fact(label: &'static str, value: String) -> AnyElement {
         )
         .child(
             div()
+                .a11y(id, Role::Label, value.clone())
                 .font_family(MONO)
                 .text_size(px(12.5))
                 .child(SharedString::from(value)),
@@ -521,6 +590,7 @@ fn fact(label: &'static str, value: String) -> AnyElement {
 fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let Some(selected) = shell.selected.as_deref() else {
         return div()
+            .a11y("bounty-detail-empty", Role::Label, "Select a bounty (↑/↓).")
             .flex_1()
             .py(px(20.))
             .text_size(px(12.5))
@@ -532,6 +602,7 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let detail = shell.details.get(selected);
     let Some(bounty) = shell.selected_bounty() else {
         return div()
+            .a11y("bounty-detail-loading", Role::Label, "Loading bounty…")
             .flex_1()
             .py(px(20.))
             .text_size(px(12.5))
@@ -543,7 +614,9 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let can_post = shell.can_post_on_list(bounty);
     let chip = shell.eligible_bounty(&bounty.id).and_then(qualify_chip);
     let status = bounty.effective_status().to_string();
+    let title = coordinate_dtag(&bounty.list_coordinate).to_string();
     let mut facts: Vec<AnyElement> = vec![fact(
+        "bounty-detail-reward",
         "REWARD",
         format!(
             "{} sats{}",
@@ -556,13 +629,14 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         ),
     )];
     if let Some(cap) = bounty.bounty_cap_sats {
-        facts.push(fact("CAP", format!("{} sats", timefmt::fmt_sats(cap))));
+        facts.push(fact("bounty-detail-cap", "CAP", format!("{} sats", timefmt::fmt_sats(cap))));
     }
     if let Some(rank) = bounty.auto_pay_min_rank {
-        facts.push(fact("MIN RANK", rank.to_string()));
+        facts.push(fact("bounty-detail-min-rank", "MIN RANK", rank.to_string()));
     }
     if let Some(state) = &bounty.payment_state {
         facts.push(fact(
+            "bounty-detail-slots",
             "SLOTS",
             format!(
                 "{} paid · {} open",
@@ -572,22 +646,31 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     }
 
     let claims: Vec<AnyElement> = match detail {
-        None => vec![
-            div()
-                .py(px(8.))
-                .text_size(px(12.))
-                .text_color(rgb(TEXT_DIM))
-                .child(if shell.selected_is_optimistic() {
-                    // The header above renders the just-submitted values; be
-                    // honest that the server has not echoed them back yet.
-                    "Created — syncing with the instance…"
-                } else {
-                    "Loading claims…"
-                })
-                .into_any_element(),
-        ],
+        None => {
+            let text = if shell.selected_is_optimistic() {
+                // The header above renders the just-submitted values; be
+                // honest that the server has not echoed them back yet.
+                "Created — syncing with the instance…"
+            } else {
+                "Loading claims…"
+            };
+            vec![
+                div()
+                    .a11y("claim-list-loading", Role::Label, text)
+                    .py(px(8.))
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT_DIM))
+                    .child(text)
+                    .into_any_element(),
+            ]
+        }
         Some(detail) if detail.claims.is_empty() => vec![
             div()
+                .a11y(
+                    "claim-list-empty",
+                    Role::Label,
+                    "No claims to show. Claims from accounts the issuer's score provider ranks below 2, or not at all, are hidden.",
+                )
                 .py(px(8.))
                 .text_size(px(12.))
                 .text_color(rgb(TEXT_DIM))
@@ -620,25 +703,29 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .items_center()
                 .child(
                     div()
+                        .a11y("bounty-detail-title", Role::Heading, title.clone())
                         .text_size(px(16.))
                         .font_weight(FontWeight::BOLD)
-                        .child(SharedString::from(
-                            coordinate_dtag(&bounty.list_coordinate).to_string(),
-                        )),
+                        .child(SharedString::from(title)),
                 )
-                .child(pill(status.clone(), status_hue(&status)))
+                .child(pill(
+                    "bounty-detail-status".into(),
+                    status.clone(),
+                    status_hue(&status),
+                ))
                 .child(if bounty.auto_pay_on() {
-                    pill("auto-pay", GREEN)
+                    pill("bounty-detail-paymode".into(), "auto-pay", GREEN)
                 } else {
-                    pill("manual pay", TEXT_MUTED)
+                    pill("bounty-detail-paymode".into(), "manual pay", TEXT_MUTED)
                 }),
         )
-        .children(chip.map(qualify_pill))
+        .children(chip.map(|chip| qualify_pill("bounty-detail-qualify".into(), chip)))
         .when_some(
             bounty.criteria.clone().filter(|c| !c.is_empty()),
             |this, criteria| {
                 this.child(
                     div()
+                        .a11y("bounty-detail-criteria", Role::Label, criteria.clone())
                         .text_size(px(12.5))
                         .text_color(rgb(TEXT_MUTED))
                         .child(SharedString::from(criteria)),
@@ -651,6 +738,11 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
             this.child(
                 div()
                     .id("new-bounty-on-list")
+                    .a11y(
+                        "bounty-detail-new-on-list",
+                        Role::Button,
+                        "New bounty on this list",
+                    )
                     .self_start()
                     .px(px(14.))
                     .py(px(6.))
@@ -673,6 +765,7 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .mt(px(4.))
                 .child(
                     div()
+                        .a11y("bounty-detail-claims-heading", Role::Heading, "Claims")
                         .text_size(px(13.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("Claims"),
@@ -684,6 +777,7 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         .child(
             v_flex()
                 .id("claim-list")
+                .a11y("claim-list", Role::List, "Claims")
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
@@ -697,6 +791,7 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
 // ------------------------------------------------------------------ forms
 
 fn form_card(
+    form_id: &'static str,
     title: String,
     rows: Vec<AnyElement>,
     error: Option<String>,
@@ -705,6 +800,7 @@ fn form_card(
     cx: &mut Context<Shell>,
 ) -> AnyElement {
     v_flex()
+        .a11y(form_id, Role::Group, title.clone())
         .w_full()
         .bg(rgb(BG_CARD))
         .border_1()
@@ -720,6 +816,7 @@ fn form_card(
                 .gap(px(10.))
                 .child(
                     div()
+                        .a11y(format!("{form_id}-title"), Role::Heading, title.clone())
                         .flex_1()
                         .text_size(px(15.))
                         .font_weight(FontWeight::BOLD)
@@ -728,6 +825,7 @@ fn form_card(
                 .child(
                     div()
                         .id("cancel-form")
+                        .a11y(format!("{form_id}-cancel"), Role::Button, "Cancel (esc)")
                         .px(px(11.))
                         .py(px(5.))
                         .rounded(px(7.))
@@ -744,20 +842,25 @@ fn form_card(
         .when_some(error, |this, error| {
             this.child(
                 div()
+                    .a11y(format!("{form_id}-error"), Role::Label, error.clone())
                     .text_size(px(12.))
                     .text_color(rgb(RED))
                     .child(SharedString::from(error)),
             )
         })
-        .child(hint(busy.unwrap_or(hint_text)))
+        .child(hint(
+            format!("{form_id}-status"),
+            busy.unwrap_or(hint_text),
+        ))
         .into_any_element()
 }
 
-fn labeled_input(label: &'static str, input: AnyElement) -> AnyElement {
+fn labeled_input(id: &'static str, label: &'static str, input: AnyElement) -> AnyElement {
     v_flex()
         .gap(px(3.))
         .child(
             div()
+                .a11y(format!("{id}-label"), Role::Label, label)
                 .text_size(px(10.5))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(TEXT_DIM))
@@ -766,6 +869,18 @@ fn labeled_input(label: &'static str, input: AnyElement) -> AnyElement {
         .child(input)
         .into_any_element()
 }
+
+/// Accessibility ids of the new-bounty form's fields, parallel to
+/// `BOUNTY_FIELD_DEFS`.
+const BOUNTY_FIELD_IDS: [&str; 7] = [
+    "bounty-form-item-singular",
+    "bounty-form-item-plural",
+    "bounty-form-description",
+    "bounty-form-criteria",
+    "bounty-form-amount",
+    "bounty-form-cap",
+    "bounty-form-min-rank",
+];
 
 fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
     if let Some(form) = &shell.bounty_form {
@@ -780,8 +895,14 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             .iter()
             .map(|coordinate| {
                 labeled_input(
+                    "bounty-form-list",
                     "List",
                     div()
+                        .a11y(
+                            "bounty-form-list",
+                            Role::Label,
+                            coordinate_dtag(coordinate).to_string(),
+                        )
                         .text_size(px(12.5))
                         .text_color(rgb(TEXT_MUTED))
                         .child(SharedString::from(coordinate_dtag(coordinate).to_string()))
@@ -789,10 +910,25 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
                 )
             })
             .collect();
-        rows.extend(BOUNTY_FIELD_DEFS.iter().zip(&form.fields).skip(hidden).map(
-            |((label, _, _), field)| labeled_input(label, Input::new(field).into_any_element()),
-        ));
+        rows.extend(
+            BOUNTY_FIELD_DEFS
+                .iter()
+                .zip(BOUNTY_FIELD_IDS)
+                .zip(&form.fields)
+                .skip(hidden)
+                .map(|(((label, _, _), id), field)| {
+                    labeled_input(
+                        id,
+                        label,
+                        Input::new(field)
+                            .accessibility_id(id)
+                            .aria_label(*label)
+                            .into_any_element(),
+                    )
+                }),
+        );
         return Some(form_card(
+            "bounty-form",
             if form.existing_list.is_some() {
                 "New bounty on this list".into()
             } else {
@@ -842,10 +978,18 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             })
             .unwrap_or_default();
         let rows = vec![
-            labeled_input("Item name", Input::new(&form.name).into_any_element()),
-            hint(format!("{payout}{RANK_NOTE}")).into_any_element(),
+            labeled_input(
+                "claim-form-item-name",
+                "Item name",
+                Input::new(&form.name)
+                    .accessibility_id("claim-form-item-name")
+                    .aria_label("Item name")
+                    .into_any_element(),
+            ),
+            hint("claim-form-note", format!("{payout}{RANK_NOTE}")).into_any_element(),
         ];
         return Some(form_card(
+            "claim-form",
             format!("Claim an item on {dtag}{reward}"),
             rows,
             form.error.clone(),
@@ -885,15 +1029,17 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                 .mb(px(18.))
                 .child(
                     div()
+                        .a11y("bounties-title", Role::Heading, "Bounties")
                         .text_size(px(21.))
                         .font_weight(FontWeight::BOLD)
                         .child("Bounties"),
                 )
-                .child(hint("↑/↓ select · ⌘N new · ⌘R refresh · ⌘] switch account"))
+                .child(hint("bounties-keys-hint", "↑/↓ select · ⌘N new · ⌘R refresh · ⌘] switch account"))
                 .child(div().flex_1())
                 .child(
                     div()
                         .id("new-on-bounties")
+                        .a11y("bounties-new", Role::Button, action_label)
                         .flex_shrink_0()
                         .px(px(16.))
                         .py(px(8.))

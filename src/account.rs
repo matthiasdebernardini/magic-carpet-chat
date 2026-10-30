@@ -24,8 +24,9 @@ use magic_carpet_chat::nostr;
 use magic_carpet_chat::secrets::Secret;
 use magic_carpet_chat::trust::{self, Assertion, BrainstormKey, Designation};
 
+use crate::a11y::Accessible;
 use crate::community;
-use crate::dashboard::{MONO, muted};
+use crate::dashboard::MONO;
 use crate::palette::*;
 use crate::shell::{AccountView, Screen, Shell, display_name, short_id, short_npub};
 use crate::timefmt;
@@ -49,6 +50,17 @@ impl Tab {
             Tab::Progress => "Progress",
             Tab::Wallet => "Wallet",
             Tab::Limits => "Limits & defaults",
+        }
+    }
+
+    /// The tab's a11y id.
+    fn id(self) -> &'static str {
+        match self {
+            Tab::Identity => "account-tab-identity",
+            Tab::Trust => "account-tab-trust",
+            Tab::Progress => "account-tab-progress",
+            Tab::Wallet => "account-tab-wallet",
+            Tab::Limits => "account-tab-limits",
         }
     }
 }
@@ -125,7 +137,12 @@ fn card() -> Div {
 
 /// A card's header line: title, the kind it reads in mono, and the verdict
 /// pill at the right edge.
-fn card_head(title: &'static str, kind: &'static str, pill: AnyElement) -> impl IntoElement {
+fn card_head(
+    id: &'static str,
+    title: &'static str,
+    kind: &'static str,
+    pill: AnyElement,
+) -> impl IntoElement {
     h_flex()
         .gap(px(10.))
         .items_center()
@@ -133,7 +150,8 @@ fn card_head(title: &'static str, kind: &'static str, pill: AnyElement) -> impl 
             div()
                 .text_size(px(14.5))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(title),
+                .child(title)
+                .a11y(id, Role::Heading, title),
         )
         .child(
             div()
@@ -148,7 +166,7 @@ fn card_head(title: &'static str, kind: &'static str, pill: AnyElement) -> impl 
 
 /// The Located / Not located / None found pill: a dot and small caps label
 /// on a wash of the same colour.
-fn status_pill(label: &'static str, color: u32, fill: u32) -> AnyElement {
+fn status_pill(id: &'static str, label: &'static str, color: u32, fill: u32) -> AnyElement {
     h_flex()
         .gap(px(7.))
         .items_center()
@@ -161,6 +179,7 @@ fn status_pill(label: &'static str, color: u32, fill: u32) -> AnyElement {
         .text_color(rgb(color))
         .child(div().size(px(6.)).rounded_full().bg(rgb(color)))
         .child(label)
+        .a11y(id, Role::Label, label)
         .into_any_element()
 }
 
@@ -172,8 +191,9 @@ fn outline_button(
     cx: &mut Context<Shell>,
     on_click: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
 ) -> impl IntoElement {
+    let id = id.into();
     div()
-        .id(id.into())
+        .id(id.clone())
         .flex_shrink_0()
         .px(px(13.))
         .py(px(6.))
@@ -185,6 +205,7 @@ fn outline_button(
         .text_color(rgb(color))
         .hover(move |this| this.border_color(rgb(ACCENT)))
         .child(label)
+        .a11y(id, Role::Button, label)
         .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
 }
 
@@ -201,6 +222,7 @@ fn open_link(
         .text_size(px(12.5))
         .text_color(rgb(ACCENT_LIGHT))
         .child(label)
+        .a11y(id, Role::Link, label)
         .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
 }
 
@@ -235,17 +257,19 @@ fn raw_toggle(
     cx: &mut Context<Shell>,
 ) -> impl IntoElement {
     let key_owned = key.to_string();
+    let toggle_text = if open {
+        format!("▾ Hide {label}")
+    } else {
+        format!("▸ View {label}")
+    };
     let toggle = div()
-        .id(SharedString::from(format!("raw-{key}")))
+        .id(SharedString::from(format!("account-trust-raw-{key}")))
         .mt(px(14.))
         .cursor_pointer()
         .text_size(px(12.))
         .text_color(rgb(ACCENT_LIGHT))
-        .child(if open {
-            format!("▾ Hide {label}")
-        } else {
-            format!("▸ View {label}")
-        })
+        .child(toggle_text.clone())
+        .a11y(format!("account-trust-raw-{key}"), Role::Button, toggle_text)
         .on_click(cx.listener(move |this, _, _, cx| {
             if let Some(page) = &mut this.account_page {
                 if open {
@@ -261,7 +285,7 @@ fn raw_toggle(
         .when(open, |this| {
             this.child(
                 div()
-                    .id(SharedString::from(format!("raw-scroll-{key}")))
+                    .id(SharedString::from(format!("account-trust-raw-scroll-{key}")))
                     .mt(px(10.))
                     .w_full()
                     .bg(rgb(BG_RAIL))
@@ -282,6 +306,8 @@ fn raw_toggle(
             )
         })
 }
+
+const MISSING_MAP_TEXT: &str = "Your personalized community trust scores cannot be located because the relevant piece of published data (a kind-10040 \"Treasure Map\") could not be found. Please go to Brainstorm and follow the prompts to set up your trust network, then come back here.";
 
 /// The red "!" note the mock uses for a missing Treasure Map. The Brainstorm
 /// in its sentence is a link — drawn as its own line inside the box, since
@@ -310,9 +336,9 @@ fn missing_map_note(cx: &mut Context<Shell>) -> impl IntoElement {
                 .flex_1()
                 .min_w(px(0.))
                 .gap(px(6.))
-                .child("Your personalized community trust scores cannot be located because the relevant piece of published data (a kind-10040 \"Treasure Map\") could not be found. Please go to Brainstorm and follow the prompts to set up your trust network, then come back here.")
+                .child(div().a11y("account-trust-missing-map", Role::Label, MISSING_MAP_TEXT).child(MISSING_MAP_TEXT))
                 .child(open_link(
-                    "brainstorm-link",
+                    "account-trust-brainstorm-link",
                     "Open Brainstorm ↗",
                     "https://brainstorm.world".to_string(),
                     cx,
@@ -344,7 +370,8 @@ pub(crate) fn render_accounts(shell: &Shell, cx: &mut Context<Shell>) -> AnyElem
                     div()
                         .text_size(px(21.))
                         .font_weight(FontWeight::BOLD)
-                        .child("Accounts"),
+                        .child("Accounts")
+                        .a11y("accounts-title", Role::Heading, "Accounts"),
                 )
                 .child(div().flex_1())
                 .child(outline_button(
@@ -363,12 +390,15 @@ pub(crate) fn render_accounts(shell: &Shell, cx: &mut Context<Shell>) -> AnyElem
                 .child("Each account is its own nsec, wallet, limits, and payment log. All of them watch the relay at once."),
         )
         .child(
-            v_flex().gap(px(12.)).children(
-                shell
-                    .views()
-                    .enumerate()
-                    .map(|(ix, view)| account_card(shell, ix, view, cx)),
-            ),
+            v_flex()
+                .gap(px(12.))
+                .children(
+                    shell
+                        .views()
+                        .enumerate()
+                        .map(|(ix, view)| account_card(shell, ix, view, cx)),
+                )
+                .a11y("accounts-list", Role::List, "Accounts"),
         )
         .child(
             div()
@@ -390,6 +420,12 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
         .balance
         .map(timefmt::fmt_sats)
         .unwrap_or_else(|| "—".to_string());
+    let card_id = format!("accounts-card-{}", view.pubkey);
+    let name = display_name(view);
+    let payout = match view.payout_address() {
+        Some(address) => format!("payouts → {address}"),
+        None => "no payout address yet".to_string(),
+    };
     h_flex()
         .w_full()
         .items_center()
@@ -400,6 +436,7 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
         .rounded(px(14.))
         .px(px(20.))
         .py(px(18.))
+        .a11y(card_id.clone(), Role::Group, name.clone())
         .child(Shell::account_marker(view, ix, 46., 16.))
         .child(
             v_flex()
@@ -413,7 +450,8 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
                             div()
                                 .text_size(px(14.5))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(SharedString::from(display_name(view))),
+                                .child(SharedString::from(name.clone()))
+                                .a11y(format!("{card_id}-name"), Role::Label, name.clone()),
                         )
                         .when(is_active, |this| {
                             this.child(
@@ -425,7 +463,8 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
                                     .text_size(px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(GREEN))
-                                    .child("active"),
+                                    .child("active")
+                                    .a11y(format!("{card_id}-active"), Role::Label, "active"),
                             )
                         }),
                 )
@@ -435,17 +474,16 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
                         .font_family(MONO)
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_DIM))
-                        .child(SharedString::from(view.npub.clone())),
+                        .child(SharedString::from(view.npub.clone()))
+                        .a11y(format!("{card_id}-npub"), Role::Label, view.npub.clone()),
                 )
                 .child(
                     div()
                         .mt(px(3.))
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_MUTED))
-                        .child(SharedString::from(match view.payout_address() {
-                            Some(address) => format!("payouts → {address}"),
-                            None => "no payout address yet".to_string(),
-                        })),
+                        .child(SharedString::from(payout.clone()))
+                        .a11y(format!("{card_id}-payout"), Role::Label, payout),
                 ),
         )
         .child(
@@ -462,7 +500,8 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
                                 .text_size(px(15.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(AMBER))
-                                .child(balance),
+                                .child(balance.clone())
+                                .a11y(format!("{card_id}-balance"), Role::Label, balance),
                         )
                         .child(
                             div()
@@ -478,7 +517,7 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
                         .when(!is_active, |this| {
                             let pubkey = pubkey.clone();
                             this.child(outline_button(
-                                format!("switch-{ix}"),
+                                format!("{card_id}-switch"),
                                 "Switch",
                                 TEXT,
                                 cx,
@@ -486,7 +525,7 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
                             ))
                         })
                         .child(outline_button(
-                            format!("manage-{ix}"),
+                            format!("{card_id}-manage"),
                             "Manage",
                             ACCENT_LIGHT,
                             cx,
@@ -506,12 +545,22 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
 /// built; the other three tabs say "Coming soon."
 pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let Some(page) = &shell.account_page else {
-        return muted("No account selected.", TEXT_MUTED);
+        return div()
+            .text_size(px(12.5))
+            .text_color(rgb(TEXT_MUTED))
+            .child("No account selected.")
+            .a11y("account-none", Role::Label, "No account selected.")
+            .into_any_element();
     };
     let pubkey = page.pubkey.clone();
     let tab = page.tab;
     let Some(view) = shell.view(&pubkey) else {
-        return muted("This account was removed.", TEXT_MUTED);
+        return div()
+            .text_size(px(12.5))
+            .text_color(rgb(TEXT_MUTED))
+            .child("This account was removed.")
+            .a11y("account-removed", Role::Label, "This account was removed.")
+            .into_any_element();
     };
     let is_active = shell.active.as_deref() == Some(pubkey.as_str());
     let npub = view.npub.clone();
@@ -533,6 +582,7 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                 .text_color(rgb(TEXT_MUTED))
                 .hover(|this| this.text_color(rgb(TEXT)))
                 .child("← All accounts")
+                .a11y("account-back", Role::Button, "← All accounts")
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.go(Screen::Accounts, window, cx);
                 })),
@@ -555,7 +605,8 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                                     div()
                                         .text_size(px(21.))
                                         .font_weight(FontWeight::BOLD)
-                                        .child(SharedString::from(display_name(view))),
+                                        .child(SharedString::from(display_name(view)))
+                                        .a11y("account-title", Role::Heading, display_name(view)),
                                 )
                                 .when(is_active, |this| {
                                     this.child(
@@ -567,7 +618,8 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                                             .text_size(px(10.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(GREEN))
-                                            .child("active"),
+                                            .child("active")
+                                            .a11y("account-active", Role::Label, "active"),
                                     )
                                 }),
                         )
@@ -577,13 +629,14 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                                 .font_family(MONO)
                                 .text_size(px(12.5))
                                 .text_color(rgb(TEXT_MUTED))
-                                .child(short_npub(&npub)),
+                                .child(short_npub(&npub))
+                                .a11y("account-npub", Role::Label, short_npub(&npub)),
                         ),
                 )
                 .child({
                     let url = format!("https://brainstorm.world/profile/{npub}");
                     div()
-                        .id("view-profile")
+                        .id("account-view-profile")
                         .flex_shrink_0()
                         .px(px(16.))
                         .py(px(8.))
@@ -595,12 +648,13 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                         .text_color(rgb(ACCENT_LIGHT))
                         .hover(|this| this.border_color(rgb(ACCENT)))
                         .child("View profile")
+                        .a11y("account-view-profile", Role::Link, "View profile")
                         .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
                 })
                 .when(!is_active, |this| {
                     let pubkey = pubkey.clone();
                     this.child(outline_button(
-                        "switch-to-account",
+                        "account-switch",
                         "Switch to this account",
                         TEXT,
                         cx,
@@ -614,6 +668,7 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                 .mb(px(18.))
                 .border_b_1()
                 .border_color(rgb(BORDER))
+                .a11y("account-tabs", Role::TabList, "Account sections")
                 .children(
                     [
                         Tab::Identity,
@@ -626,7 +681,7 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                     .map(|item| {
                         let on = tab == item;
                         div()
-                            .id(SharedString::from(format!("tab-{}", item.label())))
+                            .id(item.id())
                             .px(px(14.))
                             .py(px(8.))
                             .mb(px(-1.))
@@ -636,6 +691,8 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                             .border_b_2()
                             .border_color(if on { rgb(ACCENT) } else { rgba(0x00000000) })
                             .child(item.label())
+                            .a11y(item.id(), Role::Tab, item.label())
+                            .aria_selected(on)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(page) = &mut this.account_page {
                                     if page.tab != item {
@@ -651,7 +708,20 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
         .child(match tab {
             Tab::Identity => render_identity(shell, &pubkey, &npub, cx),
             Tab::Trust => render_trust(shell, &pubkey, cx),
-            _ => muted("Coming soon.", TEXT_MUTED),
+            _ => div()
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT_MUTED))
+                .child("Coming soon.")
+                .a11y(
+                    match tab {
+                        Tab::Progress => "account-progress-soon",
+                        Tab::Wallet => "account-wallet-soon",
+                        _ => "account-limits-soon",
+                    },
+                    Role::Label,
+                    "Coming soon.",
+                )
+                .into_any_element(),
         })
         .into_any_element()
 }
@@ -675,12 +745,13 @@ fn render_identity(
 }
 
 /// The card title the Identity tab uses: no kind, no pill.
-fn plain_title(title: &'static str) -> impl IntoElement {
+fn plain_title(id: &'static str, title: &'static str) -> impl IntoElement {
     div()
         .mb(px(4.))
         .text_size(px(14.5))
         .font_weight(FontWeight::SEMIBOLD)
         .child(title)
+        .a11y(id, Role::Heading, title)
 }
 
 fn card_note(text: &'static str) -> impl IntoElement {
@@ -705,7 +776,12 @@ fn key_row(border: u32) -> Div {
 }
 
 /// The key text: mono, and free to wrap anywhere inside the row.
-fn key_text(text: impl Into<SharedString>, color: u32) -> impl IntoElement {
+fn key_text(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+    color: u32,
+) -> impl IntoElement {
     div()
         .flex_1()
         .min_w(px(0.))
@@ -713,6 +789,7 @@ fn key_text(text: impl Into<SharedString>, color: u32) -> impl IntoElement {
         .text_size(px(12.5))
         .text_color(rgb(color))
         .child(text.into())
+        .a11y(id, Role::Label, label)
 }
 
 /// A filled small button ("Reveal", "Hide").
@@ -736,6 +813,7 @@ fn fill_button(
         .text_color(rgb(color))
         .hover(|this| this.bg(rgb(0x32324c)))
         .child(label)
+        .a11y(id, Role::Button, label)
         .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
 }
 
@@ -746,15 +824,15 @@ fn public_identity_card(shell: &Shell, npub: &str, cx: &mut Context<Shell>) -> A
         .is_some_and(|page| page.copied.as_deref() == Some("npub"));
     let copy = npub.to_string();
     card()
-        .child(plain_title("Public identity"))
+        .child(plain_title("account-public-title", "Public identity"))
         .child(card_note(
             "Safe to share — this is how vouchers and bounty lists find you.",
         ))
         .child(
             key_row(0x2a2a40ff)
-                .child(key_text(npub.to_string(), TEXT))
+                .child(key_text("account-npub-text", npub.to_string(), npub.to_string(), TEXT))
                 .child(outline_button(
-                    "copy-npub",
+                    "account-copy-npub",
                     if copied { "copied" } else { "copy" },
                     ACCENT_LIGHT,
                     cx,
@@ -767,8 +845,13 @@ fn public_identity_card(shell: &Shell, npub: &str, cx: &mut Context<Shell>) -> A
                     },
                 )),
         )
+        .child(
+            div()
+                .mt(px(12.))
+                .child(crate::qr::view(crate::qr::encode(&crate::qr::npub_link(npub)), 160.)),
+        )
         .child(div().mt(px(12.)).child(open_link(
-            "identity-view-profile",
+            "account-identity-view-profile",
             "View this profile on Brainstorm ↗",
             format!("https://brainstorm.world/profile/{npub}"),
             cx,
@@ -783,7 +866,7 @@ fn secret_key_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyE
     let copy_button = {
         let pubkey = pubkey.to_string();
         outline_button(
-            "copy-nsec",
+            "account-copy-nsec",
             if copied { "copied" } else { "copy" },
             ACCENT_LIGHT,
             cx,
@@ -796,11 +879,13 @@ fn secret_key_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyE
             let pubkey = pubkey.to_string();
             key_row(0x2a2a40ff)
                 .child(key_text(
+                    "account-nsec-text",
+                    "nsec1••••••••••••••••••••••••••••••••••••••••••••••••••••",
                     "nsec1••••••••••••••••••••••••••••••••••••••••••••••••••••",
                     TEXT_DIM,
                 ))
                 .child(fill_button(
-                    "reveal-nsec",
+                    "account-reveal-nsec",
                     "Reveal",
                     TEXT,
                     cx,
@@ -813,10 +898,16 @@ fn secret_key_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyE
             .child(
                 key_row(0xe5646c55)
                     // The one place the nsec is formatted for display.
-                    .child(key_text(revealed.nsec.expose().to_string(), 0xf0c9cc))
+                    // The label is fixed: the key itself never reaches the tree.
+                    .child(key_text(
+                        "account-nsec-text",
+                        "Secret key",
+                        revealed.nsec.expose().to_string(),
+                        0xf0c9cc,
+                    ))
                     .child(copy_button)
                     .child(fill_button(
-                        "hide-nsec",
+                        "account-hide-nsec",
                         "Hide",
                         TEXT_MUTED,
                         cx,
@@ -847,18 +938,25 @@ fn secret_key_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyE
                             .font_weight(FontWeight::BOLD)
                             .child("!"),
                     )
-                    .child(div().flex_1().min_w(px(0.)).child(format!(
-                        "Anyone with this key is this identity — they can spend from \
-                         its wallet connection and sign as you. Paste it only into a \
-                         signer you trust (a browser extension or native app), never \
-                         into a website. It hides again in {}s.",
-                        revealed.seconds_left()
-                    ))),
+                    .child({
+                        let warning = format!(
+                            "Anyone with this key is this identity — they can spend from \
+                             its wallet connection and sign as you. Paste it only into a \
+                             signer you trust (a browser extension or native app), never \
+                             into a website. It hides again in {}s.",
+                            revealed.seconds_left()
+                        );
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(warning.clone())
+                            .a11y("account-nsec-warning", Role::Label, warning)
+                    }),
             )
             .into_any_element(),
     };
     card()
-        .child(plain_title("Secret key (nsec)"))
+        .child(plain_title("account-secret-title", "Secret key (nsec)"))
         .child(card_note(
             "Stored on this computer in accounts.json. Export it to move this \
              identity into another signer — a browser extension like Alby or \
@@ -888,7 +986,8 @@ fn remove_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyEleme
                                 .text_size(px(14.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(0xf0a9ae))
-                                .child("Remove this account"),
+                                .child("Remove this account")
+                                .a11y("account-remove-title", Role::Heading, "Remove this account"),
                         )
                         .child(
                             div()
@@ -906,13 +1005,14 @@ fn remove_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyEleme
                                     .mt(px(6.))
                                     .text_size(px(12.5))
                                     .text_color(rgb(AMBER))
-                                    .child(warning),
+                                    .child(warning.clone())
+                                    .a11y("account-remove-warning", Role::Label, warning),
                             )
                         }),
                 )
                 .child(
                     div()
-                        .id("remove-this-account")
+                        .id("account-remove")
                         .flex_shrink_0()
                         .px(px(16.))
                         .py(px(8.))
@@ -926,6 +1026,11 @@ fn remove_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyEleme
                         .text_color(rgb(RED))
                         .hover(|this| this.bg(wash(0xe5646c14)))
                         .child(if armed { "Click again to remove" } else { "Remove…" })
+                        .a11y(
+                            "account-remove",
+                            Role::Button,
+                            if armed { "Click again to remove" } else { "Remove…" },
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.remove_account(pubkey.clone(), cx)
                         })),
@@ -947,18 +1052,19 @@ fn render_trust(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyElem
         .child(assertions_card(shell, pubkey, state, now, cx))
         .child(min_rank_card())
         .child(determination_card(shell, pubkey))
-        .child(web_of_trust_card(pubkey, state, cx))
+        .child(web_of_trust_card(shell, pubkey, state, cx))
         .into_any_element()
 }
 
 /// The group's uppercase dim label.
-fn group_label(text: &'static str) -> impl IntoElement {
+fn group_label(id: &'static str, text: &'static str) -> impl IntoElement {
     div()
         .mt(px(16.))
         .text_size(px(9.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(TEXT_DIM))
         .child(text)
+        .a11y(id, Role::Heading, text)
 }
 
 /// One assertion's fact grid, shared by both perspectives: located count,
@@ -980,20 +1086,27 @@ fn assertion_facts(
         }
         None => "not linked by follows".to_string(),
     };
+    let located = format!("1 current score from {prefix}");
+    let recent = format!(
+        "{} — {}",
+        timefmt::relative(now, assertion.at),
+        timefmt::month_day_year(assertion.at)
+    );
+    let rank_text = format!("rank {}", assertion.rank);
     v_flex()
         .mt(px(12.))
         .gap(px(9.))
         .child(fact(
             "Located",
-            div().child(format!("1 current score from {prefix}")),
+            div()
+                .child(located.clone())
+                .a11y(format!("account-trust-{raw_key}-located"), Role::Label, located),
         ))
         .child(fact(
             "Most recent",
-            div().child(format!(
-                "{} — {}",
-                timefmt::relative(now, assertion.at),
-                timefmt::month_day_year(assertion.at)
-            )),
+            div()
+                .child(recent.clone())
+                .a11y(format!("account-trust-{raw_key}-recent"), Role::Label, recent),
         ))
         .child(fact(
             if own_pov { "Rank" } else { "Current rank" },
@@ -1010,13 +1123,15 @@ fn assertion_facts(
                         .text_size(px(12.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(GREEN))
-                        .child(format!("rank {}", assertion.rank)),
+                        .child(rank_text.clone())
+                        .a11y(format!("account-trust-{raw_key}-rank"), Role::Label, rank_text),
                 )
                 .child(
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_MUTED))
-                        .child(hops_line),
+                        .child(hops_line.clone())
+                        .a11y(format!("account-trust-{raw_key}-hops"), Role::Label, hops_line),
                 ),
         ))
         .when(own_pov && assertion.hops == Some(0), |this| {
@@ -1024,7 +1139,12 @@ fn assertion_facts(
                 div()
                     .text_size(px(11.5))
                     .text_color(rgb(TEXT_DIM))
-                    .child("This is your own point of view. Your score provider scores everyone from your view, you included."),
+                    .child("This is your own point of view. Your score provider scores everyone from your view, you included.")
+                    .a11y(
+                        "account-trust-own-pov-note",
+                        Role::Label,
+                        "This is your own point of view. Your score provider scores everyone from your view, you included.",
+                    ),
             )
         })
         .child(raw_toggle(
@@ -1039,7 +1159,7 @@ fn assertion_facts(
 
 /// A group's failure or empty line, plus the "Check again" button.
 fn assertion_note(
-    id: &'static str,
+    key: &'static str,
     pubkey: &str,
     text: String,
     cx: &mut Context<Shell>,
@@ -1053,9 +1173,10 @@ fn assertion_note(
             div()
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_MUTED))
-                .child(SharedString::from(text)),
+                .child(SharedString::from(text.clone()))
+                .a11y(format!("account-trust-{key}-error"), Role::Label, text),
         )
-        .child(outline_button(id, "Check again", TEXT_MUTED, cx, move |this, _, cx| {
+        .child(outline_button(format!("account-trust-{key}-check-again"), "Check again", TEXT_MUTED, cx, move |this, _, cx| {
             this.fetch_trust(&pubkey);
             cx.notify();
         }))
@@ -1071,11 +1192,15 @@ fn assertion_group_body(
     prefix: &'static str,
     own_pov: bool,
     raw_key: &'static str,
-    fail_id: &'static str,
     page: &AccountPage,
     now: u64,
     cx: &mut Context<Shell>,
 ) -> AnyElement {
+    let none_found = if own_pov {
+        "No kind-30382 score events about this npub were found from the rank provider."
+    } else {
+        "No score about this npub from the instance's rank provider yet. A new identity has rank 0 until someone vouches for it — send your npub to a voucher."
+    };
     let body: AnyElement = match &evidence.last {
         Some(Some(assertion)) => {
             assertion_facts(prefix, assertion, raw_key, own_pov, now, page, cx).into_any_element()
@@ -1084,21 +1209,19 @@ fn assertion_group_body(
             .mt(px(12.))
             .text_size(px(12.5))
             .text_color(rgb(TEXT_MUTED))
-            .child(if own_pov {
-                "No kind-30382 score events about this npub were found from the rank provider."
-            } else {
-                "No score about this npub from the instance's rank provider yet. A new identity has rank 0 until someone vouches for it — send your npub to a voucher."
-            })
+            .child(none_found)
+            .a11y(format!("account-trust-{raw_key}-none"), Role::Label, none_found)
             .into_any_element(),
         None => match &evidence.status {
             Status::Failed(message) => {
-                return assertion_note(fail_id, pubkey, message.clone(), cx);
+                return assertion_note(raw_key, pubkey, message.clone(), cx);
             }
             _ => div()
                 .mt(px(12.))
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_DIM))
                 .child("Checking…")
+                .a11y(format!("account-trust-{raw_key}-checking"), Role::Label, "Checking…")
                 .into_any_element(),
         },
     };
@@ -1106,7 +1229,7 @@ fn assertion_group_body(
     match &evidence.status {
         Status::Failed(message) => v_flex()
             .child(body)
-            .child(assertion_note(fail_id, pubkey, message.clone(), cx))
+            .child(assertion_note(raw_key, pubkey, message.clone(), cx))
             .into_any_element(),
         _ => body,
     }
@@ -1120,21 +1243,29 @@ fn map_card(
     now: u64,
     cx: &mut Context<Shell>,
 ) -> AnyElement {
+    const MAP_STATUS: &str = "account-trust-map-status";
     let page = shell.account_page.as_ref().expect("account page on screen");
     let designation = state.designation.last.as_ref();
     let failed_message = state.map_read_failed();
 
     let pill = match designation {
-        Some(Designation::Set { .. }) => status_pill("Located", GREEN, 0x4ecb8d1a),
+        Some(Designation::Set { .. }) => status_pill(MAP_STATUS, "Located", GREEN, 0x4ecb8d1a),
         Some(Designation::None | Designation::Deactivated { .. }) => {
-            status_pill("Not located", RED, 0xe5646c1a)
+            status_pill(MAP_STATUS, "Not located", RED, 0xe5646c1a)
         }
-        None if failed_message.is_some() => status_pill("Not located", TEXT_DIM, 0x5b597522),
-        None => status_pill("Checking", TEXT_DIM, 0x5b597522),
+        None if failed_message.is_some() => {
+            status_pill(MAP_STATUS, "Not located", TEXT_DIM, 0x5b597522)
+        }
+        None => status_pill(MAP_STATUS, "Checking", TEXT_DIM, 0x5b597522),
     };
 
     let mut body = card()
-        .child(card_head("Treasure Map", "kind 10040", pill))
+        .child(card_head(
+            "account-trust-map-title",
+            "Treasure Map",
+            "kind 10040",
+            pill,
+        ))
         .child(
             div()
                 .mt(px(6.))
@@ -1158,10 +1289,18 @@ fn map_card(
                 .map(|row| row.kind_tag.as_str())
                 .collect::<Vec<_>>()
                 .join(" · ");
+            let entries_text = if types.is_empty() {
+                "no rank entry".to_string()
+            } else if rank_row.is_none() {
+                format!("available — {types} · no rank entry")
+            } else {
+                format!("available — {types}")
+            };
             let entries: AnyElement = if types.is_empty() {
                 div()
                     .text_color(rgb(AMBER))
                     .child("no rank entry")
+                    .a11y("account-trust-map-entries", Role::Label, entries_text)
                     .into_any_element()
             } else {
                 h_flex()
@@ -1178,26 +1317,31 @@ fn map_card(
                     .when(rank_row.is_none(), |this| {
                         this.child(div().text_color(rgb(AMBER)).child("· no rank entry"))
                     })
+                    .a11y("account-trust-map-entries", Role::Label, entries_text)
                     .into_any_element()
             };
+            let published = format!(
+                "{} — {}",
+                timefmt::relative(now, *at),
+                timefmt::month_day_year(*at)
+            );
             body = body.child(
                 v_flex()
                     .mt(px(14.))
                     .gap(px(9.))
                     .child(fact(
                         "Published",
-                        div().child(format!(
-                            "{} — {}",
-                            timefmt::relative(now, *at),
-                            timefmt::month_day_year(*at)
-                        )),
+                        div()
+                            .child(published.clone())
+                            .a11y("account-trust-map-published", Role::Label, published),
                     ))
                     .child(fact(
                         "Found on",
                         div()
                             .font_family(MONO)
                             .text_size(px(12.))
-                            .child(SharedString::from(found_on.join(", "))),
+                            .child(SharedString::from(found_on.join(", ")))
+                            .a11y("account-trust-map-found-on", Role::Label, found_on.join(", ")),
                     ))
                     .child(fact("Score entries", entries)),
             );
@@ -1235,16 +1379,26 @@ fn map_card(
                                         .min_w(px(0.))
                                         .font_family(MONO)
                                         .text_size(px(12.))
-                                        .child(SharedString::from(row.key.clone())),
+                                        .child(SharedString::from(row.key.clone()))
+                                        .a11y(
+                                            "account-trust-map-rank-provider",
+                                            Role::Label,
+                                            row.key.clone(),
+                                        ),
                                 )
                                 .child(
                                     div()
-                                        .id("copy-rank-provider")
+                                        .id("account-trust-map-copy-rank-provider")
                                         .flex_shrink_0()
                                         .cursor_pointer()
                                         .text_size(px(12.))
                                         .text_color(rgb(ACCENT_LIGHT))
                                         .child(if copied { "copied" } else { "copy" })
+                                        .a11y(
+                                            "account-trust-map-copy-rank-provider",
+                                            Role::Button,
+                                            if copied { "copied" } else { "copy" },
+                                        )
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 key.clone(),
@@ -1261,9 +1415,19 @@ fn map_card(
                             div()
                                 .font_family(MONO)
                                 .text_size(px(12.))
-                                .child(SharedString::from(row.relay.clone())),
+                                .child(SharedString::from(row.relay.clone()))
+                                .a11y(
+                                    "account-trust-map-provider-relay",
+                                    Role::Label,
+                                    row.relay.clone(),
+                                ),
                         ))
-                        .child(fact("Brainstorm key", div().child(brainstorm_line))),
+                        .child(fact(
+                            "Brainstorm key",
+                            div()
+                                .child(brainstorm_line.clone())
+                                .a11y("account-trust-map-brainstorm-key", Role::Label, brainstorm_line),
+                        )),
                 );
             }
             body = body.child(raw_toggle(
@@ -1275,16 +1439,18 @@ fn map_card(
             ));
         }
         Some(Designation::Deactivated { at, raw }) => {
+            let deactivated = format!(
+                "Your Treasure Map was published empty on {}.",
+                timefmt::month_day_year(*at)
+            );
             body = body
                 .child(
                     div()
                         .mt(px(14.))
                         .text_size(px(12.5))
                         .text_color(rgb(0xf0a9ae))
-                        .child(format!(
-                            "Your Treasure Map was published empty on {}.",
-                            timefmt::month_day_year(*at)
-                        )),
+                        .child(deactivated.clone())
+                        .a11y("account-trust-map-deactivated", Role::Label, deactivated),
                 )
                 .child(
                     v_flex()
@@ -1330,7 +1496,8 @@ fn map_card(
                     .mt(px(14.))
                     .text_size(px(12.5))
                     .text_color(rgb(TEXT_MUTED))
-                    .child("Checking Nostr servers…"),
+                    .child("Checking Nostr servers…")
+                    .a11y("account-trust-map-checking", Role::Label, "Checking Nostr servers…"),
             );
         }
         None => {}
@@ -1357,7 +1524,8 @@ fn map_card(
                 .py(px(11.))
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_MUTED))
-                .child(format!("{message} {checked}")),
+                .child(format!("{message} {checked}"))
+                .a11y("account-trust-map-error", Role::Label, format!("{message} {checked}")),
         );
     }
 
@@ -1367,7 +1535,7 @@ fn map_card(
         let pubkey = pubkey.to_string();
         body = body.child(
             h_flex().mt(px(12.)).child(outline_button(
-                "check-again-map",
+                "account-trust-map-check-again",
                 "Check again",
                 TEXT_MUTED,
                 cx,
@@ -1393,19 +1561,25 @@ fn assertions_card(
 ) -> AnyElement {
     let page = shell.account_page.as_ref().expect("account page on screen");
 
+    const STATUS: &str = "account-trust-assertions-status";
     // The card's pill and headline follow the instance group (goal §5.4).
     let pill = match &state.instance.last {
-        Some(Some(_)) => status_pill("Located", GREEN, 0x4ecb8d1a),
-        Some(None) => status_pill("None found", AMBER, 0xf2b5441a),
+        Some(Some(_)) => status_pill(STATUS, "Located", GREEN, 0x4ecb8d1a),
+        Some(None) => status_pill(STATUS, "None found", AMBER, 0xf2b5441a),
         None => match state.instance.status {
             // A failed read is not an absence — grey, like "Checking".
-            Status::Failed(_) => status_pill("Couldn’t check", TEXT_DIM, 0x5b597522),
-            _ => status_pill("Checking", TEXT_DIM, 0x5b597522),
+            Status::Failed(_) => status_pill(STATUS, "Couldn’t check", TEXT_DIM, 0x5b597522),
+            _ => status_pill(STATUS, "Checking", TEXT_DIM, 0x5b597522),
         },
     };
 
     let mut body = card()
-        .child(card_head("Trusted Assertions", "kind 30382", pill))
+        .child(card_head(
+            "account-trust-assertions-title",
+            "Trusted Assertions",
+            "kind 30382",
+            pill,
+        ))
         .child(
             div()
                 .mt(px(6.))
@@ -1423,14 +1597,13 @@ fn assertions_card(
         .is_some();
     if has_rank_row {
         body = body
-            .child(group_label("From your score provider"))
+            .child(group_label("account-trust-own-title", "From your score provider"))
             .child(assertion_group_body(
                 pubkey,
                 &state.own,
                 "your score provider",
                 true,
                 "own",
-                "check-again-own",
                 page,
                 now,
                 cx,
@@ -1450,13 +1623,17 @@ fn assertions_card(
         ),
     };
     body = body
-        .child(group_label("From the issuer's score provider"))
+        .child(group_label(
+            "account-trust-instance-title",
+            "From the issuer's score provider",
+        ))
         .child(
             div()
                 .mt(px(6.))
                 .text_size(px(11.5))
                 .text_color(rgb(TEXT_DIM))
-                .child(provider_line),
+                .child(provider_line.clone())
+                .a11y("account-trust-instance-provider", Role::Label, provider_line),
         )
         .child(assertion_group_body(
             pubkey,
@@ -1464,7 +1641,6 @@ fn assertions_card(
             "the server's score provider",
             false,
             "instance",
-            "check-again-instance",
             page,
             now,
             cx,
@@ -1486,7 +1662,8 @@ fn min_rank_card() -> AnyElement {
                         .flex_1()
                         .text_size(px(14.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Minimum rank"),
+                        .child("Minimum rank")
+                        .a11y("account-trust-min-rank-title", Role::Heading, "Minimum rank"),
                 )
                 .child(
                     div()
@@ -1499,7 +1676,12 @@ fn min_rank_card() -> AnyElement {
                         .font_family(MONO)
                         .text_size(px(16.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(trust::INSTANCE_MIN_RANK.to_string()),
+                        .child(trust::INSTANCE_MIN_RANK.to_string())
+                        .a11y(
+                            "account-trust-min-rank",
+                            Role::Label,
+                            trust::INSTANCE_MIN_RANK.to_string(),
+                        ),
                 ),
         )
         .child(
@@ -1530,7 +1712,8 @@ fn determination_card(shell: &Shell, pubkey: &str) -> AnyElement {
                     div()
                         .text_size(px(14.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Trust Determination"),
+                        .child("Trust Determination")
+                        .a11y("account-trust-determination-title", Role::Heading, "Trust Determination"),
                 )
                 .child(
                     div()
@@ -1587,7 +1770,12 @@ fn determination_card(shell: &Shell, pubkey: &str) -> AnyElement {
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(SharedString::from(
                                                     view.map(display_name).unwrap_or_default(),
-                                                )),
+                                                ))
+                                                .a11y(
+                                                    "account-trust-pov-name",
+                                                    Role::Label,
+                                                    view.map(display_name).unwrap_or_default(),
+                                                ),
                                         )
                                         .child(
                                             div()
@@ -1610,7 +1798,12 @@ fn determination_card(shell: &Shell, pubkey: &str) -> AnyElement {
                                         .text_color(rgb(TEXT_DIM))
                                         .child(SharedString::from(
                                             view.map(|v| v.npub.clone()).unwrap_or_default(),
-                                        )),
+                                        ))
+                                        .a11y(
+                                            "account-trust-pov-npub",
+                                            Role::Label,
+                                            view.map(|v| v.npub.clone()).unwrap_or_default(),
+                                        ),
                                 ),
                         ),
                 ),
@@ -1636,7 +1829,12 @@ fn determination_card(shell: &Shell, pubkey: &str) -> AnyElement {
                         .border_1()
                         .border_color(rgb(BORDER))
                         .text_size(px(12.))
-                        .child("Trusted Assertions (rank)"),
+                        .child("Trusted Assertions (rank)")
+                        .a11y(
+                            "account-trust-scoring-method",
+                            Role::Label,
+                            "Trusted Assertions (rank)",
+                        ),
                 ),
         )
         .child(
@@ -1651,7 +1849,12 @@ fn determination_card(shell: &Shell, pubkey: &str) -> AnyElement {
 
 /// Card 5: following count and verified followers, each honest about which
 /// read produced it.
-fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) -> AnyElement {
+fn web_of_trust_card(
+    shell: &Shell,
+    pubkey: &str,
+    state: &TrustState,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
     let (following, following_note) = match &state.follows.last {
         Some(Some(n)) => (n.to_string(), None),
         Some(None) => ("—".to_string(), Some("no follow list found")),
@@ -1682,7 +1885,8 @@ fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) 
             div()
                 .text_size(px(14.5))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Web of trust"),
+                .child("Web of trust")
+                .a11y("account-trust-wot-title", Role::Heading, "Web of trust"),
         )
         .child(
             div()
@@ -1696,8 +1900,18 @@ fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) 
                 .mt(px(14.))
                 .gap(px(12.))
                 .max_w(px(420.))
-                .child(wot_tile(&following, "Following", following_note))
-                .child(wot_tile(&followers, "Verified followers", followers_note)),
+                .child(wot_tile(
+                    "account-trust-following",
+                    &following,
+                    "Following",
+                    following_note,
+                ))
+                .child(wot_tile(
+                    "account-trust-followers",
+                    &followers,
+                    "Verified followers",
+                    followers_note,
+                )),
         )
         .child(
             div()
@@ -1709,8 +1923,20 @@ fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) 
                     issuer_short_npub()
                 )),
         )
+        .child(
+            div()
+                .mt(px(14.))
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT_MUTED))
+                .child("Followed someone new? Ask Brainstorm to score your web of trust again from your follow list."),
+        )
+        .child(
+            div()
+                .mt(px(10.))
+                .child(community::recalc_block(shell, pubkey, "account-trust-recalc", cx)),
+        )
         .child(open_link(
-            "wot-brainstorm",
+            "account-trust-wot-brainstorm",
             "See the full graph on Brainstorm ↗",
             profile_url,
             cx,
@@ -1719,7 +1945,12 @@ fn web_of_trust_card(pubkey: &str, state: &TrustState, cx: &mut Context<Shell>) 
 }
 
 /// One "42 / Following" tile; the note explains a "—".
-fn wot_tile(value: &str, label: &'static str, note: Option<&'static str>) -> AnyElement {
+fn wot_tile(
+    id: &'static str,
+    value: &str,
+    label: &'static str,
+    note: Option<&'static str>,
+) -> AnyElement {
     v_flex()
         .flex_1()
         .bg(rgb(BG_APP))
@@ -1733,14 +1964,16 @@ fn wot_tile(value: &str, label: &'static str, note: Option<&'static str>) -> Any
                 .font_family(MONO)
                 .text_size(px(22.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(SharedString::from(value.to_string())),
+                .child(SharedString::from(value.to_string()))
+                .a11y(id, Role::Label, value.to_string()),
         )
         .child(
             div()
                 .mt(px(2.))
                 .text_size(px(12.))
                 .text_color(rgb(TEXT_MUTED))
-                .child(label),
+                .child(label)
+                .a11y(format!("{id}-label"), Role::Label, label),
         )
         .when_some(note, |this, note| {
             this.child(
@@ -1748,7 +1981,8 @@ fn wot_tile(value: &str, label: &'static str, note: Option<&'static str>) -> Any
                     .mt(px(2.))
                     .text_size(px(11.))
                     .text_color(rgb(TEXT_DIM))
-                    .child(note),
+                    .child(note)
+                    .a11y(format!("{id}-note"), Role::Label, note),
             )
         })
         .into_any_element()

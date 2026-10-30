@@ -14,6 +14,9 @@ gpui-kit = "0.6.0"
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "0.3.4" }
 futures = "0.3"
 serde_json = "1"
+# Parses a chat bubble to read its visible text for the accessibility label;
+# the same crate gpui-base's TextView renders with.
+markdown = "1"
 
 # The protocol layer (src/lib.rs): Nostr + the instance REST API, run on a
 # dedicated tokio thread (gpui's executor is not tokio — see src/nostr.rs).
@@ -56,6 +59,11 @@ bech32 = "0.11"
 # Default features pull in `image` and an SVG renderer; the QR is painted
 # module by module with gpui quads, so only the matrix is needed.
 qrcode = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+# Reads the bundled mono font's family name (src/dashboard.rs test); the
+# version unifies with the one gpui's text stack already uses.
+ttf-parser = "0.25"
 
 # Debug builds of gpui and its text/layout stack are unusably slow without this.
 # Copied from the gpui-kit workspace.

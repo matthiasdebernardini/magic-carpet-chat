@@ -4,6 +4,8 @@
 //! (no account, relay down, list failures) and "Recent activity" is the feed
 //! the nostr runtime's updates write, newest first.
 
+use std::collections::HashMap;
+
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::component::{h_flex, v_flex};
@@ -11,6 +13,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use magic_carpet_chat::api;
 use magic_carpet_chat::nostr;
 
+use crate::a11y::Accessible;
 use crate::account::Tab;
 use crate::palette::*;
 use crate::shell::{ActivityItem, Load, Shell, account_hue, display_name, initials};
@@ -18,11 +21,26 @@ use crate::timefmt;
 use crate::trust_state::MapVerdict;
 
 /// The mock's monospace face, used for every sats figure and every npub.
-/// Menlo is the bundled macOS face; Linux resolves the generic family.
-#[cfg(target_os = "macos")]
-pub const MONO: &str = "Menlo";
-#[cfg(not(target_os = "macos"))]
-pub const MONO: &str = "monospace";
+/// Menlo is the bundled macOS face. gpui's Linux text system matches family
+/// names exactly and does not resolve the generic "monospace", so every layout
+/// failed the lookup and repainted slowly; Linux registers a bundled font.
+pub const MONO: &str = if cfg!(target_os = "macos") {
+    "Menlo"
+} else {
+    MONO_FONT_FAMILY
+};
+
+/// The family name inside [`MONO_FONT`]; a test keeps the two in step.
+const MONO_FONT_FAMILY: &str = "JetBrains Mono";
+
+/// JetBrains Mono Regular and Bold (SIL OFL 1.1, licence beside them),
+/// registered with gpui's text system at startup on every platform but macOS.
+/// Bold also serves semibold text by nearest match.
+#[cfg(any(test, not(target_os = "macos")))]
+pub const MONO_FONTS: [&[u8]; 2] = [
+    include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf"),
+];
 
 /// One line of small secondary text in `color`.
 pub(crate) fn muted(text: impl Into<SharedString>, color: u32) -> AnyElement {
@@ -53,8 +71,38 @@ pub fn avatar(
         .child(initials.into())
 }
 
+/// [`avatar`] drawn over a remote picture. gpui fetches the URL through its
+/// own HTTP client and caches it per URL; the initials show while it loads,
+/// on error, and when `picture` is absent or not http(s).
+pub fn remote_avatar(
+    picture: Option<&str>,
+    initials: impl Into<SharedString>,
+    hue: (u32, u32),
+    size: f32,
+    text: f32,
+) -> AnyElement {
+    let initials: SharedString = initials.into();
+    let Some(url) = picture.filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+    else {
+        return avatar(initials, hue, size, text).into_any_element();
+    };
+    let (loading, failed) = (initials.clone(), initials);
+    img(SharedUri::from(url.to_string()))
+        .size(px(size))
+        .flex_shrink_0()
+        .rounded_full()
+        .object_fit(ObjectFit::Cover)
+        .with_loading(move || avatar(loading.clone(), hue, size, text).into_any_element())
+        .with_fallback(move || avatar(failed.clone(), hue, size, text).into_any_element())
+        .into_any_element()
+}
+
 /// A count in a soft accent pill — the badge beside "Needs attention".
 pub fn count_badge(count: impl Into<SharedString>) -> impl IntoElement {
+    badge_div(count.into())
+}
+
+fn badge_div(count: SharedString) -> Div {
     div()
         .px(px(7.))
         .py(px(1.))
@@ -64,10 +112,12 @@ pub fn count_badge(count: impl Into<SharedString>) -> impl IntoElement {
         .text_size(px(10.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(ACCENT_LIGHT))
-        .child(count.into())
+        .child(count)
 }
 
+/// `id` is the screen-wide prefix: `<id>-heading`, `<id>-count`, `<id>-list`.
 fn card(
+    id: &'static str,
     title: &'static str,
     badge: Option<String>,
     rows: Vec<AnyElement>,
@@ -90,11 +140,22 @@ fn card(
                     div()
                         .text_size(px(14.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
+                        .child(title)
+                        .a11y(format!("{id}-heading"), Role::Heading, title),
                 )
-                .when_some(badge, |this, badge| this.child(count_badge(badge))),
+                .when_some(badge, |this, badge| {
+                    this.child(badge_div(badge.clone().into()).a11y(
+                        format!("{id}-count"),
+                        Role::Label,
+                        badge,
+                    ))
+                }),
         )
-        .child(v_flex().children(rows))
+        .child(
+            v_flex()
+                .children(rows)
+                .a11y(format!("{id}-list"), Role::List, title),
+        )
 }
 
 /// What a row's button does. Navigation rows open the account's Trust tab;
@@ -122,6 +183,8 @@ impl Action {
 /// A derived "Needs attention" row. `avatar` marks the account a row is
 /// about — initials, hue pair, and the name for the title tooltip.
 struct Attention {
+    /// Stable kebab slug of what this row is about; part of its a11y id.
+    kind: &'static str,
     dot: u32,
     title: String,
     description: String,
@@ -130,8 +193,9 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(dot: u32, title: String, description: String) -> Self {
+    fn new(kind: &'static str, dot: u32, title: String, description: String) -> Self {
         Self {
+            kind,
             dot,
             title,
             description,
@@ -166,6 +230,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
     // claiming. The bounty list needs none: it is the house issuer's.
     if shell.active_view().is_none() {
         rows.push(Attention::new(
+            "read-only",
             TEXT_DIM,
             "Read-only — add an account to claim".into(),
             "Click the + button in the left bar to create an account or paste a \
@@ -175,6 +240,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
     }
     if !shell.relay_connected {
         rows.push(Attention::new(
+            "relay-disconnected",
             AMBER,
             "Relay disconnected".into(),
             format!(
@@ -185,7 +251,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
     }
     if let Load::Failed(message) = &shell.bounties {
         rows.push(
-            Attention::new(RED, "Bounty list unavailable".into(), message.clone())
+            Attention::new("bounty-list-unavailable", RED, "Bounty list unavailable".into(), message.clone())
                 .action(Action::Refresh),
         );
     }
@@ -197,25 +263,29 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         };
         let pubkey = || view.pubkey.clone();
         if let Some(verdict) = state.needs_map() {
-            let description = match verdict {
-                MapVerdict::Missing => {
-                    "No kind-10040 event found — other apps can’t locate your rank provider."
-                }
-                MapVerdict::Deactivated => {
-                    "Your Treasure Map is empty, so other apps can’t find your score provider. Click Fix to republish it."
-                }
-                MapVerdict::NoRankRow => {
-                    "Your Treasure Map has no rank entry, so apps can’t look up your rank. Click Fix to see what is missing."
-                }
+            let (kind, description) = match verdict {
+                MapVerdict::Missing => (
+                    "map-missing",
+                    "No kind-10040 event found — other apps can’t locate your rank provider.",
+                ),
+                MapVerdict::Deactivated => (
+                    "map-deactivated",
+                    "Your Treasure Map is empty, so other apps can’t find your score provider. Click Fix to republish it.",
+                ),
+                MapVerdict::NoRankRow => (
+                    "map-no-rank-row",
+                    "Your Treasure Map has no rank entry, so apps can’t look up your rank. Click Fix to see what is missing.",
+                ),
             };
             rows.push(
-                Attention::new(AMBER, "Publish your Treasure Map".into(), description.into())
+                Attention::new(kind, AMBER, "Publish your Treasure Map".into(), description.into())
                     .action(Action::OpenTrust(pubkey()))
                     .for_account(view, ix),
             );
         } else if let Some(message) = state.map_unreadable() {
             rows.push(
                 Attention::new(
+                    "map-unreadable",
                     AMBER,
                     "Couldn’t check your Treasure Map".into(),
                     message.to_string(),
@@ -227,6 +297,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         if state.no_follows() {
             rows.push(
                 Attention::new(
+                    "no-follows",
                     AMBER,
                     "Follow someone".into(),
                     "Trust scores can’t be calculated for an empty follow list.".into(),
@@ -238,6 +309,7 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         if state.no_verified_follower() {
             rows.push(
                 Attention::new(
+                    "no-verified-follower",
                     AMBER,
                     "Gain a follower".into(),
                     "You need at least one verified follower for a trust score.".into(),
@@ -265,7 +337,13 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
     // The title keys the avatar's element id; it moves into the row text
     // before the avatar closure runs, so take a copy up front.
     let row_key = row.title.clone();
+    let row_id = match &row.avatar {
+        Some((_, _, _, pubkey)) => format!("dash-attention-{pubkey}-{}", row.kind),
+        None => format!("dash-attention-{}", row.kind),
+    };
     h_flex()
+        .a11y(row_id.clone(), Role::Group, row_key.clone())
+        .aria_description(row.description.clone())
         .gap(px(11.))
         .items_start()
         .py(px(11.))
@@ -291,7 +369,8 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                             div()
                                 .text_size(px(13.))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(SharedString::from(row.title)),
+                                .child(SharedString::from(row.title))
+                                .a11y(format!("{row_id}-title"), Role::Label, row_key.clone()),
                         )
                         .when_some(row.avatar, |this, (letters, hue, name, pubkey)| {
                             this.child(
@@ -311,7 +390,12 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                         .mt(px(2.))
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_MUTED))
-                        .child(SharedString::from(row.description)),
+                        .child(SharedString::from(row.description.clone()))
+                        .a11y(
+                            format!("{row_id}-description"),
+                            Role::Label,
+                            row.description,
+                        ),
                 ),
         )
         .when(has_action, |this| {
@@ -336,6 +420,7 @@ fn attention_row(row: Attention, cx: &mut Context<Shell>) -> AnyElement {
                     .text_size(px(11.5))
                     .text_color(rgb(ACCENT_LIGHT))
                     .child(label)
+                    .a11y(format!("{row_id}-action"), Role::Button, label)
                     .on_click(cx.listener(move |this, _, window, cx| match &row.action {
                         Action::Refresh => this.refresh(cx),
                         Action::RetryTrust(pubkey) => {
@@ -378,12 +463,22 @@ fn all_clear(shell: &Shell) -> AnyElement {
                 .min_w(px(0.))
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_MUTED))
-                .child(SharedString::from(text.to_string())),
+                .child(SharedString::from(text.to_string()))
+                .a11y("dash-attention-clear", Role::Label, text),
         )
         .into_any_element()
 }
 
-fn activity_row(event: &ActivityItem, now: u64) -> AnyElement {
+/// ActivityItem carries no event id, so the key is its timestamp plus an
+/// FNV-1a hash of its text; identical items get a `-<n>` suffix in order.
+fn activity_key(event: &ActivityItem) -> String {
+    let hash = event.text.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    });
+    format!("dash-activity-{}-{hash:x}", event.at)
+}
+
+fn activity_row(event: &ActivityItem, now: u64, id: String) -> AnyElement {
     let meta = format!(
         "{} UTC · {}",
         timefmt::hhmmss_utc(event.at),
@@ -391,6 +486,8 @@ fn activity_row(event: &ActivityItem, now: u64) -> AnyElement {
     );
 
     h_flex()
+        .a11y(id.clone(), Role::Group, event.text.clone())
+        .aria_description(meta.clone())
         .gap(px(11.))
         .items_start()
         .py(px(10.))
@@ -418,7 +515,8 @@ fn activity_row(event: &ActivityItem, now: u64) -> AnyElement {
                         .mt(px(1.))
                         .text_size(px(11.))
                         .text_color(rgb(TEXT_DIM))
-                        .child(SharedString::from(meta)),
+                        .child(SharedString::from(meta.clone()))
+                        .a11y(format!("{id}-meta"), Role::Label, meta),
                 ),
         )
         .into_any_element()
@@ -432,6 +530,11 @@ fn empty_activity() -> AnyElement {
         .text_size(px(12.5))
         .text_color(rgb(TEXT_DIM))
         .child("Nothing yet. New claims and payments show up here.")
+        .a11y(
+            "dash-activity-empty",
+            Role::Label,
+            "Nothing yet. New claims and payments show up here.",
+        )
         .into_any_element()
 }
 
@@ -461,10 +564,17 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
     let activity_elements: Vec<AnyElement> = if shell.activity.is_empty() {
         vec![empty_activity()]
     } else {
+        let mut seen: HashMap<String, usize> = HashMap::new();
         shell
             .activity
             .iter()
-            .map(|event| activity_row(event, now))
+            .map(|event| {
+                let key = activity_key(event);
+                let n = seen.entry(key.clone()).or_insert(0);
+                *n += 1;
+                let id = if *n == 1 { key } else { format!("{key}-{n}") };
+                activity_row(event, now, id)
+            })
             .collect()
     };
 
@@ -487,13 +597,15 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                     div()
                         .text_size(px(21.))
                         .font_weight(FontWeight::BOLD)
-                        .child("Dashboard"),
+                        .child("Dashboard")
+                        .a11y("dash-heading", Role::Heading, "Dashboard"),
                 )
                 .child(
                     div()
                         .text_size(px(12.5))
                         .text_color(rgb(TEXT_MUTED))
-                        .child(SharedString::from(summary)),
+                        .child(SharedString::from(summary.clone()))
+                        .a11y("dash-summary", Role::Label, summary),
                 )
                 .child(div().flex_1())
                 .child(
@@ -520,6 +632,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                                 .text_color(rgb(TEXT_DIM))
                         })
                         .child(action_label)
+                        .a11y("dash-new-item", Role::Button, action_label)
                         .on_click(cx.listener(|this, _, window, cx| this.new_item(window, cx))),
                 ),
         )
@@ -527,7 +640,31 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
             h_flex()
                 .gap(px(16.))
                 .items_start()
-                .child(card("Needs attention", badge, attention_elements))
-                .child(card("Recent activity", None, activity_elements)),
+                .child(card("dash-attention", "Needs attention", badge, attention_elements))
+                .child(card("dash-activity", "Recent activity", None, activity_elements)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MONO_FONTS, MONO_FONT_FAMILY};
+
+    /// The family gpui indexes each bundled face under is the one `MONO` names
+    /// off macOS; a mismatch would send Linux back to the failing lookup.
+    /// fontdb's rule: the typographic family (name ID 16) wins, else ID 1.
+    #[test]
+    fn every_bundled_mono_face_is_indexed_under_the_mono_family() {
+        for data in MONO_FONTS {
+            let face = ttf_parser::Face::parse(data, 0).expect("bundled font parses");
+            let family_of = |id| {
+                face.names()
+                    .into_iter()
+                    .filter(|name| name.name_id == id)
+                    .find_map(|name| name.to_string())
+            };
+            let family = family_of(ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+                .or_else(|| family_of(ttf_parser::name_id::FAMILY));
+            assert_eq!(family.as_deref(), Some(MONO_FONT_FAMILY));
+        }
+    }
 }

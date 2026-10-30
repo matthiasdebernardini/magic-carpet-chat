@@ -9,9 +9,7 @@ import asyncio, json, os, subprocess, sys, time
 from dataclasses import dataclass, field
 
 IP = os.environ.get("MC_SANDBOX_IP", "172.17.0.2")
-# Target-neutral paths: the cua box keeps ~/mc; elsewhere MC_E2E_DIR points at
-# the run dir (a mode-0700 dir under /tmp on omac).
-E2E_DIR = os.environ.get("MC_E2E_DIR", os.path.expanduser("~/mc"))
+E2E_DIR = os.path.expanduser("~/mc")
 RUNS = os.path.join(E2E_DIR, "runs"); os.makedirs(RUNS, exist_ok=True)
 LOG = open(os.path.join(RUNS, time.strftime("%Y%m%d-%H%M%S") + ".jsonl"), "a")
 KEYS = os.path.join(E2E_DIR, "keys.json")
@@ -71,78 +69,13 @@ def secret(arg):
     return json.load(open(KEYS))[who][what]
 
 class Driver:
-    """The cua-box driver: xdotool and the Sandbox mouse inside the mc
-    container on DISPLAY=:1. The omac driver lives in suite.py."""
+    """The cua-box driver: xdotool inside the mc container on DISPLAY=:1.
+    suite.AppDriver adds the accessibility-tree kinds."""
     def __init__(self, sb): self.sb = sb
     async def x(self, cmd): return await self.sb.shell.run(f"DISPLAY=:1 {cmd}", timeout=60)
     async def act(self, kind, arg):
         if kind == "key":     await self.x(f"xdotool key --clearmodifiers {arg}")
         elif kind == "type":  await self.x("xdotool type --delay 20 " + json.dumps(secret(arg) if arg.startswith("$") else arg))
-        elif kind == "click": await self.sb.mouse.click(*arg)
-        elif kind == "click_text":
-            # arg: "phrase" or {"text": "phrase", "near": "anchor phrase"}.
-            text = arg["text"] if isinstance(arg, dict) else arg
-            near = arg.get("near") if isinstance(arg, dict) else None
-            img = await self.sb.screenshot()
-            data = img if isinstance(img, (bytes, bytearray)) else getattr(img, "data", None) or img
-            open("/tmp/shot.png", "wb").write(data)
-            from PIL import Image
-            im = Image.open("/tmp/shot.png").convert("L")
-            im.resize((im.width * 2, im.height * 2), Image.LANCZOS).save("/tmp/ocr.png")
-            tsv = subprocess.run(["tesseract", "/tmp/ocr.png", "-", "--psm", "3", "tsv"],
-                                 capture_output=True, text=True).stdout
-            lines = {}
-            for ln in tsv.splitlines()[1:]:
-                p = ln.split("\t")
-                if len(p) < 12 or not p[11].strip():
-                    continue
-                lines.setdefault((p[2], p[3], p[4]), []).append(
-                    (p[11], float(p[6]) + float(p[8]) / 2, float(p[7]) + float(p[9]) / 2))
-            # [(joined, [(word, cx, cy), ...])] in reading order
-            lines = sorted(lines.values(), key=lambda ws: min(w[2] for w in ws))
-            def match(needle):
-                out = []
-                for ws in lines:
-                    joined = " ".join(w[0] for w in ws).lower()
-                    i = joined.find(needle.lower())
-                    if i < 0:
-                        continue
-                    off, sel = 0, []
-                    for w, cx, cy in ws:
-                        w0, w1 = off, off + len(w)
-                        off += len(w) + 1
-                        if w0 < i + len(needle) and w1 > i:
-                            sel.append((cx, cy))
-                    if sel:
-                        out.append((sum(x for x, _ in sel) / len(sel) / 2,
-                                    sum(y for _, y in sel) / len(sel) / 2))
-                return out
-            hits = match(text)
-            if not hits:
-                preview = [" ".join(w[0] for w in ws) for ws in lines][:40]
-                raise RuntimeError(f"click_text: {text!r} not on screen; OCR lines: {preview}")
-            if near:
-                anchor = match(near)
-                if not anchor:
-                    preview = [" ".join(w[0] for w in ws) for ws in lines][:40]
-                    raise RuntimeError(f"click_text: near {near!r} not on screen; OCR lines: {preview}")
-                ay = anchor[0][1]
-                hits.sort(key=lambda p: abs(p[1] - ay))
-            x, y = hits[0]
-            await self.sb.mouse.click(x, y)
-            return f"click_text {text!r} -> ({x:.0f},{y:.0f})"
-        elif kind == "scroll":
-            # gpui scrolls per wheel event, not per delta: park the pointer
-            # over the window centre, then click the wheel button repeatedly.
-            img = await self.sb.screenshot()
-            data = img if isinstance(img, (bytes, bytearray)) else getattr(img, "data", None) or img
-            open("/tmp/shot.png", "wb").write(data)
-            from PIL import Image
-            im = Image.open("/tmp/shot.png")
-            cx, cy = im.width // 2, im.height // 2
-            await self.sb.mouse.move(cx, cy)
-            btn = "5" if arg == "down" else "4"
-            await self.x(f"xdotool click --repeat 12 --delay 60 {btn}")
         elif kind == "wait":  await asyncio.sleep(arg)
         elif kind == "shell": await self.x(arg)
         elif kind == "js":    # run JS in the Chromium page via cua-driver's page tool (CDP)
@@ -159,7 +92,7 @@ class Driver:
     async def screen(self): return ocr(await self.sb.screenshot())
 
 async def run(steps, min_conf=0.4):
-    from cua import Sandbox   # box-only: the omac target never imports cua
+    from cua import Sandbox
     sb = await Sandbox.connect("mc", http_url=f"http://{IP}:8000")
     d, jev, hist = Driver(sb), Jev(), []
     log(event="start", live=jev.live, steps=len(steps))

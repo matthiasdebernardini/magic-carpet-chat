@@ -7,8 +7,13 @@ The mode lives in $E2E_DIR/mode.json and is re-read on every request:
    "scan": ok|fail, "dup_coordinate": "<39998:pubkey:dtag or empty>",
    "graperank": "ok"|"429"|"403"|"503"|[answers consumed one per call],
    "setup": "ok"|"404", "delay_secs": 0,
+   "run": [steps of a graperank run, one per graperankResult poll],
    "eligible": {"<viewer hex>": [[id, coord, issuerRank, auto_pay_min_rank|null, criteria], ...]},
    "eligible_delay": {"<viewer hex>": secs}}
+A run step is "waiting", "calculating", "publishing", "done" or "fail:<CODE>"
+(an `error.code` such as NO_ELIGIBLE_USERS). The default run is waiting ->
+calculating -> publishing -> done; the last step repeats. Each accepted
+graperank POST starts the run over.
 GET /api/bounties/eligible needs the sid cookie login-user set: 401 without
 one, 403 when ?viewer= is not the session pubkey, like
 magic-carpet-v2/src/api/bounties.js:294-320. A null auto_pay_min_rank is a
@@ -22,9 +27,13 @@ The same process also serves a fake Brainstorm on 127.0.0.1:$BS_PORT (8788):
   POST /authChallenge/{hex}/verify     -> {"data":{"token":"tok-<uuid>"}} (token never logged)
   POST /user/followList                -> 200, requires Bearer tok-…
   POST /user/graperank                 -> mode "graperank" answer
+  GET  /user/graperankResult           -> the run's next step (data null before any accepted run)
+  GET  /user/history                   -> last_time_calculated_graperank: when a poll last answered done
   GET  /setup/{hex}                    -> mode "setup": six rows like the live body, or 404
-  GET  /search/byText                  -> canned data.results profiles filtered by text"""
-import json, os, re, threading, time, uuid
+  POST /search/pubkeys                 -> canned {results:[{pubkey,rank}]} filtered by body.query
+                                          (names and photos live in kind-0s the suite seeds on the relay)
+  GET  /pic/alice.png                  -> a 64x64 PNG of sixteen flat colours (Alice's picture)"""
+import json, os, re, struct, threading, time, uuid, zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -32,6 +41,7 @@ DIR = os.environ.get("E2E_DIR", "/tmp/e2e")
 MODE = os.path.join(DIR, "mode.json")
 LOG = os.path.join(DIR, "server.log")
 state = {"mtime": None, "creates": 0, "made": {}, "grape": [],   # made: bounties created here, by id
+         "polls": None, "finished": None,   # polls: graperankResult reads since the last accepted run
          "eligible_seen": {}}   # eligible rows served, by id, without issuerRank (the detail route has none)
 SESSIONS = {}   # sid cookie -> the pubkey that logged in with it
 
@@ -44,6 +54,7 @@ BS_CHALLENGES = {}   # hex -> challenge, kept only until verify
 def mode():
     m = {"create": "ok", "hang_secs": 45, "scan": "ok", "dup_coordinate": "",
          "graperank": "ok", "setup": "ok", "delay_secs": 0,
+         "run": ["waiting", "calculating", "publishing", "done"],
          "eligible": {}, "eligible_delay": {}}
     try:
         st = os.stat(MODE)
@@ -204,14 +215,54 @@ class H(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------- fake Brainstorm
+def colour_png():
+    """A 64x64 PNG, a 4x4 grid of sixteen flat, well-apart colours."""
+    cols = [(r, g, b) for r in (230, 40) for g in (230, 40) for b in (230, 40)]
+    cols += [(230, 140, 20), (140, 20, 230), (20, 230, 140), (230, 20, 140),
+             (20, 140, 230), (140, 230, 20), (120, 120, 120), (250, 250, 20)]
+    rows = b"".join(
+        b"\x00" + b"".join(bytes(cols[(y // 16) * 4 + x // 16]) for x in range(64))
+        for y in range(64))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+# The pubkeys are the public secp256k1 test keys 1, 2 and 3 (their secrets are
+# in scenarios.py): the app only shows a name from a kind-0 the key signed.
 BS_SEARCH = [
-    {"pubkey": "a" * 64, "name": "alice", "display_name": "Alice E2E",
-     "nip05": "alice@e2e.test", "picture": ""},
-    {"pubkey": "b" * 64, "name": "bob", "display_name": "Bob E2E",
-     "nip05": "bob@e2e.test", "picture": ""},
-    {"pubkey": "c" * 64, "name": "carol", "display_name": "Carol E2E",
-     "nip05": "carol@e2e.test", "picture": ""},
+    {"pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+     "name": "alice", "display_name": "Alice E2E"},
+    {"pubkey": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+     "name": "bob", "display_name": "Bob E2E"},
+    {"pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "name": "carol", "display_name": "Carol E2E"},
 ]
+
+
+def iso(t):
+    """Naive UTC with microseconds, as the real server's pydantic writes it."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%06d" % int((t % 1) * 1e6)
+
+
+def bs_run(step):
+    """A BrainstormRequestInstance at `step`, the shape /user/graperankResult
+    returns (brainstorm_server app/schemas/schemas.py)."""
+    status, ta, internal, error = {
+        "waiting": ("waiting", "waiting", "waiting", None),
+        "calculating": ("ongoing", "waiting", "waiting", None),
+        "publishing": ("success", "ongoing", "success", None),
+        "done": ("success", "success", "success", None),
+    }.get(step) or ("failure", "waiting", "waiting",
+                    {"code": step.split(":", 1)[-1], "message": None})
+    now = iso(time.time())
+    return {"private_id": 1, "status": status, "ta_status": ta, "internal_publication_status": internal,
+            "count_values": None, "password": "", "algorithm": "graperank", "parameters": "",
+            "how_many_others_with_priority": 2 if step == "waiting" else 0, "pubkey": None,
+            "trigger_source": "manual", "graperank_preset_used": None, "graperank_params": None,
+            "error": error, "created_at": now, "updated_at": now}
 
 
 def bs_setup_rows():
@@ -275,11 +326,43 @@ class B(BaseHTTPRequestHandler):
             if m["setup"] == "404":
                 return self.send(404, {"error": "no setup data"})
             return self.send(200, bs_setup_rows())
-        if u.path == "/search/byText":
-            text = (q.get("text") or q.get("q") or [""])[0].lower()
-            hits = [p for p in BS_SEARCH if text in p["name"] or text in p["display_name"].lower()]
-            log("BS GET /search/byText %r -> %d" % (text[:20], len(hits)))
-            return self.send(200, {"code": 200, "data": {"results": hits}})
+        if u.path == "/pic/alice.png":
+            log("BS GET /pic/alice.png")
+            try:
+                body = colour_png()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if u.path == "/user/graperankResult":
+            if not self.authed():
+                log("BS GET graperankResult auth=False -> 401")
+                return self.send(401, {"error": "unauthorized"})
+            if state["polls"] is None:
+                log("BS GET graperankResult -> none")
+                return self.send(200, {"code": 200, "data": None})
+            steps = m.get("run") or ["done"]
+            step = steps[min(state["polls"], len(steps) - 1)]
+            state["polls"] += 1
+            if step == "done":
+                state["finished"] = time.time()
+            log("BS GET graperankResult -> %s" % step)
+            return self.send(200, {"code": 200, "data": bs_run(step)})
+        if u.path == "/user/history":
+            if not self.authed():
+                log("BS GET /user/history auth=False -> 401")
+                return self.send(401, {"error": "unauthorized"})
+            fin = state["finished"]
+            log("BS GET /user/history -> %s" % ("finished" if fin else "none"))
+            return self.send(200, {"code": 200, "data": {
+                "pubkey": "", "ta_pubkey": BS_PROVIDER,
+                "last_time_calculated_graperank": iso(fin) if fin else None,
+                "last_time_triggered_graperank": None,
+                "created_at": iso(time.time()), "updated_at": iso(time.time())}})
         log("BS GET %s -> 404" % u.path)
         self.send(404, {"error": "not found"})
 
@@ -299,6 +382,14 @@ class B(BaseHTTPRequestHandler):
             if ok:
                 return self.send(200, {"data": {"token": "tok-%s" % uuid.uuid4()}})
             return self.send(401, {"error": "bad login event"})
+        if u.path == "/search/pubkeys":
+            text = str(b.get("query") or "").strip().lower()
+            if not text:
+                return self.send(400, {"error": "query field is missing or empty"})
+            hits = [{"pubkey": p["pubkey"], "rank": 1.0 - i / 10} for i, p in enumerate(BS_SEARCH)
+                    if text in p["name"] or text in p["display_name"].lower()]
+            log("BS POST /search/pubkeys %r -> %d" % (text[:20], len(hits)))
+            return self.send(200, {"results": hits})
         if u.path == "/user/followList":
             ev = b.get("signed_event") or b.get("event") or b
             ptags = sum(1 for t in (ev.get("tags") or []) if isinstance(t, list) and t and t[0] == "p")
@@ -315,6 +406,7 @@ class B(BaseHTTPRequestHandler):
             if not self.authed():
                 return self.send(401, {"error": "unauthorized"})
             if g == "ok":
+                state["polls"] = 0
                 return self.send(200, {"success": True})
             if g == "403":
                 return self.send(403, {"detail": "Last GrapeRank run was too recent"})
