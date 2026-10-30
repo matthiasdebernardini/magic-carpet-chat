@@ -1,55 +1,133 @@
 """The scenarios. Each is `async def x(sc)`; register it in SCENARIOS.
 
-sc.box.launch(...)       relaunch the app on a fresh MC_STORE_DIR
+start(sc, name, ...)     relaunch the app on a fresh MC_STORE_DIR, with the
+                         accessibility bus and the preflight
 sc.box.start_fake(mode)  fresh fake instance + relay in the given mode
 sc.step(Step, must_act)  one agent.py step: Jev picks a candidate, judges `done`
-sc.check / check_screen  hard checks; every scenario needs at least one
+sc.check / check_tree    hard checks; every scenario needs at least one
 sc.log_after(marker)     fake-server log lines after sc.box.mark(marker)
 
+Every candidate acts through the app's accessibility tree, by the ids in
+docs/a11y-ids.md (suite.AppDriver), and every hard check on the app reads the
+tree. Jev still judges each step from the screenshot.
+
 Candidate actions are complete; none of them may create a wallet, remove an
-account for real, or publish anywhere but the fake server (P and R excepted).
+account for real, or publish anywhere but the fake server (P, R and Y excepted).
 """
-import asyncio, os, time
+import asyncio, time
 from agent import Step, Cand
-from suite import accent_pills, fine_lines, has, norm, ocr_phrase_all, ocr_phrase_pos, shot_bytes
+from suite import shot_bytes
 
-FOCUS = ("focus", "Magic Carpet")
+FOCUS = ("focus", "Magic Carpet")   # before "key" and "type": the app's window takes them
 PARK = ("park", None)   # pointer to the rail's foot: hover tooltips hide the header
-# Rail geometry at 1280x960 (window at 0,0): the avatars sit 55 px apart.
-# Rail avatar clicks go through the "avatar" action: the driver maps
-# a name to a window-local point, which differs per target (the
-# box coordinates date to an older rail layout than the omac one).
-
-BOUNTIES = Cand("open-bounties", "Press super+2 to open the Bounties screen.", [FOCUS, ("key", "super+2")])
-DASHBOARD = Cand("open-dashboard", "Press super+1 to open the Dashboard.", [FOCUS, ("key", "super+1")])
-WALLET = Cand("open-wallet", "Press super+6 to open the Wallet screen of the selected account.", [FOCUS, ("key", "super+6")])
-NEW_FORM = Cand("new-bounty-form", "Press super+n to open the 'New DList + bounty' form.", [FOCUS, ("key", "super+n")])
-HOUSE = Cand("click-house-avatar", "Click the first avatar in the left rail to select the house issuer, then press super+2 to return to Bounties.",
-             [FOCUS, ("avatar", "house"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)])
-NEXT_ACCOUNT = Cand("next-account", "Press super+] to select the next account in the rail.", [FOCUS, ("key", "super+bracketright")])
+# Account switches keep the screen; the sidebar's Bounties tab is the way to
+# Bounties, and bounties-new carries the issuer/claimant wording.
+TO_BOUNTIES = [("wait_id", "nav-bounties"), ("press", "nav-bounties"), PARK]
+BOUNTIES = Cand("open-bounties", "Press the sidebar's Bounties tab.", TO_BOUNTIES + [("wait_id", "bounties-title")])
+DASHBOARD = Cand("open-dashboard", "Press the sidebar's Dashboard tab.", [("press", "nav-dashboard"), ("wait_id", "dash-heading"), PARK])
+NEW_FORM = Cand("new-bounty-form", "Press the '+ New DList + bounty' button in the Bounties header.",
+                [("press", "bounties-new"), ("wait_id", "bounty-form"), PARK])
 HOUSE_CUES = ("New DList + bounty", "Submit a bounty claim", "Bounties")
+ISSUER = ("bounties-new", "New DList + bounty")       # the header button as the house sees it
+CLAIMANT = ("bounties-new", "Submit a bounty claim")  # and as anyone else does
+# A bounty row: any id under bounty-row- but its pills' (fake ids are not UUIDs).
+ROW = "~bounty-row-(?!.*-(?:status|sats|paid|auto-pay|qualify)$).+"
+# Recent activity rows: dash-activity-<at>-<hash>, "-2", "-3" for repeats.
+ACTIVITY = "~dash-activity-[0-9]+-[0-9a-f]+(?:-[0-9]+)?"
+STILL_SENDING = "Still sending. Wait for it to finish."
 
 
-def fill(name, cap="200"):
-    """The seven form fields; the last Enter submits."""
+def tab(sc, who):
+    """The rail tab of keys.json's `who` (house, claimant)."""
+    return f"rail-account-{sc.suite.keys[who]['pub']}"
+
+
+def house(sc):
+    return Cand("press-house-tab", "Press the house issuer's account tab in the left rail, then the sidebar's Bounties tab.",
+                [("press", tab(sc, "house"))] + TO_BOUNTIES + [("wait_id", {"id": "bounties-new", "has": [ISSUER[1]], "soft": True})])
+
+
+async def start(sc, name, ready="rail-add-account", **kw):
+    """The accessibility bus up, then the app launched on it and the
+    preflight passed. The store, or None (the checks say why)."""
+    if not sc.check("accessibility bus up (python3-gi, at-spi, IsEnabled)", sc.box.a11y_up()):
+        return None
+    store = sc.box.launch(name, sc.suite.run_id, **kw)
+    return store if await a11y_preflight(sc, ready) else None
+
+
+async def a11y_preflight(sc, ready="rail-add-account"):
+    """Right after a launch: xwininfo is there, the app's window is
+    measurable, and its tree is on the bus (`ready` is in it: the rail's +,
+    or the choose card's Create on a first launch)."""
+    who = f" ({sc.app.name})" if sc.app else ""
+    d = sc.suite.driver
+    from suite import dx
+    ok = sc.check(f"xwininfo in mc{who}", dx("command -v xwininfo").returncode == 0)
+    try:
+        box = await d.window_box()
+        ok = sc.check(f"app window measured{who}", True, str(box)) and ok
+    except RuntimeError as e:
+        ok = sc.check(f"app window measured{who}", False, str(e)) and ok
+    try:
+        await d.act("wait_id", {"id": ready, "secs": 20})
+        ok = sc.check(f"app tree on the accessibility bus ({ready}){who}", True) and ok
+    except RuntimeError as e:
+        ok = sc.check(f"app tree on the accessibility bus ({ready}){who}", False, str(e)) and ok
+    # A scenario needs a hard check of its own, after these. Only the first
+    # launch's: Y relaunches, and its earlier checks still count.
+    if not sc.checks_from:
+        sc.checks_from = len(sc.checks)
+    return ok
+
+
+async def act(sc, name, actions):
+    """Driver actions outside a Jev step. True, or a failed check `name`
+    with the reason (a press that found no node, say)."""
+    try:
+        for kind, arg in actions:
+            await sc.suite.driver.act(kind, arg)
+        return True
+    except Exception as e:
+        return sc.check(name, False, f"{type(e).__name__}: {e}")
+
+
+BOUNTY_FIELDS = ("item-singular", "item-plural", "description", "criteria", "amount", "cap", "min-rank")
+
+
+def type_fields(pairs):
+    """Each (field, text): focus bounty-form-<field> by its id, replace its
+    text. A retry replaces an earlier attempt's text instead of appending."""
+    do = [FOCUS]
+    for fid, text in pairs:
+        do += [("click_id", f"bounty-form-{fid}"), ("key", "ctrl+a"), ("type", text), ("wait", 0.3)]
+    return do
+
+
+def fill_fields(name, cap="200"):
+    """The seven bounty fields: reward 100, `cap`, min rank 2. No Enter: the
+    caller's Enter, in the last field, submits (in the others it moves on)."""
     words = name.replace("-", " ")
+    return type_fields(zip(BOUNTY_FIELDS, (name, name + "s", f"{words}s for the e2e suite",
+                                           f"A {words} name, one per claim", "100", cap, "2")))
+
+
+def fill(name, cap="200", wait=False):
+    """Fill and submit. wait: until the new bounty's detail pane names it."""
+    do = fill_fields(name, cap) + [("key", "Return"), ("stamp", "submitted")]
+    if wait:
+        do.append(("wait_id", {"id": "bounty-detail-title", "name": name, "secs": 45, "soft": True}))
     return Cand("fill-and-publish",
-                f"Type the seven fields with Enter after each: singular '{name}', plural, description, criteria, reward 100, cap {cap}, min rank 2. The last Enter submits.",
-                [FOCUS, ("type", name), ("key", "Return"), ("wait", 0.4),
-                 ("type", name + "s"), ("key", "Return"), ("wait", 0.4),
-                 ("type", f"{words}s for the e2e suite"), ("key", "Return"), ("wait", 0.4),
-                 ("type", f"A {words} name, one per claim"), ("key", "Return"), ("wait", 0.4),
-                 ("key", "ctrl+a"), ("type", "100"), ("key", "Return"), ("wait", 0.4),
-                 ("key", "ctrl+a"), ("type", cap), ("key", "Return"), ("wait", 0.4),
-                 ("key", "ctrl+a"), ("type", "2"), ("key", "Return"), ("stamp", "submitted")])
+                f"Click each of the seven fields and type it: singular '{name}', plural, description, criteria, reward 100, cap {cap}, min rank 2; Enter in the last field publishes.",
+                do)
 
 
 async def open_house_form(sc):
     """Bounties screen, house selected, New DList + bounty form open."""
     ok = await sc.step(Step("Show the Bounties screen with the house issuer selected (its header button reads 'New DList + bounty'; the claimant would see 'Submit a bounty claim').",
-                            [HOUSE, BOUNTIES], "The Bounties screen is shown and its header button reads 'New DList + bounty'.", settle=2, cues=HOUSE_CUES),
+                            [house(sc), BOUNTIES], "The Bounties screen is shown and its header button reads 'New DList + bounty'.", settle=2, cues=HOUSE_CUES),
                        label="house on bounties")
-    if not (ok and sc.check_screen("house selected", ["New DList + bounty"], ["Submit a bounty claim"])):
+    if not (ok and sc.check_tree("house selected", [ISSUER], [CLAIMANT])):
         return False
     return await sc.step(Step("Open the new bounty form as the house issuer.", [NEW_FORM],
                               "A form titled 'New DList + bounty' is open with an 'Item (singular)' field.", settle=2,
@@ -64,23 +142,25 @@ async def submit_form(sc, name, done, cues, settle=3.0):
 # ---------------------------------------------------------------- A
 async def scenario_a(sc):
     sc.box.start_fake({"create": "hang", "hang_secs": 45})
-    sc.store = sc.box.launch("A", sc.suite.run_id)
-    if not await open_house_form(sc):
+    sc.store = await start(sc, "A")
+    if not sc.store or not await open_house_form(sc):
         return
     sc.box.mark("A submit")
     # Submit and the four attempts in one candidate: all of it must land
     # inside the app's 20 s client timeout, and an OCR pass takes ~5 s here.
     # A snap after each attempt is the per-action evidence; the feed's three
-    # amber lines below are the per-action verdict.
+    # amber lines below are the per-action verdict. The switch is the
+    # claimant's rail tab: super+] and the tab both go through set_account.
     await sc.step(Step(
-        "Submit a 'hang-city' bounty; while its create request is in flight, try in turn: switch account (super+]), add an account (+), remove the active account (two clicks), and Escape.",
+        "Submit a 'hang-city' bounty; while its create request is in flight, try in turn: switch account (the claimant's rail tab), add an account (+), remove the active account (two presses), and Escape.",
         [Cand("submit-then-try-all-four",
-              "Fill and submit the form, then press super+], click the '+' in the rail, click 'Remove this account' then 'Click again to remove' in the sidebar, then press Escape.",
-              fill("hang-city").do + [
+              "Fill and submit the form, then press the claimant's tab in the rail, the '+' in the rail, 'Remove this account' twice in the sidebar, then Escape.",
+              fill_fields("hang-city") + [
+                  ("key", "Return"), ("stamp", "submitted"),
                   ("wait", 1.5), ("snap", "submitted"),
-                  ("key", "super+bracketright"), ("wait", 0.5), ("snap", "after super+]"),
-                  ("avatar", "plus"), ("wait", 0.5), PARK, ("snap", "after plus"),
-                  ("click", REMOVE_LINK_XY), ("wait", 0.5), ("click", REMOVE_LINK_XY), ("wait", 0.5), PARK,
+                  ("press", tab(sc, "claimant")), ("wait", 0.5), ("snap", "after switch"),
+                  ("press", "rail-add-account"), ("wait", 0.5), PARK, ("snap", "after plus"),
+                  ("press", "sidebar-remove-account"), ("wait", 0.5), ("press", "sidebar-remove-account"), ("wait", 0.5), PARK,
                   ("snap", "after remove x2"),
                   ("key", "Escape"), ("stamp", "attempts done"), ("wait", 0.5)])],
         "The bounty form is still open and still reads 'Publishing…'; the header button still reads 'New DList + bounty' (the house is still selected); no account setup screen.",
@@ -89,9 +169,10 @@ async def scenario_a(sc):
     t_submit = sc.stamps.get("submitted", time.time())
     done_at = sc.stamps.get("attempts done", time.time())
     sc.check("the attempts ran inside the client timeout", done_at - t_submit < 18, f"{done_at - t_submit:.1f} s after submit")
-    if sc.check_screen("switch, setup, remove and esc all refused",
-                       ["Publishing", "Cancel (esc)", "New DList + bounty"], ["Submit a bounty claim", "Your Nostr account"]):
-        sc.accept_step("submit and in-flight attempts", "Publishing, Cancel (esc) and New DList + bounty on screen after the attempts")
+    if sc.check_tree("switch, setup, remove and esc all refused",
+                     [("bounty-form-status", "Publishing"), ("bounty-form-cancel", None), ISSUER],
+                     [CLAIMANT, ("~setup-.+", None)]):
+        sc.accept_step("submit and in-flight attempts", "Publishing, the form's Cancel and the issuer's header button in the tree after the attempts")
     # The client timeout is 20 s; give it 26 from the submit.
     await asyncio.sleep(max(0, t_submit + 26 - time.time()))
     # After the timeout the form reads "Checking the list…" until the
@@ -99,14 +180,15 @@ async def scenario_a(sc):
     await sc.step(Step("Wait for the create request to time out and the list check after it.", [Cand("wait", "Wait 5 seconds.", [("wait", 5)])],
                        "The bounty form is still open, 'Publishing…' is gone, and an error line says the bounty may exist already.",
                        tries=3, settle=1, cues=("Publishing", "Checking the list", "may exist already")), label="timeout unlocks")
-    await sc.wait_for(["may exist already"], timeout=20, label="list check done")
-    sc.check_screen("form unlocked after the client timeout and the list check", ["Cancel (esc)", "may exist already"],
-                    ["Publishing", "Checking the list"])
+    sc.wait_tree("bounty-form-error", 20, has="may exist already")
+    sc.check_tree("form unlocked after the client timeout and the list check",
+                  [("bounty-form-cancel", None), ("bounty-form-error", "may exist already")],
+                  [("bounty-form-status", "Publishing"), ("bounty-form-status", "Checking the list")])
     await sc.step(Step("Open the Dashboard to read the Recent activity feed.", [DASHBOARD],
                        "The Recent activity panel lists 'Still sending. Wait for it to finish.' at least once.",
                        settle=2, cues=("Still sending", "Recent activity")), label="activity feed")
-    n = sc.count("Still sending")
-    sc.check("amber 'Still sending' line for switch, setup and remove (3x)", n >= 3, f"seen {n}x")
+    n = sc.tree(ACTIVITY, name=STILL_SENDING)
+    sc.check("amber 'Still sending' line for switch, setup and remove (3x)", n >= 3, f"{n} activity rows")
     posts = [l for l in sc.log_after("A submit") if l.startswith("POST /api/bounties")]
     sc.check("exactly one create request went out", len(posts) == 1, posts)
     sc.check("the active account was not removed", sc.box.accounts_in_store(sc.store) == 2, f"{sc.box.accounts_in_store(sc.store)} accounts in store")
@@ -115,15 +197,15 @@ async def scenario_a(sc):
 # ---------------------------------------------------------------- B, C
 async def scenario_b(sc):
     sc.box.start_fake({"create": "502"})
-    sc.box.launch("B", sc.suite.run_id)
-    if not await open_house_form(sc):
+    if not await start(sc, "B") or not await open_house_form(sc):
         return
     sc.box.mark("B submit")
     await submit_form(sc, "gateway-city", "The form shows an error saying the bounty may exist already and to check the list before retrying.",
                       ("may exist already", "Check the bounty list"))
     # "Checking the list…" first, then the hint once the refetch lands.
-    await sc.wait_for(["may exist already"], timeout=20, label="after 502")
-    sc.check_screen("'may exist already' hint shown, form unlocked", ["may exist already"], ["Checking the list", "Publishing"])
+    sc.wait_tree("bounty-form-error", 20, has="may exist already")
+    sc.check_tree("'may exist already' hint shown, form unlocked", [("bounty-form-error", "may exist already")],
+                  [("bounty-form-status", "Checking the list"), ("bounty-form-status", "Publishing")])
     lines = sc.log_after("B submit")
     post = next((i for i, l in enumerate(lines) if l.startswith("POST /api/bounties")), None)
     refetch = post is not None and any(l.startswith("GET /api/bounties issuer") for l in lines[post + 1:])
@@ -132,14 +214,12 @@ async def scenario_b(sc):
 
 async def scenario_c(sc):
     sc.box.start_fake({"create": "400"})
-    sc.box.launch("C", sc.suite.run_id)
-    if not await open_house_form(sc):
+    if not await start(sc, "C") or not await open_house_form(sc):
         return
     sc.box.mark("C submit")
     await submit_form(sc, "refused-city", "The form shows an error about amountSats and no 'may exist already' hint.", ("amountSats", "may exist already"))
-    await asyncio.sleep(5)
-    await sc.see("after 400")
-    sc.check_screen("400 shows the refusal, no hint", ["amountSats"], ["may exist already"])
+    sc.wait_tree("bounty-form-error", 10, has="amountSats")
+    sc.check_tree("400 shows the refusal, no hint", [("bounty-form-error", "amountSats")], [("bounty-form-error", "may exist already")])
     lines = sc.log_after("C submit")
     post = next((i for i, l in enumerate(lines) if l.startswith("POST /api/bounties")), None)
     sc.check("the create went out", post is not None, lines[-6:])
@@ -150,20 +230,18 @@ async def scenario_c(sc):
 async def scenario_d(sc):
     coord = "39998:%s:dup-city" % sc.suite.keys["house"]["pub"]
     sc.box.start_fake({"create": "ok", "dup_coordinate": coord})
-    sc.box.launch("D", sc.suite.run_id)
-    if not await open_house_form(sc):
+    if not await start(sc, "D") or not await open_house_form(sc):
         return
     sc.box.mark("D submit")
     # Driven directly: the dup mode already lists dup-city, so the judge half
     # believes a fill step is done and its pick comes back weak.
-    for kind, arg in fill("dup-city").do:
-        await sc.suite.driver.act(kind, arg)
+    if not await act(sc, "the duplicate's form filled and submitted", fill("dup-city").do):
+        return
     await sc.step(Step("Wait for the form's answer to the duplicate.", [Cand("wait", "Wait 2 seconds.", [("wait", 2)])],
                        "The form shows 'This list already has an open bounty. Pick it from the list instead.'",
                        tries=2, settle=1, cues=("already has an open bounty", "Publishing")), label="dup answer")
-    await asyncio.sleep(2)
-    await sc.see("after dup submit")
-    sc.check_screen("duplicate refused in the form", ["already has an open bounty"])
+    sc.wait_tree("bounty-form-error", 10, has="already has an open bounty")
+    sc.check_tree("duplicate refused in the form", [("bounty-form-error", "already has an open bounty")])
     sent = [l for l in sc.log_after("D submit") if l.startswith(("POST /api/bounties", "POST strfry/publish"))]
     sc.check("no request sent for the duplicate", not sent, sent)
 
@@ -171,8 +249,7 @@ async def scenario_d(sc):
 # ---------------------------------------------------------------- E
 async def scenario_e(sc):
     sc.box.start_fake({"create": "401once"})
-    sc.box.launch("E", sc.suite.run_id)
-    if not await open_house_form(sc):
+    if not await start(sc, "E") or not await open_house_form(sc):
         return
     sc.box.mark("E once")
     # Positive wording: Jev scores absences ("no error") poorly; the hard
@@ -183,68 +260,71 @@ async def scenario_e(sc):
     posts = [i for i, l in enumerate(lines) if l.startswith("POST /api/bounties")]
     relog = len(posts) == 2 and sum(1 for l in lines[posts[0]:posts[1]] if l.startswith("POST login-user")) == 1
     sc.check("401 then re-login then a second create", relog, lines)
-    sc.check_screen("401 once: form closed without an error", [], ["not logged in", "Cancel (esc)"])
+    sc.check_tree("401 once: form closed without an error", [], [("bounty-form", None)])
     # 401 twice: a new mode file resets the fake's counter.
     sc.box.set_mode({"create": "401always"})
     sc.box.mark("E twice")
     await sc.step(Step("Open the new bounty form again as the house issuer.", [NEW_FORM, BOUNTIES],
                        "A form titled 'New DList + bounty' is open with an 'Item (singular)' field.", settle=2, cues=("Item (singular)",)), label="reopen form")
     await submit_form(sc, "deny-city", "The form is still open with an error line, and no 'Publishing…'.", ("not logged in", "Publishing", "Item (singular)"), settle=4)
-    await asyncio.sleep(3)
-    await sc.see("after 401 twice")
+    sc.wait_tree("bounty-form-error", 10)
     lines = sc.log_after("E twice")
     posts = [l for l in lines if l.startswith("POST /api/bounties")]
     logins = [l for l in lines if l.startswith("POST login-user")]
     sc.check("401 twice: two creates, one re-login, then stop", len(posts) == 2 and len(logins) == 1, lines)
-    sc.check_screen("401 twice: clean error in the open form", ["Cancel (esc)", "401"], ["Publishing"])
+    sc.check_tree("401 twice: clean error in the open form", [("bounty-form-cancel", None), ("bounty-form-error", "401")],
+                  [("bounty-form-status", "Publishing")])
     sc.check("app still running", sc.box.app_alive())
 
 
 # ---------------------------------------------------------------- F
-CLAIMANT_WALLET = Step(
-    "Show the Wallet screen of the claimant account. The house's Wallet only says 'The house key's wallet is not managed here.'; if that shows, select the next account.",
-    [WALLET, Cand("next-account-wallet", "Press super+] to select the next account, then super+6 for its Wallet.",
-                  [FOCUS, ("key", "super+bracketright"), ("wait", 2), ("key", "super+6")])],
-    "The Wallet screen is shown for an account that is not the house: no 'house key's wallet is not managed here' line.",
-    settle=3, cues=("not managed here", "Wallet", "read this profile", "Try again", "Create a Coinos wallet"))
+def claimant_wallet(sc):
+    return Step(
+        "Show the Wallet screen of the claimant account. The house's Wallet only says 'The house key's wallet is not managed here.'",
+        [Cand("claimant-wallet", "Press the claimant's account tab in the left rail, then the sidebar's Wallet tab.",
+              [("press", tab(sc, "claimant")), ("press", "nav-wallet"), ("wait_id", "wallet-title"), PARK])],
+        "The Wallet screen is shown for an account that is not the house: no 'house key's wallet is not managed here' line.",
+        settle=3, cues=("not managed here", "Wallet", "read this profile", "Try again", "Create a Coinos wallet"))
 
 
 async def scenario_f(sc):
     sc.box.start_fake({"scan": "fail"})
-    sc.box.launch("F", sc.suite.run_id)
-    if not await sc.step(CLAIMANT_WALLET, label="claimant wallet"):
+    if not await start(sc, "F") or not await sc.step(claimant_wallet(sc), label="claimant wallet"):
         return
-    sc.check_screen("scan 500: 'Couldn't read this profile' with 'Try again'", ["read this profile", "Try again"], ["Create a Coinos wallet"])
+    sc.wait_tree("wallet-profile-error", 15)
+    sc.check_tree("scan 500: 'Couldn't read this profile' with 'Try again'",
+                  [("wallet-profile-error", "Couldn't read this profile"), ("wallet-profile-retry", None)],
+                  [("wallet-create", None), ("wallet-managed-elsewhere", None)])
     sc.box.set_mode({"scan": "ok"})
     sc.box.mark("F retry")
     await sc.step(Step("The profile scan is healthy again; press the 'Try again' button on the Wallet screen. Do not create a wallet.",
-                       [Cand("try-again", "Click the 'Try again' button under 'Couldn't read this profile'.", [FOCUS, ("click_text", "Try again"), ("wait", 1), PARK])],
+                       [Cand("try-again", "Press the 'Try again' button under 'Couldn't read this profile'.",
+                             [("press", "wallet-profile-retry"), ("wait_id", {"id": "wallet-create", "secs": 20, "soft": True}), PARK])],
                        "'Couldn't read this profile' is gone and the wallet panel offers 'Create a Coinos wallet for this account'.",
                        tries=2, settle=4, cues=("read this profile", "Create a Coinos wallet", "Checking your profile")), must_act=True, label="try again")
-    sc.check_screen("retry reaches the Read state", ["Create a Coinos wallet"], ["read this profile"])
+    sc.check_tree("retry reaches the Read state", [("wallet-create", None)], [("wallet-profile-error", None)])
     ok = [l for l in sc.log_after("F retry") if l.startswith("GET /api/strfry/scan") and l.endswith("200 []")]
     sc.check("the retry re-read the profile scan", bool(ok), sc.log_after("F retry")[-4:])
 
 
 # ---------------------------------------------------------------- G
-BOUNTIES_XY = (150, 250)  # the "Bounties" sidebar row (window at 0,0, 1280x960)
-CHIP_XY = (135, 116)  # the account name at the top of the sidebar
-REMOVE_LINK_XY = (143, 155)  # "Remove this account" under the chip (window at 0,0, 1280x960); fixed, so no OCR pass
+# The sidebar chip opens the active account's page on its Trust tab
+# (shell.rs, `open_account(.., Tab::Trust)`); its Identity & keys tab is next.
 IDENTITY = Step("Open the Identity & keys tab of the active account's page.",
-                [Cand("chip-then-identity", "Click the account name at the top of the sidebar (opens the account page), then click the 'Identity & keys' tab.",
-                      [FOCUS, ("click", CHIP_XY), ("wait", 1.5), PARK, ("click_text", "Identity"), ("wait", 1), PARK])],
+                [Cand("chip-then-identity", "Press the account chip at the top of the sidebar (opens the account page), then its 'Identity & keys' tab.",
+                      [("press", "sidebar-account"), ("wait_id", "account-tab-identity"), ("press", "account-tab-identity"),
+                       ("wait_id", "account-copy-nsec"), PARK])],
                 "The 'Identity & keys' tab shows 'Public identity' and 'Secret key (nsec)'.", settle=2,
                 cues=("Public identity", "Secret key", "Identity"))
 
 
 async def scenario_g(sc):
     sc.box.start_fake({})
-    sc.box.launch("G", sc.suite.run_id)
-    if not await sc.step(IDENTITY, label="identity tab"):
+    if not await start(sc, "G") or not await sc.step(IDENTITY, label="identity tab"):
         return
-    await sc.step(Step("Copy the nsec: click the 'copy' button in the 'Secret key (nsec)' row (next to 'Reveal'). Never click Reveal.",
-                       [Cand("copy-nsec", "Click the 'copy' button to the right of 'Reveal' in the Secret key row.",
-                             [FOCUS, ("click_text", {"text": "copy", "near": "Reveal"}), ("stamp", "copy"), ("wait", 0.5), PARK])],
+    await sc.step(Step("Copy the nsec: press the 'copy' button in the 'Secret key (nsec)' row (next to 'Reveal'). Never press Reveal.",
+                       [Cand("copy-nsec", "Press the 'copy' button to the right of 'Reveal' in the Secret key row.",
+                             [("press", "account-copy-nsec"), ("stamp", "copy"), ("wait", 0.5), PARK])],
                        "The Secret key row's button now reads 'copied'.", tries=1, settle=0.5, cues=("copied", "Reveal")), must_act=True, label="copy nsec")
     t0 = sc.stamps.get("copy", time.time())   # the click itself, not the end of the step
     # Poll the clipboard; keep only booleans and the first 8 characters.
@@ -267,161 +347,108 @@ async def scenario_g(sc):
 
 
 # ---------------------------------------------------------------- H
+REMOVE_ARMED = "Click again to remove"
+SIDEBAR_REMOVE = "sidebar-remove-account"
+
+
 async def remove_armed_flow(sc, who, expect_sats=False):
     """Arm from the sidebar, walk away, arm from the Identity card, walk away."""
-    await sc.step(Step(f"Arm 'Remove this account' for the {who}: click the sidebar link once. Do not click a second time.",
-                       [Cand("arm-sidebar", "Click 'Remove this account' under the account name in the sidebar, once.",
-                             [FOCUS, ("click_fine", "Remove this account"), ("wait", 1), PARK])],
-                       "The sidebar link now reads 'Click again to remove'.", tries=1, settle=2, cues=("Click again to remove", "Remove this account")),
+    await sc.step(Step(f"Arm 'Remove this account' for the {who}: press the sidebar link once. Do not press it a second time.",
+                       [Cand("arm-sidebar", "Press 'Remove this account' under the account name in the sidebar, once.",
+                             [("press", SIDEBAR_REMOVE), ("wait", 1), PARK])],
+                       "The sidebar link now reads 'Click again to remove'.", tries=1, settle=2, cues=(REMOVE_ARMED, "Remove this account")),
                   must_act=True, label=f"{who} arm sidebar")
-    sc.check_screen(f"{who}: sidebar arms 'Click again to remove'", ["Click again to remove"])
+    sc.check_tree(f"{who}: sidebar arms 'Click again to remove'", [(SIDEBAR_REMOVE, REMOVE_ARMED)])
     if expect_sats:
         # Arming re-reads the balance: "Checking balance…", then the warning.
-        screen = await sc.wait_for(["still holds"], ["Couldn't read the balance"], timeout=25, every=2, label=f"{who} balance")
-        sc.check(f"{who} (Coinos wallet): armed remove warns about sats left", has(screen, "still holds"),
-                 "balance not readable" if has(screen, "Couldn't read the balance") else "no 'This wallet still holds N sats' line while armed")
-    await sc.step(Step("Navigate away: press super+1 for the Dashboard.", [DASHBOARD],
+        sc.wait_tree("sidebar-remove-warning", 25, has=("still holds", "Couldn't read the balance"))
+        warning = sc.tree_name("sidebar-remove-warning") or ""
+        sc.check(f"{who} (Coinos wallet): armed remove warns about sats left", "still holds" in warning,
+                 "balance not readable" if "read the balance" in warning else f"sidebar-remove-warning reads {warning!r}")
+    await sc.step(Step("Navigate away: press the sidebar's Dashboard tab.", [DASHBOARD],
                        "The Dashboard is shown and the sidebar reads 'Remove this account' again, not 'Click again to remove'.",
-                       settle=2, cues=("Click again to remove", "Remove this account", "Dashboard")), must_act=True, label=f"{who} leave (sidebar)")
-    sc.check_screen(f"{who}: navigating away disarms (sidebar)", ["Remove this account"], ["Click again to remove"])
+                       settle=2, cues=(REMOVE_ARMED, "Remove this account", "Dashboard")), must_act=True, label=f"{who} leave (sidebar)")
+    sc.check_tree(f"{who}: navigating away disarms (sidebar)", [(SIDEBAR_REMOVE, "Remove this account")], [(SIDEBAR_REMOVE, REMOVE_ARMED)])
     if not await sc.step(IDENTITY, label=f"{who} identity tab"):
         return
     await sc.step(Step(f"Arm the 'Remove…' button on the {who}'s Identity card ('Remove this account' card at the bottom), once.",
-                       [Cand("arm-card", "Click the 'Remove…' button on the right of the 'Remove this account' card, once.",
+                       [Cand("arm-card", "Press the 'Remove…' button on the right of the 'Remove this account' card, once.",
                              # The npub QR card pushes this card below the fold.
-                             [FOCUS, ("scroll", "down"), ("wait", 3),
-                              ("click_text", {"text": "Remove", "near": "Deletes the nsec"}), ("wait", 1), PARK])],
+                             [("scroll_to", "account-remove"), ("press", "account-remove"), ("wait", 1), PARK])],
                        "The card's button and the sidebar link read 'Click again to remove'.", tries=1, settle=2,
-                       cues=("Click again to remove", "Remove", "Deletes the nsec")), must_act=True, label=f"{who} arm card")
-    n = sc.count("click again to remove")
-    sc.check(f"{who}: Identity card arms (card + sidebar)", n >= 2, f"seen {n}x")
-    await sc.step(Step("Navigate away: press super+2 for Bounties.", [BOUNTIES],
+                       cues=(REMOVE_ARMED, "Remove", "Deletes the nsec")), must_act=True, label=f"{who} arm card")
+    sc.check_tree(f"{who}: Identity card arms (card + sidebar)", [("account-remove", REMOVE_ARMED), (SIDEBAR_REMOVE, REMOVE_ARMED)])
+    await sc.step(Step("Navigate away: press the sidebar's Bounties tab.", [BOUNTIES],
                        "The Bounties screen is shown and nothing reads 'Click again to remove'.", settle=2,
-                       cues=("Click again to remove", "Bounties")), must_act=True, label=f"{who} leave (card)")
-    sc.check_screen(f"{who}: navigating away disarms (card)", [], ["Click again to remove"])
+                       cues=(REMOVE_ARMED, "Bounties")), must_act=True, label=f"{who} leave (card)")
+    sc.check_tree(f"{who}: navigating away disarms (card)", [], [("~(sidebar-remove-account|account-remove)", REMOVE_ARMED)])
 
 
 async def scenario_h(sc):
     sc.box.start_fake({})
-    sc.store = sc.box.launch("H", sc.suite.run_id, seed=True)
-    await sc.step(Step("Show Bounties with the house issuer selected.", [HOUSE, BOUNTIES],
-                       "The Bounties screen is shown and its header button reads 'New DList + bounty'.", settle=2, cues=HOUSE_CUES), label="house")
+    sc.store = await start(sc, "H", seed=True)
+    if not sc.store:
+        return
+    await sc.step(Step("Show Bounties with the house issuer selected.", [house(sc), BOUNTIES],
+                       "The Bounties screen is shown and its header button reads 'New DList + bounty'.", settle=2, cues=HOUSE_CUES),
+                  must_act=True, label="house")   # the press is idempotent; Jev took the Dashboard for done
     await remove_armed_flow(sc, "house")
-    # Direct: the avatar click is idempotent, and the judge halted here on a
-    # weak pick (p 0.44-0.50, abstain ~0.4) in two runs. The literal header
-    # check below decides.
-    for kind, arg in [FOCUS, ("avatar", "claimant"), ("wait", 2), PARK, ("key", "super+2"), ("wait", 1)]:
-        await sc.suite.driver.act(kind, arg)
-    await sc.wait_for(["Submit a bounty claim"], timeout=30, every=3, label="claimant")
-    sc.check_screen("claimant selected", ["Submit a bounty claim"])
+    # Direct: the tab press is idempotent, and the judge halted here on a
+    # weak pick (p 0.44-0.50, abstain ~0.4) in two runs. The header check
+    # below decides.
+    await act(sc, "claimant's tab and Bounties pressed", [("press", tab(sc, "claimant"))] + TO_BOUNTIES)
+    sc.wait_tree("bounties-new", 30, has=CLAIMANT[1])
+    sc.check_tree("claimant selected", [CLAIMANT])
     await remove_armed_flow(sc, "claimant", expect_sats=True)
     sc.check("nothing was removed", sc.box.accounts_in_store(sc.store) == 2, f"{sc.box.accounts_in_store(sc.store)} accounts in store")
 
 
 # ---------------------------------------------------------------- P (paid)
 async def scenario_p(sc):
-    """One real bounty (100 sats, cap 100) and one claim against tapestry.
-    Never retried."""
+    """One real bounty (100 sats, cap 100) and one claim against tapestry,
+    with R's gates. Never retried."""
     stamp = sc.suite.run_id.replace("-", "")[-10:]
-    name = f"e2e-{stamp}"
-    os.environ["LIST_NAME"], os.environ["CLAIM_ITEM"] = name, f"E2E Roasters {stamp}"
-    import importlib
-    import demo_bounty, demo_claim, demo_settled
-    for m in (demo_bounty, demo_claim, demo_settled):
-        importlib.reload(m)   # they read LIST_NAME / CLAIM_ITEM at import
+    name, item = f"e2e-{stamp}", f"E2E Roasters {stamp}"
     meta = sc.suite.meta
     meta["float_before"] = sc.box.float_sats()
     sc.check("float at least 200 sats", (meta["float_before"] or 0) >= 200, f"{meta['float_before']} sats")
-    sc.box.launch("P", sc.suite.run_id, target="instance", seed=True)
+    if not await start(sc, "P", target="instance", seed=True):
+        return
     try:
-        await paid_flow(sc, name, demo_bounty, demo_claim, demo_settled)
+        await paid_flow(sc, name, item)
     finally:
         meta["float_after"] = sc.box.float_sats()
         spent = (meta["float_before"] or 0) - (meta["float_after"] or 0)
         sc.check("float dropped by one payout, not more", 0 < spent <= 150, f"{meta['float_before']} -> {meta['float_after']} sats")
 
 
-async def paid_flow(sc, name, demo_bounty, demo_claim, demo_settled):
-    import dataclasses
-    once = lambda s: dataclasses.replace(s, tries=1)
-    b = demo_bounty.STEPS
-    # The app opens on the Dashboard, whose cues overlap demo_bounty's first
-    # step; live Jev read it as "already done" (run 20260923-110709). Land on
-    # Bounties first, with the action forced.
-    if not await sc.step(Step("Open the Bounties screen.", [demo_bounty.OPEN_BOUNTIES],
-                              "The screen heading reads 'Bounties' and a hint line mentions 'select' and 'switch account'.",
-                              settle=2, cues=("select", "switch account", "Recent activity")), must_act=True, label="open bounties"):
+async def paid_flow(sc, name, item):
+    # cap = reward = 100: the bounty closes after its one payout, so a
+    # leftover e2e bounty can never pay again.
+    if not await house_publishes(sc, name, cap="100"):
         return
-    if not await sc.steps_(b[:3]):
+    claimant = tab(sc, "claimant")
+    acct = sc.tree_name(claimant)
+    if not sc.check("the claimant's account tab names it", bool(acct), repr(acct)):
         return
-    # Gate: FILL's keystrokes end in Enter. In a claim form they would claim
-    # (and pay out) some other bounty, so the house's bounty form must be up.
-    if not sc.check_screen("the house's New DList + bounty form is open", ["New DList + bounty", "Cancel (esc)"],
-                           ["Claim an item on", "Submit a bounty claim"]):
-        await sc.suite.driver.act("key", "Escape")
+    if not await claim_and_settle(sc, "claimant", name, item, claimant, acct, r_open_form(name)):
         return
-    # demo_bounty's FILL, with cap = reward = 100: the bounty closes after its
-    # one payout, so a leftover e2e bounty can never pay again. tries=1: a
-    # retried Enter could create a second bounty.
-    publish = dataclasses.replace(b[3], tries=1, cands=[fill(name, cap="100")] + b[3].cands[1:])
-    if not await sc.step(publish, must_act=True, label="publish bounty"):
-        return
-    c = demo_claim.ALL
-    if not await sc.steps_(c[:2]):
-        return
-    # Gate: the claim form must be on this run's bounty, or we'd pay another one.
-    if not sc.check_screen("claim form is on this run's bounty", [f"Claim an item on {name}"]):
-        await sc.suite.driver.act("key", "Escape")
-        sc.notes.append("claim form was not on this run's bounty; cancelled, nothing claimed")
-        return
-    # tries=1: a second claim would be a second payout.
-    if not await sc.step(once(c[2]), must_act=True, label="submit claim"):
-        return
-    await sc.step(dataclasses.replace(c[3], tries=6), label="wait for settlement")
-    screen = await sc.wait_for(["Payment settled", "Payment receipt"], ["Auto-pay failed"], timeout=150, every=10, label="settle poll")
-    if has_failed(screen):
-        sc.notes.append("Auto-pay failed on the claim card; not retried, not reset")
-    await sc.step(demo_settled.STEPS[0], label="settled after refresh")
-    both = sc.screen + "\n" + screen
-    sc.check_screen("Payment settled and Payment receipt on the claim card", ["Payment settled", "Payment receipt"], ["Auto-pay failed"], screen=both)
-    await sc.step(demo_settled.STEPS[1], label="claimant wallet")
-
-
-def has_failed(screen):
-    return "auto-pay failed" in screen.lower()
+    await sc.step(Step("Show the claimant's wallet balance.",
+                       [Cand("open-wallet", "Press the sidebar's Wallet tab.", [("press", "nav-wallet"), ("wait_id", "wallet-balance"), PARK])],
+                       "The Wallet screen is shown with a sats balance.", settle=5, cues=("Wallet", "sats", "coinos")),
+                  label="claimant wallet")
 
 
 # ---------------------------------------------------------------- R (paid)
-# R drives the app through its accessibility tree (atspi.py, box only): each
-# step's candidates press controls and focus fields by their stable ids
-# (docs/a11y-ids.md), and the waits are for the ids that mark the next
-# state. Jev still picks the candidate and judges every postcondition
-# from the screenshot, so a press that reaches the wrong control fails the
-# step. Labels carry no text over AT-SPI, so the wallet, auto-pay and payment
-# wording is still read from the screen.
+# R drives the app through its accessibility tree like every scenario: the
+# waits are for the ids that mark the next state, and the gates before each
+# paying Enter read the tree. Jev still picks the candidate and judges every
+# postcondition from the screenshot, so a press that reaches the wrong
+# control fails the step.
 RAIL_ACCOUNT = "~rail-account-[0-9a-f]{64}"
 BOUNTY_ROW = "~bounty-row-[0-9a-f-]{36}"
 CLAIM_CARD = "~claim-[0-9a-f]{64}"
-# Switching accounts lands on the Dashboard; the sidebar's Bounties tab is
-# the way back, and bounties-new carries the issuer/claimant wording.
-TO_BOUNTIES = [("wait_id", "nav-bounties"), ("press", "nav-bounties"), PARK]
-
-
-def a11y_name(sc, target, name=None):
-    """The control's AT-SPI name, or None unless exactly one node matches."""
-    try:
-        return sc.suite.driver.a11y("name", target, name=name)["name"]
-    except RuntimeError as e:
-        sc.notes.append(f"a11y: {e}"[:300])
-        return None
-
-
-def a11y_count(sc, target, name=None):
-    try:
-        return sc.suite.driver.a11y("exists", target, name=name)["count"]
-    except RuntimeError as e:
-        sc.notes.append(f"a11y: {e}"[:300])
-        return -1
+PAYMENT = "~claim-[0-9a-f]{64}-payment"   # every claim card's payment state
 
 
 def create_account(who, stamp, first_run=False):
@@ -461,14 +488,14 @@ async def newcomer(sc, who, stamp, first_run=False):
     if not await sc.step(steps[1], must_act=True, label=f"newcomer {who} create"):
         return False
     # Live coinos.io plus a kind-0 publish: allow a minute. "Copy password"
-    # exists only after a Coinos signup in this session; the wording itself
-    # is a Label, so the screen confirms it.
+    # exists only after a Coinos signup in this session.
     try:
         await sc.suite.driver.act("wait_id", {"id": "wallet-copy-password", "secs": 60, "soft": True})
     except Exception as e:   # a soft wait still raises when the driver cannot run at all
         sc.notes.append(f"newcomer {who}: wallet wait: {e}"[:300])
-    screen = await sc.wait_for(["Coinos wallet ready"], ["failed"], timeout=15, every=4, label=f"newcomer {who} wallet")
-    if not sc.check_screen(f"newcomer {who}: Coinos wallet ready", ["Coinos wallet ready"], ["failed"], screen=screen):
+    sc.wait_tree("setup-step-wallet-tag", 15, has="Coinos wallet ready")
+    if not sc.check_tree(f"newcomer {who}: Coinos wallet ready", [("setup-step-wallet-tag", "Coinos wallet ready")],
+                         [("setup-error", None), ("wallet-error", None)]):
         return False
     # Driven directly: the judge kept re-observing instead of pressing Enter.
     # The ready panel's Dashboard button is below the fold at 1280x960 (and
@@ -485,10 +512,11 @@ async def newcomer(sc, who, stamp, first_run=False):
                              tries=2, settle=1, cues=("Recent activity", "Dashboard", "Coinos wallet ready")), label=label)
     # The Dashboard also says "Coinos wallet ready: ..." in Needs attention;
     # only the ready panel has the Copy password button.
-    if not sc.check_screen(f"newcomer {who}: back on the Dashboard", ["Recent activity"], ["Copy password"]):
+    if not sc.check_tree(f"newcomer {who}: back on the Dashboard", [("dash-heading", None), ("dash-activity-heading", None)],
+                         [("wallet-copy-password", None)]):
         return False
     if not met:
-        sc.accept_step(label, "Recent activity on screen, ready panel gone")
+        sc.accept_step(label, "dash-heading and Recent activity in the tree, ready panel gone")
     return True
 
 
@@ -503,57 +531,17 @@ async def scenario_r(sc):
     meta["float_before_r"] = sc.box.float_sats()
     if not sc.check("float at least 250 sats (two payouts plus fees)", (meta["float_before_r"] or 0) >= 250, f"{meta['float_before_r']} sats"):
         return
-    # R drives by accessibility id: no bus, no R (before any account exists).
-    if not sc.check("accessibility bus up (python3-gi, at-spi, IsEnabled)", sc.box.a11y_up()):
-        return
     # Only the house starts in the store; the newcomers are made in the app.
-    store = sc.box.launch("R", sc.suite.run_id, target="instance", seed=False, nsecs=sc.box.keys["house"]["sec"], a11y=True)
+    # No bus or no tree: no R, before any account exists.
+    store = await start(sc, "R", target="instance", seed=False, nsecs=sc.box.keys["house"]["sec"])
+    if not store:
+        return
     try:
-        if not await a11y_preflight(sc):
-            return
         await newcomers_flow(sc, name, stamp, store)
     finally:
         meta["float_after_r"] = sc.box.float_sats()
         spent = (meta["float_before_r"] or 0) - (meta["float_after_r"] or 0)
         sc.check("float dropped by two payouts, not more", 150 < spent <= 300, f"{meta['float_before_r']} -> {meta['float_after_r']} sats")
-
-
-async def a11y_preflight(sc, ready="rail-add-account"):
-    """Before any newcomer is made: xwininfo is there, the app's window is
-    measurable, and its tree is on the bus (`ready` is in it: the rail's +,
-    or the choose card's Create on a first launch)."""
-    who = f" ({sc.app.name})" if sc.app else ""
-    d = sc.suite.driver
-    from suite import dx
-    ok = sc.check(f"xwininfo in mc{who}", dx("command -v xwininfo").returncode == 0)
-    try:
-        box = await d.window_box()
-        ok = sc.check(f"app window measured{who}", True, str(box)) and ok
-    except RuntimeError as e:
-        ok = sc.check(f"app window measured{who}", False, str(e)) and ok
-    try:
-        await d.act("wait_id", {"id": ready, "secs": 20})
-        ok = sc.check(f"app tree on the accessibility bus ({ready}){who}", True) and ok
-    except RuntimeError as e:
-        ok = sc.check(f"app tree on the accessibility bus ({ready}){who}", False, str(e)) and ok
-    return ok
-
-
-def fill_by_id(name, cap):
-    """The seven bounty fields, each focused by its id: reward 100, `cap`,
-    min rank 2. Enter only in the last field, where it submits (Enter in
-    the others just moves on)."""
-    words = name.replace("-", " ")
-    do = [FOCUS]
-    for fid, text in (("item-singular", name), ("item-plural", name + "s"),
-                      ("description", f"{words}s for the e2e suite"), ("criteria", f"A {words} name, one per claim"),
-                      ("amount", "100"), ("cap", cap), ("min-rank", "2")):
-        do += [("click_id", f"bounty-form-{fid}"), ("key", "ctrl+a"), ("type", text), ("wait", 0.3)]
-    do += [("key", "Return"), ("stamp", "submitted"),
-           ("wait_id", {"id": "bounty-detail-title", "name": name, "secs": 45, "soft": True})]
-    return Cand("fill-and-publish",
-                f"Click each of the seven fields and type it: singular '{name}', plural, description, criteria, reward 100, cap {cap}, min rank 2; Enter in the last field publishes.",
-                do)
 
 
 async def newcomers_flow(sc, name, stamp, store):
@@ -567,25 +555,22 @@ async def newcomers_flow(sc, name, stamp, store):
     if not await house_publishes(sc, name):
         return
     for who in ("A", "B"):
-        if not await claim_and_settle(sc, who, name, stamp, r_open_form(name)):
+        item = f"E2E Newcomer {who} {stamp}"
+        if not await claim_and_settle(sc, f"newcomer {who}", name, item, {"id": RAIL_ACCOUNT, "name": item}, item, r_open_form(name)):
             return
 
 
-async def house_publishes(sc, name):
-    """The house (in the store, with the newcomers) selected on Bounties,
-    the form gates, one publish of `name` (reward 100, cap 200), auto-pay
+async def house_publishes(sc, name, cap="200"):
+    """The house (in the store, with the claimants) selected on Bounties,
+    the form gates, one publish of `name` (reward 100, `cap`), auto-pay
     armed. False at the first unmet step or failed gate."""
-    # The house issues one bounty that pays two claims, then closes.
     house_tab = Cand("press-house-tab", "Press the house issuer's account tab in the left rail, then the sidebar's Bounties tab.",
-                     [("press", f"rail-account-{sc.box.keys['house']['pub']}")] + TO_BOUNTIES
-                     + [("wait_id", {"id": "bounties-new", "has": ["New DList + bounty"]})])
+                     [("press", tab(sc, "house"))] + TO_BOUNTIES + [("wait_id", {"id": "bounties-new", "has": [ISSUER[1]]})])
     if not await sc.step(Step("Show the Bounties screen with the house issuer selected (its header button reads 'New DList + bounty').",
                               [house_tab], "The Bounties screen is shown and its header button reads 'New DList + bounty'.",
                               settle=1, cues=HOUSE_CUES), must_act=True, label="house on bounties"):
         return False
-    new_name = a11y_name(sc, "bounties-new") or ""
-    ok = sc.check_screen("house selected", ["New DList + bounty"], ["Submit a bounty claim"])
-    if not (sc.check("house selected (bounties-new)", "New DList + bounty" in new_name, repr(new_name)) and ok):
+    if not sc.check_tree("house selected (bounties-new)", [ISSUER], [CLAIMANT]):
         return False
     if not await sc.step(Step("Open the new bounty form as the house issuer.",
                               [Cand("press-new-bounty", "Press the '+ New DList + bounty' button.",
@@ -594,31 +579,32 @@ async def house_publishes(sc, name):
                          label="open form"):
         return False
     # Gate: the last Enter publishes; in a claim form it would claim and pay.
-    form = a11y_name(sc, "bounty-form")
-    ok = sc.check_screen("the house's New DList + bounty form is open", ["New DList + bounty", "Cancel (esc)"],
-                         ["Claim an item on", "Submit a bounty claim"])
-    ok = sc.check("bounty-form is the house's new list, no claim-form",
-                  form == "New DList + bounty" and a11y_count(sc, "claim-form") == 0, f"bounty-form {form!r}") and ok
-    if not ok:
+    form = sc.tree_name("bounty-form")
+    if not sc.check("bounty-form is the house's new list, no claim-form",
+                    form == "New DList + bounty" and sc.tree("claim-form") == 0, f"bounty-form {form!r}"):
         await sc.suite.driver.act("key", "Escape")
         return False
-    # cap 200 = two payouts of 100; tries=1: a retried Enter is a second bounty.
+    # tries=1: a retried Enter is a second bounty.
     publish = Step("Fill the bounty form and publish it.",
-                   [fill_by_id(name, "200"), Cand("cancel-form", "Press the form's 'Cancel (esc)' button.", [("press", "bounty-form-cancel")])],
+                   [fill(name, cap, wait=True), Cand("cancel-form", "Press the form's 'Cancel (esc)' button.", [("press", "bounty-form-cancel")])],
                    "The new bounty is listed and auto-pay is armed.", tries=1, settle=1,
                    cues=(name, "Auto-pay armed", "watching for claims"))
     if not await sc.step(publish, must_act=True, label="publish bounty"):
         return False
-    # top-auto-pay is in the tree while a bounty is focused; its wording is a Label.
-    await sc.suite.driver.act("wait_id", {"id": "top-auto-pay", "secs": 20, "soft": True})
-    await sc.wait_for(["Auto-pay armed"], timeout=20, every=3, label="auto-pay armed")
-    if not sc.check_screen("auto-pay armed on the new bounty", ["Auto-pay armed"]):
+    # top-auto-pay is in the tree while a bounty is focused.
+    sc.wait_tree("top-auto-pay", 20, has="Auto-pay armed")
+    if not sc.check_tree("auto-pay armed on the new bounty", [("top-auto-pay", "Auto-pay armed")]):
         return False
-    return True
+    # Gate before any claim: a field the click missed keeps the form's
+    # default (cap 400), and the claims would still pay. Never retried.
+    title, reward, got_cap = (sc.tree_name(i) or "" for i in ("bounty-detail-title", "bounty-detail-reward", "bounty-detail-cap"))
+    return sc.check(f"the new bounty is {name}, reward 100 sats, cap {cap} sats",
+                    title == name and reward.startswith("100 sats") and got_cap.startswith(f"{cap} sats"),
+                    f"title {title!r}, reward {reward!r}, cap {got_cap!r}")
 
 
 def r_open_form(name):
-    """R's claim-form step candidates: the bounty is still selected from its
+    """The claim-form step candidates: the bounty is still selected from its
     creation, or it is selected with Down (the list runs oldest first, so its
     row can sit below the fold, where it cannot be pressed)."""
     return [Cand("claim-on-selected", f"'{name}' is already open in the detail pane: press the '+ Submit a bounty claim' button.",
@@ -628,49 +614,41 @@ def r_open_form(name):
                  [("select_bounty", name), ("press", "bounties-new"), ("wait_id", "claim-form-item-name"), PARK])]
 
 
-async def claim_and_settle(sc, who, name, stamp, open_cands, refresh=None, names=None):
-    """Newcomer `who` selected (and gated) on Bounties, the claim form
-    opened with `open_cands` and gated on this run's list and 100 sats, one
-    claim, settlement and its checks. `refresh` is the candidate that shows
-    the card's latest state (R's: Bounties, then super+r). `names` maps
-    "A"/"B" to the newcomers' account names when they are not this run's
-    (Y reusing wallets). False where the flow has to stop."""
-    other = "B" if who == "A" else "A"
-    names = names or {w: f"E2E Newcomer {w} {stamp}" for w in ("A", "B")}
-    item = names[who]
-    select = Step(f"Select newcomer {who} in the left rail and show Bounties (the header button reads 'Submit a bounty claim').",
-                  [Cand(f"press-newcomer-{who}-tab", f"Press newcomer {who}'s account tab in the left rail, then the sidebar's Bounties tab.",
-                        [("press", {"id": RAIL_ACCOUNT, "name": item})] + TO_BOUNTIES
-                        + [("wait_id", {"id": "bounties-new", "has": ["Submit a bounty claim"]})])],
+async def claim_and_settle(sc, who, name, item, tab_, acct, open_cands, refresh=None):
+    """`who` (its rail tab `tab_`, its account name `acct`) selected and
+    gated on Bounties, the claim form opened with `open_cands` and gated on
+    this run's list and 100 sats, one claim of `item`, settlement and its
+    checks. `refresh` is the candidate that shows the card's latest state
+    (by default: Bounties, then this run's bounty again with Down; nothing
+    on the box can make a running app refetch, see Y). False where the
+    flow has to stop."""
+    select = Step(f"Select {who} in the left rail and show Bounties (the header button reads 'Submit a bounty claim').",
+                  [Cand("press-account-tab", f"Press {who}'s account tab in the left rail, then the sidebar's Bounties tab.",
+                        [("press", tab_)] + TO_BOUNTIES + [("wait_id", {"id": "bounties-new", "has": [CLAIMANT[1]]})])],
                   "The Bounties header button reads 'Submit a bounty claim'.", settle=1,
                   cues=("Submit a bounty claim", "New DList + bounty"))
-    if not await sc.step(select, must_act=True, label=f"select newcomer {who}"):
+    if not await sc.step(select, must_act=True, label=f"select {who}"):
         return False
-    # Gate on the account: the sidebar chip's name, from the tree and from
-    # the sidebar OCR pass (the main pane also lists A's claim on B's turn).
-    sidebar = sc.screen.split("\n[sidebar]\n")[-1] if "\n[sidebar]\n" in sc.screen else ""
-    chip = a11y_name(sc, "sidebar-account")
-    ok = sc.check_screen(f"newcomer {who} selected (header)", ["Submit a bounty claim"], ["New DList + bounty"])
-    ok = sc.check_screen(f"newcomer {who} selected (sidebar name)", [item], [names[other]], screen=sidebar) and ok
-    ok = sc.check(f"newcomer {who} selected (sidebar-account)", chip == item, repr(chip)) and ok
+    # Gate on the account: the header, and the sidebar chip's name.
+    chip = sc.tree_name("sidebar-account")
+    ok = sc.check_tree(f"{who} selected (header)", [CLAIMANT], [ISSUER])
+    ok = sc.check(f"{who} selected (sidebar-account)", chip == acct, repr(chip)) and ok
     if not ok:
         await sc.suite.driver.act("key", "Escape")
         return False
-    # Baseline from the Bounties pane, before the claim form can hide A's card.
-    n_settled = sc.count("Payment settled")
+    # Baseline before the claim form can hide earlier cards.
+    n_settled = sc.tree(PAYMENT, has="Payment settled")
     open_form = Step("Open the claim form for this run's bounty.", open_cands,
                      "A claim form is open (a 'Cancel' control is visible and the 'Submit a bounty claim' button is gone).",
                      settle=1, cues=("Cancel", "Submit a bounty claim"))
     if not await sc.step(open_form, label=f"open claim form {who}"):
         return False
-    # Gate: the claim form must be on this run's bounty, or we'd pay another one.
-    form = a11y_name(sc, "claim-form") or ""
-    ok = sc.check_screen(f"newcomer {who}: claim form is on this run's bounty", [f"Claim an item on {name}"])
-    # The exact label (src/bounties.rs claim form): this run's list and
+    # Gate: the claim form must be on this run's bounty, or we'd pay another
+    # one. The exact label (src/bounties.rs claim form): this run's list and
     # its 100-sat reward, proven before the paying Enter.
+    form = sc.tree_name("claim-form") or ""
     want = f"Claim an item on {name} · 100 sats per item"
-    ok = sc.check(f"newcomer {who}: claim-form names this run's list and 100 sats", form == want, repr(form)) and ok
-    if not ok:
+    if not sc.check(f"{who}: claim-form names this run's list and 100 sats", form == want, repr(form)):
         await sc.suite.driver.act("key", "Escape")
         sc.notes.append(f"claim form for {who} was not on this run's bounty; cancelled, nothing claimed")
         return False
@@ -684,12 +662,9 @@ async def claim_and_settle(sc, who, name, stamp, open_cands, refresh=None, names
     if not await sc.step(submit, must_act=True, label=f"submit claim {who}"):
         return False
     # This claim's card, by its item name; its receipt row appears once
-    # the zap receipt is in (the payment wording is a Label: the screen).
-    card = None
-    try:
-        card = sc.suite.driver.a11y("name", CLAIM_CARD, name=item)["id"]
-    except RuntimeError as e:
-        sc.notes.append(f"a11y: newcomer {who}'s claim card: {e}"[:300])
+    # the zap receipt is in.
+    node = sc.tree_node(CLAIM_CARD, name=item)
+    card = node["id"] if node else None
     wait, tries = Cand("wait-for-settlement", "Wait 20 seconds for the auto-pay watcher to pay and the zap receipt to arrive.", [("wait", 20)]), 6
     if card:
         wait, tries = Cand("wait-for-receipt", "Wait up to 150 seconds for this claim's card to show its payment receipt.",
@@ -697,23 +672,19 @@ async def claim_and_settle(sc, who, name, stamp, open_cands, refresh=None, names
     await sc.step(Step("Wait for the payment to settle.", [wait],
                        "The claim card shows 'Payment settled' or 'Zap receipt'.", settle=1, tries=tries,
                        cues=("Payment settled", "Zap receipt", "Auto-pay failed")), label=f"wait for settlement {who}")
-    screen = sc.screen
-    if not (card and a11y_count(sc, f"{card}-receipt") == 1):
-        # The receipt row did not confirm: the old screen poll.
-        screen = await sc.wait_for(["Payment settled", "Payment receipt"], ["Auto-pay failed"], timeout=150, every=10, label=f"settle poll {who}")
-    if has_failed(screen) or has_failed(sc.screen):
-        sc.notes.append(f"Auto-pay failed on newcomer {who}'s claim card; not retried, not reset")
-    refresh = refresh or Cand("refresh-bounties", "Press the sidebar's Bounties tab, then super+r to refetch.",
-                              [("press", "nav-bounties"), FOCUS, ("key", "super+r")])
-    await sc.step(Step("Show the bounty's claim card with its latest payment state.", [refresh],
+    if card:
+        sc.wait_tree(f"{card}-payment", 30, has=("Payment settled", "Auto-pay failed"))
+        if (sc.tree_name(f"{card}-payment") or "").startswith("Auto-pay failed"):
+            sc.notes.append(f"Auto-pay failed on {who}'s claim card; not retried, not reset")
+    await sc.step(Step("Show the bounty's claim card with its latest payment state.", [refresh or reselect(name)],
                        "The claim card shows 'Payment settled' or 'Zap receipt'.", settle=4,
                        cues=("Payment settled", "Zap receipt")), label=f"settled after refresh {who}")
-    both = sc.screen + "\n" + screen
-    sc.check_screen(f"newcomer {who}: claim item on screen, no Auto-pay failed", [item, "Payment receipt"], ["Auto-pay failed"], screen=both)
-    n = max(sc.count("Payment settled", sc.screen), sc.count("Payment settled", screen))
-    sc.check(f"newcomer {who}: a new Payment settled card ({n} now, {n_settled} before)", n >= n_settled + 1)
-    if card:
-        sc.check(f"newcomer {who}: this claim's card has its receipt row", a11y_count(sc, f"{card}-receipt") == 1, card[:16])
+    if not sc.check(f"{who}: this claim's card is in the tree", bool(card), item):
+        return True
+    sc.check_tree(f"{who}: the claim card settled, with its receipt row",
+                  [(f"{card}-receipt", None), (f"{card}-payment", "Payment settled")], [(f"{card}-payment", "Auto-pay failed")])
+    n = sc.tree(PAYMENT, has="Payment settled")
+    sc.check(f"{who}: a new Payment settled card ({n} now, {n_settled} before)", n >= n_settled + 1)
     return True
 
 
@@ -755,7 +726,7 @@ def pinned_open_form(name):
                  select_row(name) + [("press", "bounties-new"), ("wait_id", "claim-form-item-name"), PARK])]
 
 
-def pinned_refresh(name):
+def reselect(name):
     return Cand("reselect-bounty", f"Press Bounties and select '{name}' again with Down.", select_row(name) + [PARK])
 
 
@@ -769,7 +740,7 @@ async def sees_claim(sc, app, item, name):
                                    select_row(name) + [("wait_id", {"id": CLAIM_CARD, "name": item, "secs": 60, "soft": True}), PARK])],
                              f"The detail pane shows '{name}' and a claim card for '{item}'.", settle=1, cues=(name, item)),
                         label=label)
-    n = a11y_count(sc, CLAIM_CARD, item)
+    n = sc.tree(CLAIM_CARD, name=item)
     if sc.check(f"{app.name} (pid {app.pid}) has {item}'s claim card in its own tree", n == 1, f"{n} cards") and not met:
         sc.accept_step(label, "the claim card is in this app's tree")
 
@@ -785,7 +756,7 @@ async def account_name(sc, pub):
     app has read its kind-0; None after 60 s."""
     end = time.time() + 60
     while time.time() < end:
-        n = a11y_name(sc, f"rail-account-{pub}")
+        n = sc.tree_name(f"rail-account-{pub}")
         if n and n != "New account":
             return n
         await asyncio.sleep(2)
@@ -815,7 +786,7 @@ async def scenario_y(sc):
     if not sc.check("accessibility bus up (python3-gi, at-spi, IsEnabled)", sc.box.a11y_up()):
         return
     sc.fast = True
-    sc.box.launch("Y-A", sc.suite.run_id, target="instance", nsecs=sc.box.keys["house"]["sec"], a11y=True, at=APP_A_AT,
+    sc.box.launch("Y-A", sc.suite.run_id, target="instance", nsecs=sc.box.keys["house"]["sec"], at=APP_A_AT,
                   seed_account=(reuse[0], reuse[1][0]) if reuse else None)
     try:
         await two_apps_flow(sc, sc.box.last_app, name, stamp, reuse)
@@ -847,7 +818,7 @@ async def two_apps_flow(sc, app_a, name, stamp, reuse=None):
     store_check(sc, app_a, 2)
     # Beside App A: newcomer B exists before any publish, either made in a
     # fresh install or seeded from the reused store.
-    sc.box.launch("Y-B", sc.suite.run_id, target="instance", nsecs="", a11y=True, keep=True, at=APP_B_AT,
+    sc.box.launch("Y-B", sc.suite.run_id, target="instance", nsecs="", keep=True, at=APP_B_AT,
                   seed_account=(reuse[0], reuse[1][1]) if reuse else None)
     app_b = sc.box.last_app
     sc.use(app_b)
@@ -865,13 +836,17 @@ async def two_apps_flow(sc, app_a, name, stamp, reuse=None):
     if not await house_publishes(sc, name):
         return
     names = names or {w: f"E2E Newcomer {w} {stamp}" for w in ("A", "B")}
+
+    def claim(who, open_cands):
+        n = names[who]
+        return claim_and_settle(sc, f"newcomer {who}", name, n, {"id": RAIL_ACCOUNT, "name": n}, n, open_cands, reselect(name))
     # A claims in App A, which is up and has the bounty selected.
-    if not await claim_and_settle(sc, "A", name, stamp, r_open_form(name), pinned_refresh(name), names):
+    if not await claim("A", r_open_form(name)):
         return
     # Then App B again, on its own store: its launch reads the new bounty,
     # and selecting it must show A's claim.
     sc.box.kill_pid(app_b.pid)
-    sc.box.launch("Y-B2", sc.suite.run_id, target="instance", nsecs="", a11y=True, keep=True, at=APP_B_AT, store=app_b.store)
+    sc.box.launch("Y-B2", sc.suite.run_id, target="instance", nsecs="", keep=True, at=APP_B_AT, store=app_b.store)
     app_b = sc.box.last_app
     sc.use(app_b)
     if not await a11y_preflight(sc):
@@ -879,7 +854,7 @@ async def two_apps_flow(sc, app_a, name, stamp, reuse=None):
     await sees_claim(sc, app_b, names["A"], name)
     # B claims in App B; App A, watching the bounty, must show it live.
     sc.use(app_b)
-    if not await claim_and_settle(sc, "B", name, stamp, pinned_open_form(name), pinned_refresh(name), names):
+    if not await claim("B", pinned_open_form(name)):
         return
     await sees_claim(sc, app_a, names["B"], name)
 
@@ -894,16 +869,23 @@ import json
 LOCAL_RELAY = "ws://127.0.0.1:10547"
 
 
+def nak_out(box, args, what, sec=None):
+    rc, out = box.nak(args, sec=sec)
+    if rc != 0 or not out.strip():
+        raise RuntimeError(f"nak failed: {what}")
+    return out.strip()
+
+
+def nak_pub(box, sec):
+    """The hex public key of a hex secret."""
+    return nak_out(box, ["key", "public", "$NAK_SEC"], "key public", sec=sec)
+
+
 def fresh_key(box):
     """A throwaway keypair via nak: hex sec, hex pub, npub."""
-    def nak(args, what, sec=None):
-        rc, out = box.nak(args, sec=sec)
-        if rc != 0 or not out.strip():
-            raise RuntimeError(f"nak failed: {what}")
-        return out.strip()
-    sec = nak(["key", "generate"], "key generate")
-    pub = nak(["key", "public", "$NAK_SEC"], "key public", sec=sec)
-    npub = nak(["encode", "npub", pub], "encode npub")
+    sec = nak_out(box, ["key", "generate"], "key generate")
+    pub = nak_pub(box, sec)
+    npub = nak_out(box, ["encode", "npub", pub], "encode npub")
     return {"sec": sec, "pub": pub, "npub": npub}
 
 
@@ -956,20 +938,20 @@ def publish_search_profiles(box):
         nak_publish(box, sec, 0, json.dumps(profile))
 
 
-# The sidebar chip opens the active account's page on its Trust tab
-# (shell.rs, `open_account(.., Tab::Trust)`), so the chip click is the whole
-# action. A second OCR click on the tab used to follow it and raised whenever
-# the 1.5 s wait ended before the software-rendered page had repainted.
 TRUST_STEPS = ("Good news: you can do the three needed steps right here",
                "Follow at least one well-known account",
                "Ask Brainstorm to calculate your community's trust scores",
                "Publish your Treasure Map")
+# The sidebar chip opens the active account's page on its Trust tab
+# (shell.rs, `open_account(.., Tab::Trust)`), so the chip press is the whole
+# action; step 1's heading marks the tab drawn.
+TRUST_READY = ("wait_id", {"id": "community-step-follow", "secs": 20, "soft": True})
 TRUST_TAB = Step(
     "Open the active account's page on its 'Trust' tab.",
-    [Cand("chip-opens-trust", "Click the account name at the top of the left sidebar; it opens the account page on its 'Trust' tab.",
-          [FOCUS, ("click", CHIP_XY), ("wait", 2), PARK]),
-     Cand("trust-tab", "The account page is already open on another tab: click its 'Trust' tab, beside 'Identity & keys'.",
-          [FOCUS, ("click_text", {"text": "Trust", "near": "Identity & keys"}), ("wait", 1), PARK])],
+    [Cand("chip-opens-trust", "Press the account chip at the top of the left sidebar; it opens the account page on its 'Trust' tab.",
+          [("press", "sidebar-account"), TRUST_READY, PARK]),
+     Cand("trust-tab", "The account page is already open on another tab: press its 'Trust' tab, beside 'Identity & keys'.",
+          [("press", "account-tab-trust"), TRUST_READY, PARK])],
     # The Trust tab has no "Your Trusted Community" heading (that is the
     # setup screen's step 3); naming it sank the judge to p~0.53 every time.
     "The account page is open with its tab strip 'Identity & keys, Trust, Progress, Wallet, Limits & defaults', "
@@ -983,53 +965,62 @@ TRUST_TAB = Step(
 async def open_trust(sc):
     if await sc.step(TRUST_TAB, label="trust tab"):
         return True
-    # The literal tab strip and steps decide when the judge does not.
-    if sc.check_screen("the Trust tab's steps are on screen",
-                       ["Identity & keys", "Calculate my trust scores", "Publish my Treasure Map"] + list(TRUST_STEPS[1:])):
-        sc.accept_step("trust tab", "the tab strip, the three steps and their buttons on screen")
+    # The tab, the three steps and their buttons in the tree decide when the judge does not.
+    if sc.check_tree("the Trust tab's steps are in the tree",
+                     [("account-tab-trust", None), ("community-step-follow", None), ("community-step-calculate", None),
+                      ("community-step-publish-map", None), ("~community-calc(-retry)?", None), ("community-map", None)]):
+        sc.accept_step("trust tab", "the tab, the three steps and their buttons in the tree")
         return True
     return False
 
 
-async def follow_owner(sc, expect_confirm):
-    """Click Follow on the recommended owner row; if the first-list amber box
+def owner_follow(owner):
+    return f"community-owner-{owner['pub']}-follow"
+
+
+async def follow_owner(sc, owner, expect_confirm):
+    """Press Follow on the recommended owner row; if the first-list amber box
     shows, approve it. Returns True once '✓ Following' / 'Saved on' shows."""
     # An account with a kind-3 reads "You already follow N account. Go to
     # step 2." over the row; without the last sentence the judge's abstain
-    # mass reached 0.32 there and the step halted before any click (W).
+    # mass reached 0.32 there and the step halted before any press (W).
     ok = await sc.step(Step(
-        "Click 'Follow' on the recommended row ('RECOMMENDED — YOUR OWNER NPUB') in step 1 of the Trust tab. "
-        "The test needs the owner in the follow list, so click it even when step 1 says 'You already follow N account'.",
-        [Cand("follow-owner", "Click the 'Follow' button on the recommended owner row.",
-              [FOCUS, ("click_pill", "RECOMMENDED"), ("wait", 1), PARK])],
-        "After the click, either a confirmation box offers the buttons 'Start a new follow list' and 'Cancel', or the row already reads '✓ Following' or 'Saved on'.",
+        "Press 'Follow' on the recommended row ('RECOMMENDED — YOUR OWNER NPUB') in step 1 of the Trust tab. "
+        "The test needs the owner in the follow list, so press it even when step 1 says 'You already follow N account'.",
+        [Cand("follow-owner", "Press the 'Follow' button on the recommended owner row.",
+              [("scroll_to", owner_follow(owner)), ("press", owner_follow(owner)), ("wait", 1), PARK])],
+        "After the press, either a confirmation box offers the buttons 'Start a new follow list' and 'Cancel', or the row already reads '✓ Following' or 'Saved on'.",
         tries=4, settle=6,
         cues=("Start a new follow list", "Following", "Saved on", "Couldn't check", "RECOMMENDED")),
         must_act=True, label="follow owner")
     if not ok:
         return False
-    if has(sc.screen, "Start a new follow list"):
+    if sc.tree("community-first-list") > 0:
         if not expect_confirm:
-            sc.notes.append("unexpected first-list confirmation for an account that has a kind-3")
-            return False
-        return await sc.step(Step(
-            "Approve the first follow list: click 'Start a new follow list' in the confirmation box.",
-            [Cand("confirm-first-list", "Click the 'Start a new follow list' button beside 'Cancel' in the confirmation box.",
-                  [FOCUS, ("click_pill", CONFIRM_ANCHOR), ("wait", 1), PARK])],
-            "The recommended row reads '✓ Following' and a 'Saved on N of M Nostr servers' line is shown.",
-            tries=4, settle=8, cues=("Following", "Saved on", "Start a new follow list")),
-            must_act=True, label="confirm first list")
+            return sc.check("no first-list confirmation for an account that has a kind-3", False,
+                            "community-first-list is in the tree")
+        return await confirm_first_list(sc, "The recommended row reads '✓ Following' and a 'Saved on N of M Nostr servers' line is shown.")
     return True
+
+
+async def confirm_first_list(sc, done):
+    return await sc.step(Step(
+        "Approve the first follow list: press 'Start a new follow list' in the confirmation box.",
+        [Cand("confirm-first-list", "Press the 'Start a new follow list' button beside 'Cancel' in the confirmation box.",
+              [("scroll_to", "community-first-list"), ("press", "community-first-list"),
+               ("wait_id", {"id": "community-follow-saved", "secs": 20, "soft": True}), PARK])],
+        done, tries=4, settle=8, cues=("Following", "Saved on", "Start a new follow list")),
+        must_act=True, label="confirm first list")
 
 
 async def calculate(sc, done_cond="Step 2 shows 'Brainstorm confirmed — your community's trust scores are in the process of being calculated'.",
                     label="calculate", tries=4):
-    # tries=1 for error paths: every click is one graperank request (the real
-    # API rate-limits to 3/30 min), so a retried click falsifies the test.
+    # tries=1 for error paths: every press is one graperank request (the real
+    # API rate-limits to 3/30 min), so a retried press falsifies the test.
     return await sc.step(Step(
-        "Click 'Calculate my trust scores' in step 2.",
-        [Cand("calculate", "Click the 'Calculate my trust scores' button.",
-              [FOCUS, ("click_pill", "Ask Brainstorm to calculate"), ("wait", 1), PARK])],
+        "Press 'Calculate my trust scores' in step 2.",
+        [Cand("calculate", "Press the 'Calculate my trust scores' button.",
+              [("scroll_to", "community-calc"), ("press", "community-calc"), ("wait", 1), PARK])],
         done_cond, tries=tries, settle=10,
         cues=("Brainstorm confirmed", "Asking the Brainstorm", "Calculate my trust scores",
               "Please wait", "temporarily unavailable")),
@@ -1038,19 +1029,15 @@ async def calculate(sc, done_cond="Step 2 shows 'Brainstorm confirmed — your c
 
 async def publish_map(sc):
     ok = await sc.step(Step(
-        "Click 'Publish my Treasure Map' in step 3.",
-        [Cand("publish-map", "Click the 'Publish my Treasure Map' button.",
+        "Press 'Publish my Treasure Map' in step 3.",
+        [Cand("publish-map", "Press the 'Publish my Treasure Map' button.",
               # Step 3 sits below the fold under the Recalculate row.
-              [FOCUS, ("scroll_until", {"text": "Publish your Treasure Map", "reach": 90}), PARK,
-               ("click_pill", "Publish your Treasure Map"), ("wait", 1), PARK])],
+              [("scroll_to", "community-map"), ("press", "community-map"), ("wait", 1), PARK])],
         "The publish started: 'Fetching tag data' shows, or the card already reads 'Located'.",
         tries=3, settle=6,
         cues=("Fetching tag data", "Located", "Publish my Treasure Map")),
         must_act=True, label="publish map")
-    if not ok:
-        return False
-    screen = await sc.wait_for(["Located"], timeout=45, every=4, label="map lands")
-    return has(screen, "Located")
+    return ok and sc.wait_tree("account-trust-map-status", 45, has="Located")
 
 
 def check_map_rows(sc, acct_pub):
@@ -1069,6 +1056,12 @@ def check_map_rows(sc, acct_pub):
              f"tags={json.dumps(maps[0].get('tags'))[:300]}")
 
 
+async def trust_start(sc, sid, acct, owner, **env):
+    """Launch as `acct` with `owner` as the well-known account, then the Trust tab."""
+    return (await start(sc, sid, nsecs=acct["sec"], extra_env={"MC_ISSUER_NPUB": owner["npub"], **env})
+            and await open_trust(sc))
+
+
 # ---------------------------------------------------------------- L
 async def scenario_l(sc):
     """Fresh account, no kind-3: confirm the first list, follow the owner,
@@ -1076,13 +1069,12 @@ async def scenario_l(sc):
     acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({})
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
-    sc.box.launch("L", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "L", acct, owner):
         return
-    if not await follow_owner(sc, expect_confirm=True):
+    if not await follow_owner(sc, owner, expect_confirm=True):
         return
-    sc.check_screen("owner followed: '✓ Following' and a 'Saved on' line", ["Following", "Saved on"])
+    sc.check_tree("owner followed: '✓ Following' and a 'Saved on' line",
+                  [(owner_follow(owner), "✓ Following"), ("community-follow-saved", "Saved on")])
     if not await calculate(sc):
         return
     if not await publish_map(sc):
@@ -1094,8 +1086,7 @@ async def scenario_l(sc):
         sc.check("the newest kind-3 follows the owner", p_owner,
                  f"{len(k3[0].get('tags', []))} tags")
     check_map_rows(sc, acct["pub"])
-    await sc.see("located")
-    sc.check_screen("the Trust card reads 'Located'", ["Located"])
+    sc.check_tree("the Trust card reads 'Located'", [("account-trust-map-status", "Located")])
 
 
 # ---------------------------------------------------------------- M
@@ -1108,13 +1099,11 @@ async def scenario_m(sc):
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
     nak_publish(sc.box, acct["sec"], 3, "e2e old content", [f"p={p}" for p in others])
     await asyncio.sleep(1)
-    sc.box.launch("M", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "M", acct, owner):
         return
-    if not await follow_owner(sc, expect_confirm=False):
+    if not await follow_owner(sc, owner, expect_confirm=False):
         return
-    sc.check_screen("owner followed without a confirmation", ["Following"], ["Start a new follow list"])
+    sc.check_tree("owner followed without a confirmation", [(owner_follow(owner), "✓ Following")], [("community-first-list", None)])
     k3 = nak_req(sc.box, 3, acct["pub"])
     sc.check("a kind-3 on the local relay", bool(k3), f"{len(k3)} events")
     if k3:
@@ -1132,60 +1121,56 @@ async def scenario_n(sc):
     acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({})
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
-    sc.box.launch("N", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"],
-                             "MC_TRUST_RELAYS": f"{LOCAL_RELAY}, ws://127.0.0.1:10599"})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "N", acct, owner, MC_TRUST_RELAYS=f"{LOCAL_RELAY}, ws://127.0.0.1:10599"):
         return
     await sc.step(Step(
-        "Click 'Follow' on the recommended row; the relay answer must come back inconclusive.",
-        [Cand("follow-owner", "Click the 'Follow' button on the recommended owner row.",
-              [FOCUS, ("click_pill", "RECOMMENDED"), ("wait", 1), PARK])],
+        "Press 'Follow' on the recommended row; the relay answer must come back inconclusive.",
+        [Cand("follow-owner", "Press the 'Follow' button on the recommended owner row.",
+              [("scroll_to", owner_follow(owner)), ("press", owner_follow(owner)), ("wait", 1), PARK])],
         "An error line 'Couldn't check your follow list' is shown.",
         tries=4, settle=8,
         cues=("Couldn't check your follow list", "Start a new follow list", "Following")),
         must_act=True, label="follow inconclusive")
-    screen = await sc.wait_for(["Couldn't check your follow list"],
-                               ["Following"], timeout=30, every=3, label="inconclusive")
-    sc.check_screen("the inconclusive error line shows", ["Couldn't check your follow list"],
-                    ["Following"], screen=screen)
+    sc.wait_tree("community-follow-error", 30, has="Couldn't check your follow list")
+    sc.check_tree("the inconclusive error line shows", [("community-follow-error", "Couldn't check your follow list")],
+                  [(owner_follow(owner), "✓ Following")])
     await asyncio.sleep(2)
     sc.check("no kind-3 was published to the local relay", not nak_req(sc.box, 3, acct["pub"]))
 
 
 # ---------------------------------------------------------------- O
+CALC_429 = "Please wait a few minutes before recalculating"
+CALC_503 = "The Brainstorm server is temporarily unavailable"
+
+
 async def scenario_o(sc):
-    """graperank 429, then 403, then 503: each click shows the right wording
+    """graperank 429, then 403, then 503: each press shows the right wording
     and can be retried; followList is posted at most once."""
     acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({"graperank": ["429", "403", "503"]})
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
     nak_publish(sc.box, acct["sec"], 3, "", [f"p={owner['pub']}"])
     await asyncio.sleep(1)
-    sc.box.launch("O", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "O", acct, owner):
         return
     # The account already follows the owner, so step 2 is enabled at once.
     # The Noul postcondition judges the state generically (an error line and
     # the button back); the exact wording per status is the hard check after
-    # each click — a second click would spend the next scripted answer.
+    # each press — a second press would spend the next scripted answer.
     sc.box.mark("O 429")
     await calculate(sc, done_cond="Step 2 shows the error 'Please wait a few minutes "
                     "before recalculating' and the 'Calculate my trust scores' button.",
                     label="calc 429", tries=1)
-    screen = await sc.wait_for(["Please wait a few minutes before recalculating"],
-                               ["Brainstorm confirmed"], timeout=25, every=3, label="429 wording")
-    sc.check_screen("429 wording", ["Please wait a few minutes before recalculating"], screen=screen)
+    sc.wait_tree("community-calc-status", 25, has=CALC_429)
+    sc.check_tree("429 wording", [("community-calc-status", CALC_429)], [("community-calc-status", "Brainstorm confirmed")])
     # Presses 2 and 3 are direct: the 429 text is still on screen, so Jev saw
-    # nothing to do and abstained. Each waits for its own '-> status' log line,
-    # then lets the app repaint before the wording is read.
-    for marker, status, wording in (("O 403", "403", "Please wait a few minutes before recalculating"),
-                                    ("O 503", "503", "The Brainstorm server is temporarily unavailable")):
+    # nothing to do and abstained. After a failure the button is the retry
+    # one. Each waits for its own '-> status' log line, then lets the app
+    # repaint before the wording is read.
+    for marker, status, wording in (("O 403", "403", CALC_429), ("O 503", "503", CALC_503)):
         sc.box.mark(marker)
-        await sc.suite.driver.act(*FOCUS)
-        await sc.suite.driver.act("click_pill", "Ask Brainstorm to calculate")
-        await sc.suite.driver.act(*PARK)
+        await act(sc, f"{status}: Calculate pressed again",
+                  [("scroll_to", "community-calc-retry"), ("press", "community-calc-retry"), PARK])
         end = time.time() + 25
         while time.time() < end and not any(
                 l.startswith("BS POST /user/graperank") and l.endswith(f"-> {status}")
@@ -1195,8 +1180,8 @@ async def scenario_o(sc):
             l.startswith("BS POST /user/graperank") and l.endswith(f"-> {status}")
             for l in sc.log_after(marker)), sc.log_after(marker))
         await asyncio.sleep(4)   # the error line from the previous press is replaced by now
-        screen = await sc.wait_for([wording], ["Brainstorm confirmed"], timeout=25, every=3, label=f"{status} wording")
-        sc.check_screen(f"{status} wording", [wording], ["Brainstorm confirmed"], screen=screen)
+        sc.wait_tree("community-calc-status", 25, has=wording)
+        sc.check_tree(f"{status} wording", [("community-calc-status", wording)], [("community-calc-status", "Brainstorm confirmed")])
     lines = sc.box.server_log().splitlines()
     grapes = [l for l in lines if "/user/graperank" in l]
     follows = [l for l in lines if "followList" in l]
@@ -1213,25 +1198,16 @@ async def scenario_q(sc):
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
     nak_publish(sc.box, acct["sec"], 3, "", [f"p={owner['pub']}"])
     await asyncio.sleep(1)
-    sc.box.launch("Q", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "Q", acct, owner):
         return
     if not await calculate(sc):
         return
-    # The line renders under step 3, below the 960 px window: scroll to it.
-    await sc.suite.driver.act("scroll", "down")
-    await sc.suite.driver.act(*PARK)
-    screen = await sc.wait_for(["Brainstorm has no data for this account"], timeout=30, every=3,
-                               label="setup missing")
-    sc.check_screen("Brainstorm has no data wording", ["Brainstorm has no data for this account"],
-                    screen=screen)
+    sc.wait_tree("community-map-status", 30, has="Brainstorm has no data for this account")
+    sc.check_tree("Brainstorm has no data wording", [("community-map-status", "Brainstorm has no data for this account")])
     sc.box.mark("Q publish attempt")
-    # The button renders disabled: a click must send nothing anywhere.
-    try:
-        await sc.suite.driver.act("click_pill", "Publish your Treasure Map")
-    except Exception as e:
-        sc.notes.append(f"publish click found no button ({e})")
+    # The button is drawn disabled and has no click handler, so it has no
+    # action to press either: a pointer click on it must send nothing anywhere.
+    await act(sc, "the disabled Publish button was clicked", [("scroll_to", "community-map"), ("click_id", "community-map"), PARK])
     await asyncio.sleep(4)
     sc.check("no kind-10040 on the local relay", not nak_req(sc.box, 10040, acct["pub"]))
     lines = sc.log_after("Q publish attempt")
@@ -1239,133 +1215,50 @@ async def scenario_q(sc):
     sc.check("the disabled publish sent no Brainstorm request", not posts, posts)
 
 
-# ---------------------------------------------------------------- S
-async def scenario_s(sc):
-    coord = "39998:%s:post-city" % sc.suite.keys["house"]["pub"]
-    sc.box.start_fake({"create": "ok", "dup_coordinate": coord})
-    sc.box.launch("S", sc.suite.run_id)
-    # The goal needs only the header button, as in H and R; the first bounty
-    # is auto-selected, so its detail pane follows and the check below reads it.
-    ok = await sc.step(Step("Show the Bounties screen with the house issuer selected (its header button reads 'New DList + bounty').",
-                            [HOUSE, BOUNTIES], "The Bounties screen is shown and its header button reads 'New DList + bounty'.",
-                            settle=2, cues=HOUSE_CUES + ("New bounty on this list",)), must_act=True, label="house on bounties")
-    if not (ok and sc.check_screen("issuer sees the button", ["New bounty on this list"], ["Submit a bounty claim"])):
-        return
-    await sc.step(Step("Open the form from the detail pane's button.",
-                       [Cand("click-new-on-list", "Click the 'New bounty on this list' button in the detail pane.",
-                             [FOCUS, ("click_text", "New bounty on this list"), ("wait", 1), PARK])],
-                       "A form titled 'New bounty on this list' is open with a 'Bounty criteria' field and no 'Item (singular)', 'Items (plural)' or 'List description' field.",
-                       settle=2, cues=("New bounty on this list", "Item (singular)", "Bounty criteria", "Cancel")), label="open list form")
-    # The issuer's header button always reads "+ New DList + bounty (⌘N)",
-    # and "List" alone matches it, so check the fields themselves.
-    sc.check_screen("existing-list form: criteria, no list fields", ["New bounty on this list", "Bounty criteria", "Cancel (esc)"],
-                    ["Item (singular)", "Items (plural)", "List description"])
-    sc.box.mark("S submit")
-    for kind, arg in [("type", "A post city name, one per claim"), ("key", "Return"), ("wait", 0.4),
-                      ("key", "ctrl+a"), ("type", "100"), ("key", "Return"), ("wait", 0.4),
-                      ("key", "ctrl+a"), ("type", "200"), ("key", "Return"), ("wait", 0.4),
-                      ("key", "ctrl+a"), ("type", "2"), ("key", "Return")]:
-        await sc.suite.driver.act(kind, arg)
-    # The box can lag the keystrokes by several seconds: a fixed sleep once
-    # caught the untouched form before Enter landed. Wait for the second row.
-    await sc.wait_for(["House bounties (2)"], timeout=30, label="after create on the existing list")
-    lines = sc.log_after("S submit")
-    posts = [l for l in lines if l.startswith("POST /api/bounties")]
-    sc.check("exactly one create, on the existing list", len(posts) == 1 and posts[0].endswith("coord=post-city"), posts)
-    pubs = [l for l in lines if l.startswith("POST strfry/publish")]
-    sc.check("no list publish reached the server", not pubs, pubs)
-    # The new bounty's detail pane shows "New bounty on this list" again, so
-    # look for phrases only the form shows.
-    sc.check_screen("form closed after the create", [], ["Cancel (esc)", "Bounty criteria"])
-    await sc.step(Step("Select the next account (the claimant) and show the Bounties screen.", [NEXT_ACCOUNT],
-                       "The header button reads 'Submit a bounty claim'.", settle=2, cues=HOUSE_CUES + ("New bounty on this list",)),
-                  label="claimant selected")
-    sc.check_screen("non-issuer has no button", ["Submit a bounty claim"], ["New bounty on this list"])
-
-
 # ---------------------------------------------------------------- U
-async def find_search_box(sc):
-    """(x, y) of the empty follow-search box, or None. Found once, before
-    anything is typed: the placeholder is the only text that marks it."""
-    data, _ = await sc.snap("search box")
-    box = ocr_phrase_pos(data, "Search profiles")
-    sc.check("the search box is on screen", box is not None)
-    return box
-
-
-def type_into(box, text):
-    """Click the box, select what it holds, type `text`: a retry replaces
-    the earlier attempt's text instead of appending to it."""
-    return [FOCUS, ("click", box), ("wait", 0.5), ("key", "ctrl+a"), ("type", text), ("wait", 2), PARK]
-
-
-# The first-list box's first line: the amber 'Start a new follow list' pill is
-# the nearest pill at or below it. 'cancel' is no anchor: it first shows in
-# this box's sentence, nearer the pasted row's Follow pill than the amber one.
-CONFIRM_ANCHOR = "No follow list was found"
-
-
-def row_has_follow(data, pos):
-    """An accent pill (the Follow button) on the row at `pos`, right of it.
-    OCR cannot read the button's dark-on-violet label."""
-    return any(abs(p[1] - pos[1]) < 14 and p[0] > pos[0] for p in accent_pills(data))
+def search_for(text, hit=None):
+    """Focus the follow-search box by its id, replace what it holds with
+    `text` (a retry replaces the earlier attempt's), and wait for `hit`."""
+    do = [FOCUS, ("scroll_to", "community-search"), ("click_id", "community-search"), ("wait", 0.5),
+          ("key", "ctrl+a"), ("type", text)]
+    if hit:
+        do.append(("wait_id", {"id": hit, "secs": 20, "soft": True}))
+    return do + [("wait", 2), PARK]
 
 
 async def scenario_u(sc):
     """Fresh account, no kind-3: paste an npub the fake Brainstorm search does
-    not know; the one row shows, Follow publishes a kind-3 with its p tag."""
+    not know; its one row shows, Follow publishes a kind-3 with its p tag."""
     acct, owner, target = fresh_key(sc.box), fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({})
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
-    sc.box.launch("U", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "U", acct, owner):
         return
     short = target["npub"][:12]
-    # The box itself shows the pasted npub, so the row is only the match
-    # below it: remember where the box is before typing into it.
-    box = await find_search_box(sc)
-    if box is None:
-        return
-    row_below = box[1] + 12
+    row = f"community-hit-{target['pub']}"
     met = await sc.step(Step(
         "Click the 'Search profiles to follow' box in step 1 and paste the npub.",
-        [Cand("paste-npub", "Click the 'Search profiles to follow' input, then type the npub into it.",
-              type_into(box, target["npub"]))],
-        # The Follow label is dark on violet and never in the OCR: the
-        # condition names only what the judge can read.
+        [Cand("paste-npub", "Click the 'Search profiles to follow' input, then type the npub into it.", search_for(target["npub"], row))],
         f"The search box holds an npub, and below it one result row is labelled with the short npub "
         f"'{short}…' (the start of the same key).",
         tries=3, settle=4, cues=(short, "No profiles match", "Searching", "private key")),
         must_act=True, label="paste npub")
-    data, _ = await sc.snap("pasted row")
-    rows = [p for p in ocr_phrase_all(data, short, fold=True) if p[1] > row_below]
-    sc.check("the result row below the box is labelled by the short npub", rows, f"box y={box[1]:.0f}")
-    sc.check_screen("no 'no match' line", [], ["No profiles match"])
-    if not rows:
-        return
-    # Without its pill, click_pill would fall back to the recommended row's.
-    if not sc.check("the pasted row has a Follow button", row_has_follow(data, rows[0]), f"row y={rows[0][1]:.0f}"):
+    # The row is the pasted key's by its id: no reading of the npub it shows.
+    if not sc.check_tree("the pasted key's result row, with its Follow button", [(row, None), (f"{row}-follow", None)],
+                         [("community-search-status", "No profiles match")]):
         return
     if not met:
-        sc.accept_step("paste npub", "a row labelled by the short npub, with a Follow button, below the box")
+        sc.accept_step("paste npub", "the pasted key's result row and its Follow button in the tree")
     if not await sc.step(Step(
-            f"Click 'Follow' on the result row '{short}' (not the recommended row).",
-            [Cand("follow-pasted", "Click the 'Follow' button on the result row of the pasted npub.",
-                  [FOCUS, ("click_pill", {"text": short, "below": row_below, "fold": True}), ("wait", 1), PARK])],
+            f"Press 'Follow' on the result row '{short}' (not the recommended row).",
+            [Cand("follow-pasted", "Press the 'Follow' button on the result row of the pasted npub.",
+                  [("scroll_to", f"{row}-follow"), ("press", f"{row}-follow"), ("wait", 1), PARK])],
             "A confirmation box offers 'Start a new follow list' and 'Cancel'.",
             tries=3, settle=6, cues=("Start a new follow list", "Following", "Saved on")),
             must_act=True, label="follow pasted"):
         return
-    if has(sc.screen, "Start a new follow list"):
-        if not await sc.step(Step(
-                "Approve the first follow list: click 'Start a new follow list' in the confirmation box.",
-                [Cand("confirm-first-list", "Click the 'Start a new follow list' button beside 'Cancel' in the confirmation box.",
-                      [FOCUS, ("click_pill", CONFIRM_ANCHOR), ("wait", 1), PARK])],
-                "A 'Saved on N of M Nostr servers' line is shown.",
-                tries=4, settle=8, cues=("Saved on", "Following", "Start a new follow list")),
-                must_act=True, label="confirm first list"):
-            return
+    if sc.tree("community-first-list") > 0 and not await confirm_first_list(sc, "A 'Saved on N of M Nostr servers' line is shown."):
+        return
     k3 = nak_req(sc.box, 3, acct["pub"])
     sc.check("a kind-3 on the local relay", bool(k3), f"{len(k3)} events")
     if k3:
@@ -1375,23 +1268,28 @@ async def scenario_u(sc):
 
 
 # ---------------------------------------------------------------- X
-AVATAR_X = (428, 464)   # the avatar sits at x 437-456 in a result row; its label starts at 466
+def avatar_region(win, rect):
+    """Screen pixels (x0, y0, x1, y1) around a search hit's avatar, from the
+    window's place (`win`, AppDriver.window_box) and the hit row's tree rect
+    (community-hit-<pubkey>): the row pads 12 px, then a 20 px avatar, then
+    the label 10 px on (community.rs). The avatar has no node of its own."""
+    x0, cy = win[0] + rect["x"], win[1] + rect["y"] + rect["h"] // 2
+    return (x0 + 4, cy - 14, x0 + 40, cy + 15)
 
 
-def avatar_spread(data, y):
-    """How much of the round avatar on the result row at window y the three
-    commonest colours cover (2 bits per channel), from 0 to 1. An initials
-    circle is one gradient fill and a letter (about 0.8 measured); the fake's
+def avatar_spread(data, region):
+    """How much of the round avatar in `region` the three commonest colours
+    cover (2 bits per channel), from 0 to 1. An initials circle is one
+    gradient fill and a letter (about 0.8 measured); the fake's
     sixteen-colour picture spreads over many (about 0.4). The avatar is the
-    saturated blob in a fixed window left of the label, shrunk by 3 px. None
-    when nothing is found."""
+    saturated blob in the region, shrunk by 3 px. None when nothing is found."""
     import io
     from collections import Counter
     from PIL import Image
-    cy = int(y)
+    rx0, ry0, rx1, ry1 = region
     im = Image.open(io.BytesIO(data)).convert("RGB")
     px = im.load()
-    sat = [(x, y) for y in range(cy - 14, cy + 15) for x in range(*AVATAR_X)
+    sat = [(x, y) for y in range(ry0, ry1) for x in range(rx0, rx1)
            if 0 <= x < im.width and 0 <= y < im.height and max(px[x, y]) - min(px[x, y]) > 60]
     if len(sat) < 40:
         return None
@@ -1409,36 +1307,37 @@ async def scenario_x(sc):
     sc.box.start_fake({})
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
     publish_search_profiles(sc.box)
-    sc.box.launch("X", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"]})
-    if not await open_trust(sc):
-        return
-    box = await find_search_box(sc)
-    if box is None:
+    alice, bob, carol = (f"community-hit-{nak_pub(sc.box, sec)}" for sec, _ in SEARCH_PEOPLE)
+    if not await trust_start(sc, "X", acct, owner):
         return
     sc.box.mark("search")
     met = await sc.step(Step(
         "Click the 'Search profiles to follow' box in step 1 and type 'e2e'.",
-        [Cand("search-e2e", "Click the 'Search profiles to follow' input, then type e2e into it.",
-              type_into(box, "e2e"))],
-        # The Follow labels are dark on violet and never in the OCR (p was
-        # 0.44 with every row on screen): the hard check counts the pills.
+        [Cand("search-e2e", "Click the 'Search profiles to follow' input, then type e2e into it.", search_for("e2e", carol))],
         "The search box holds 'e2e' and below it result rows show 'Alice E2E', 'Bob E2E' and 'Carol E2E', "
         "each with a round avatar on its left.",
         tries=3, settle=4, cues=("Alice E2E", "Bob E2E", "Carol E2E", "No profiles match", "Searching")),
         must_act=True, label="search e2e")
-    await asyncio.sleep(4)   # the picture loads after the row is drawn
-    data, _ = await sc.snap("avatars")
-    # The rows are found by position: the Follow pills below the box, top to
-    # bottom, are Alice, Bob, Carol (OCR lost 'Bob' with the initials circle).
-    pills = sorted((p for p in accent_pills(data) if p[1] > box[1] + 12), key=lambda p: p[1])
-    if sc.check("three result rows (Alice, Bob, Carol), each with a Follow button, below the box",
-                len(pills) == 3, pills) and not met:
-        sc.accept_step("search e2e", "three result rows with Follow buttons below the box")
+    rows = sc.check_tree("three result rows (Alice, Bob, Carol), each with a Follow button",
+                         [(r, None) for r in (alice, bob, carol)] + [(f"{r}-follow", None) for r in (alice, bob, carol)])
+    if rows and not met:
+        sc.accept_step("search e2e", "the three hits and their Follow buttons in the tree")
     sc.check("the fake served Alice's picture", "BS GET /pic/alice.png" in sc.log_after("search"))
-    if len(pills) != 3:
+    if not rows:
         return
-    pic, plain = avatar_spread(data, pills[0][1]), avatar_spread(data, pills[1][1])
+    await asyncio.sleep(4)   # the picture loads after the row is drawn
+    # Pixels, because the tree cannot say it: whether a hit draws its
+    # picture or its initials. The region comes from the rows' tree rects.
+    d = sc.suite.driver
+    try:
+        win = await d.window_box()
+        within = f"{win[2]}x{win[3]}"
+        rects = [d.a11y("rect", r, within=within)["rect"] for r in (alice, bob)]
+    except RuntimeError as e:
+        sc.check("Alice's and Bob's rows are inside the window", False, e)
+        return
+    data, _ = await sc.snap("avatars")
+    pic, plain = (avatar_spread(data, avatar_region(win, r)) for r in rects)
     sc.check("both avatars were found on screen", pic is not None and plain is not None,
              f"picture={pic} initials={plain}")
     if pic is not None and plain is not None:
@@ -1451,67 +1350,55 @@ async def scenario_x(sc):
 
 # ---------------------------------------------------------------- V, W
 RUN_POLL = "20"   # MC_RECALC_POLL_SECS: each run state stays up ~20 s
-WAITING, CALCULATING = "Waiting in Brainstorm", "Calculating your scores"   # OCR may drop the apostrophe
+WAITING, CALCULATING = "Waiting in Brainstorm", "Calculating your scores"
 PUBLISHING, DONE_LINE = "Publishing your scores", "Your scores are recalculated and published"
-RECALC_WAIT = "Please wait a few minutes before recalculating"
+RECALC_WAIT = CALC_429
 FOLLOW_FIRST = "Follow at least one account first so we can calculate"
 SENDING = "Sending your follow list"
 RUN_CUES = (WAITING, CALCULATING, PUBLISHING, DONE_LINE, RECALC_WAIT, FOLLOW_FIRST, SENDING)
+STEP1_RECALC = "community-recalc"   # step 1's Recalculate, under its 'Saved on' line
 
 
-RECALC_REACH = 90   # px below the 'Saved on' line that the Recalculate pill sits within
-
-
-async def recalculate(sc, label):
-    """One click on the Recalculate pill: the only accent pill between step
-    1's 'Saved on' line and step 2's heading (step 2's Calculate pill sits
-    below that heading). A missing or ambiguous pill fails the scenario.
-    Never retried: every click is one graperank request (3 per 30 min live)."""
-    await sc.suite.driver.act(*FOCUS)
-    data, _ = await sc.snap(f"{label} before click")
-    saved = ocr_phrase_pos(data, "Saved on")
-    step2 = ocr_phrase_pos(data, "Ask Brainstorm to calculate")
-    if not sc.check(f"{label}: 'Saved on' line on screen", saved is not None):
+async def recalculate(sc, label, rc=STEP1_RECALC):
+    """One press of the Recalculate button `rc`; it must be in the window and
+    not 'unavailable'. Never retried: every press is one graperank request
+    (3 per 30 min live)."""
+    if not await act(sc, f"{label}: Recalculate scrolled into the window", [("scroll_to", rc)]):
         return False
-    floor = step2[1] if step2 is not None and step2[1] > saved[1] else saved[1] + RECALC_REACH
-    pills = [p for p in accent_pills(data) if saved[1] < p[1] < min(floor, saved[1] + RECALC_REACH)]
-    if not sc.check(f"{label}: exactly one Recalculate pill under 'Saved on'", len(pills) == 1, pills):
+    n = sc.tree_node(rc)
+    if not sc.check(f"{label}: the Recalculate button is there and available", n is not None and "unavailable" not in n["description"],
+                    n and n["description"]):
         return False
-    await sc.suite.driver.sb.mouse.click(pills[0][0], pills[0][1])
-    await sc.suite.driver.act(*PARK)
-    return pills[0]
+    return await act(sc, f"{label}: Recalculate pressed", [("press", rc), PARK])
 
 
 RUN_STATES = (("waiting", WAITING), ("calculating", CALCULATING), ("publishing", PUBLISHING), ("done", DONE_LINE))
 
 
-async def watch_run(sc, label, pill, timeout=150, every=1.0):
-    """Watch one run's status line, the band under the Recalculate `pill`,
-    until 'Done' or an error line shows. Each state lasts one poll (20 s),
-    and a full see() takes ~40 s on the box, so neither Jev nor see() can
-    catch them (run 20261026-173419: the judge first looked at 'Publishing').
-    Raw screenshots with OCR of the band alone take a few seconds each.
-    Returns [(state, secs after the click, band text)] in the order first
-    seen; each new state also lands as an evidence frame."""
-    band = (380, max(0, int(pill[1]) - 20), 1220, int(pill[1]) + 110)
+async def watch_run(sc, label, rc=STEP1_RECALC, timeout=150, every=1.0):
+    """Watch one run's status line (`rc`-status) in the tree until 'Done'
+    or an error line shows. Each state lasts one poll (20 s), and a full
+    see() takes ~40 s on the box, so neither Jev nor see() can catch them
+    (run 20261026-173419: the judge first looked at 'Publishing'); a tree
+    read takes about a second. Returns [(state, secs after the press,
+    status text)] in the order first seen; each new state also lands as an
+    evidence frame."""
     t0, seen, started = time.time(), [], False
     while time.time() - t0 < timeout:
-        data = shot_bytes(await sc.suite.sb.screenshot())
-        text = "\n".join(line for line, _, _ in fine_lines(data, band, scale=3, thr=50))
+        try:   # absent between states: not a note every second
+            text = sc.suite.driver.a11y("name", f"{rc}-status")["name"]
+        except RuntimeError:
+            text = ""
         # The previous run's Done line stays until the repaint after the
-        # click: nothing counts before this run's own first line shows.
-        started = started or any(has(text, p) for p in (SENDING, WAITING, CALCULATING, PUBLISHING,
-                                                        RECALC_WAIT, FOLLOW_FIRST))
+        # press: nothing counts before this run's own first line shows.
+        started = started or any(p in text for p in (SENDING, WAITING, CALCULATING, PUBLISHING,
+                                                     RECALC_WAIT, FOLLOW_FIRST))
         for name, phrase in RUN_STATES if started else ():
-            if has(text, phrase) and name not in [n for n, _, _ in seen]:
+            if phrase in text and name not in [n for n, _, _ in seen]:
                 seen.append((name, round(time.time() - t0, 1), text))
+                data = shot_bytes(await sc.suite.sb.screenshot())
                 sc.keep(data, f"{label} {name}", text)
-            elif name == "waiting" and has(text, phrase) and "runs ahead" in norm(text):
-                # A later waiting frame where OCR read the queue position.
-                i = next(i for i, (n, _, _) in enumerate(seen) if n == "waiting")
-                if "2 runs ahead" not in norm(seen[i][2]):
-                    seen[i] = (name, seen[i][1], text)
-        if any(n == "done" for n, _, _ in seen) or has(text, RECALC_WAIT) or has(text, FOLLOW_FIRST):
+        if any(n == "done" for n, _, _ in seen) or RECALC_WAIT in text or FOLLOW_FIRST in text:
             break
         await asyncio.sleep(every)
     sc.notes.append({f"{label} states": [f"{n}@{t}s" for n, t, _ in seen]})
@@ -1525,23 +1412,24 @@ def check_run(sc, label, seen, marker):
     for name, phrase in RUN_STATES:
         sc.check(f"{label}: '{phrase}' shown", name in names, names)
     waiting = next((text for n, _, text in seen if n == "waiting"), "")
-    sc.check(f"{label}: waiting shows the queue position", "2 runs ahead" in norm(waiting), waiting[:200])
+    sc.check(f"{label}: waiting shows the queue position", "2 runs ahead" in waiting, waiting[:200])
     sc.check(f"{label}: the states came in order", names == [n for n, _ in RUN_STATES], names)
     polls = [l.rsplit(" ", 1)[-1] for l in sc.log_after(marker) if l.startswith("BS GET graperankResult -> ")]
     sc.check(f"{label}: the fake answered waiting, calculating, publishing, done",
              polls[:4] == [n for n, _ in RUN_STATES], polls)
 
 
-async def judge_done(sc, label):
+async def judge_done(sc, label, rc=STEP1_RECALC):
     """Done is the one state that stays: Jev judges it, with the finished
     time from /user/history beside it."""
     done = f"The Recalculate area says 'Done. {DONE_LINE}.' and a 'Last run finished' line shows."
     met = await sc.step(Step("Watch the recalculation finish.",
                              [Cand("wait-for-poll", "Wait a few seconds for the next progress update.", [("wait", 3)])],
                              done, tries=2, settle=1, cues=RUN_CUES + ("Last run finished",)), label=f"{label} done")
-    ok = sc.check_screen(f"{label}: 'Done' and 'Last run finished' on screen", [DONE_LINE, "Last run finished"])
+    ok = sc.check_tree(f"{label}: 'Done' and 'Last run finished' in the tree",
+                       [(f"{rc}-status", DONE_LINE), (f"{rc}-last-run", "Last run finished")])
     if ok and not met:
-        sc.accept_step(f"{label} done", "the Done line and 'Last run finished' on screen")
+        sc.accept_step(f"{label} done", "the Done line and 'Last run finished' in the tree")
 
 
 def bs_posts(sc, marker, path):
@@ -1555,18 +1443,15 @@ async def scenario_v(sc):
     acct, owner = fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({})
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
-    sc.box.launch("V", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"], "MC_RECALC_POLL_SECS": RUN_POLL})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "V", acct, owner, MC_RECALC_POLL_SECS=RUN_POLL):
         return
-    if not await follow_owner(sc, expect_confirm=True):
+    if not await follow_owner(sc, owner, expect_confirm=True):
         return
     sc.box.mark("V first")
-    pill = await recalculate(sc, "first recalculate")
-    if not pill:
+    if not await recalculate(sc, "first recalculate"):
         return
-    check_run(sc, "first run", await watch_run(sc, "first run", pill), "V first")
-    await sc.wait_for(["Last run finished"], timeout=20, every=3, label="history")
+    check_run(sc, "first run", await watch_run(sc, "first run"), "V first")
+    sc.wait_tree(f"{STEP1_RECALC}-last-run", 20, has="Last run finished")
     await judge_done(sc, "first run")
     sc.check("the first run sent the new follow list once",
              len(bs_posts(sc, "V first", "/user/followList")) == 1, bs_posts(sc, "V first", "/user/followList"))
@@ -1575,10 +1460,9 @@ async def scenario_v(sc):
     sc.check("history was read", any(l.startswith("BS GET /user/history") for l in sc.log_after("V first")))
 
     sc.box.mark("V second")
-    pill = await recalculate(sc, "second recalculate")
-    if not pill:
+    if not await recalculate(sc, "second recalculate"):
         return
-    check_run(sc, "second run", await watch_run(sc, "second run", pill), "V second")
+    check_run(sc, "second run", await watch_run(sc, "second run"), "V second")
     follows, grapes = bs_posts(sc, "V second", "/user/followList"), bs_posts(sc, "V second", "/user/graperank")
     sc.check("the unchanged follow list was not sent again", not follows, follows)
     sc.check("the second run sent exactly one graperank", len(grapes) == 1, grapes)
@@ -1595,20 +1479,19 @@ async def wait_log(sc, marker, path, n=1, timeout=25):
 async def scenario_w(sc):
     """graperank 429, then 403, then a run that fails NO_ELIGIBLE_USERS: each
     shows its wording and spends exactly one graperank. With no follows the
-    button is disabled and a click sends nothing."""
+    button is unavailable and a click sends nothing."""
     acct, owner, other = fresh_key(sc.box), fresh_key(sc.box), fresh_key(sc.box)
     sc.box.start_fake({"graperank": ["429", "403", "ok"], "run": ["waiting", "fail:NO_ELIGIBLE_USERS"]})
     publish_owner_profile(sc.box, owner, sc.suite.run_id)
     nak_publish(sc.box, acct["sec"], 3, "", [f"p={other['pub']}"])
     await asyncio.sleep(1)
-    sc.box.launch("W", sc.suite.run_id, nsecs=acct["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"], "MC_RECALC_POLL_SECS": "5"})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "W", acct, owner, MC_RECALC_POLL_SECS="5"):
         return
-    if not await follow_owner(sc, expect_confirm=False):
+    if not await follow_owner(sc, owner, expect_confirm=False):
         return
-    # Counted from the first click: 1, then 2, then 3 — a click that missed
+    # Counted from the first press: 1, then 2, then 3 — a press that missed
     # (or a stale line from the previous run) cannot pass the next round.
+    status = f"{STEP1_RECALC}-status"
     for n, (marker, want) in enumerate([("W 429", RECALC_WAIT), ("W 403", RECALC_WAIT),
                                         ("W fail", FOLLOW_FIRST)], start=1):
         sc.box.mark(marker)
@@ -1617,8 +1500,8 @@ async def scenario_w(sc):
         grapes = await wait_log(sc, "W 429", "/user/graperank", n=n)
         if not sc.check(f"{marker}: graperank count is {n}", len(grapes) == n, grapes):
             return
-        screen = await sc.wait_for([want], timeout=40, every=3, label=marker)
-        sc.check_screen(f"{marker}: its wording shows", [want], [DONE_LINE], screen=screen)
+        sc.wait_tree(status, 40, has=want)
+        sc.check_tree(f"{marker}: its wording shows", [(status, want)], [(status, DONE_LINE)])
     sc.check("the failed run was polled",
              any(l.startswith("BS GET graperankResult -> fail") for l in sc.log_after("W fail")))
     await asyncio.sleep(6)
@@ -1627,35 +1510,22 @@ async def scenario_w(sc):
     follows = bs_posts(sc, "W 429", "/user/followList")
     sc.check("followList posted exactly once", len(follows) == 1, follows)
 
-    # A fresh key with no follow list: the Trust tab's button is disabled.
+    # A fresh key with no follow list: the Trust tab's Recalculate (in its
+    # web-of-trust card, under 'Followed someone new?') is unavailable.
     bare = fresh_key(sc.box)
-    sc.box.launch("W2", sc.suite.run_id, nsecs=bare["sec"],
-                  extra_env={"MC_ISSUER_NPUB": owner["npub"], "MC_RECALC_POLL_SECS": "5"})
-    if not await open_trust(sc):
+    if not await trust_start(sc, "W2", bare, owner, MC_RECALC_POLL_SECS="5"):
         return
-    screen = sc.screen
-    for _ in range(8):
-        if has(screen, "Followed someone new"):
-            break
-        await sc.suite.driver.act("scroll", "down")
-        await sc.suite.driver.act(*PARK)
-        screen = await sc.see("scroll to web of trust")
-    sc.check_screen("no follows: the follow-first line shows", ["Followed someone new", FOLLOW_FIRST], screen=screen)
-    # The follow-first line sits right under the Recalculate button. Enabled,
-    # the button is an accent pill there; disabled, it is a plain grey one.
-    data, _ = await sc.snap("disabled recalculate")
-    # The follow-first line itself is too faint for the position OCR: anchor
-    # on the readable line above the button.
-    line = ocr_phrase_pos(data, "Followed someone new")
-    if not sc.check("the line above the Recalculate button was located", line is not None):
+    rc = "account-trust-recalc"
+    if not await act(sc, "the Trust tab's Recalculate scrolled into the window", [("scroll_to", rc), PARK]):
         return
-    below = [p for p in accent_pills(data) if line[1] < p[1] < line[1] + 80]
-    sc.check("the Recalculate button is drawn disabled (no accent pill under the line)", not below, below)
+    sc.check_tree("no follows: the follow-first line shows", [(f"{rc}-follow-first", FOLLOW_FIRST)])
+    n = sc.tree_node(rc)
+    sc.check("the Recalculate button is unavailable (its description)", n is not None and "unavailable" in n["description"],
+             n and n["description"])
     sc.box.mark("W disabled")
-    try:
-        await sc.suite.driver.act("click_text", {"text": "Recalculate", "near": "Followed someone new"})
-    except Exception as e:
-        sc.check("the disabled Recalculate button was clicked", False, e)
+    # It has no click handler, so no action to press: the pointer click a
+    # user would make.
+    if not await act(sc, "the disabled Recalculate button was clicked", [("click_id", rc), PARK]):
         return
     await asyncio.sleep(5)
     # A window re-activation may re-read /setup; only the run's calls count.
@@ -1664,9 +1534,51 @@ async def scenario_w(sc):
     sc.check("the disabled Recalculate sent nothing to Brainstorm", not sent, sent)
 
 
+# ---------------------------------------------------------------- S
+async def scenario_s(sc):
+    coord = "39998:%s:post-city" % sc.suite.keys["house"]["pub"]
+    sc.box.start_fake({"create": "ok", "dup_coordinate": coord})
+    if not await start(sc, "S"):
+        return
+    # The goal needs only the header button, as in H and R; the first bounty
+    # is auto-selected, so its detail pane follows and the check below reads it.
+    ok = await sc.step(Step("Show the Bounties screen with the house issuer selected (its header button reads 'New DList + bounty').",
+                            [house(sc), BOUNTIES], "The Bounties screen is shown and its header button reads 'New DList + bounty'.",
+                            settle=2, cues=HOUSE_CUES + ("New bounty on this list",)), must_act=True, label="house on bounties")
+    if not (ok and sc.check_tree("issuer sees the button", [("bounty-detail-new-on-list", None)], [CLAIMANT])):
+        return
+    await sc.step(Step("Open the form from the detail pane's button.",
+                       [Cand("press-new-on-list", "Press the 'New bounty on this list' button in the detail pane.",
+                             [("press", "bounty-detail-new-on-list"), ("wait_id", "bounty-form-criteria"), PARK])],
+                       "A form titled 'New bounty on this list' is open with a 'Bounty criteria' field and no 'Item (singular)', 'Items (plural)' or 'List description' field.",
+                       settle=2, cues=("New bounty on this list", "Item (singular)", "Bounty criteria", "Cancel")), label="open list form")
+    sc.check_tree("existing-list form: criteria, no list fields",
+                  [("bounty-form", "New bounty on this list"), ("bounty-form-criteria", None), ("bounty-form-cancel", None)],
+                  [(f"bounty-form-{f}", None) for f in ("item-singular", "item-plural", "description")])
+    sc.box.mark("S submit")
+    await act(sc, "the existing-list form filled and submitted",
+              type_fields([("criteria", "A post city name, one per claim"), ("amount", "100"), ("cap", "200"), ("min-rank", "2")])
+              + [("key", "Return")])
+    # The box can lag the keystrokes by several seconds: a fixed sleep once
+    # caught the untouched form before Enter landed. Wait for the second row.
+    sc.wait_tree("bounties-tab-house", 30, has="House bounties (2)")
+    lines = sc.log_after("S submit")
+    posts = [l for l in lines if l.startswith("POST /api/bounties")]
+    sc.check("exactly one create, on the existing list", len(posts) == 1 and posts[0].endswith("coord=post-city"), posts)
+    pubs = [l for l in lines if l.startswith("POST strfry/publish")]
+    sc.check("no list publish reached the server", not pubs, pubs)
+    sc.check_tree("form closed after the create", [("bounties-tab-house", "House bounties (2)")], [("bounty-form", None)])
+    # Direct, as in H: the rail avatars all read "New account", so the judge
+    # cannot tell the claimant's tab apart and halted here (p 0.56, abstain
+    # 0.40). The tree check below decides.
+    await act(sc, "claimant's tab and Bounties pressed", [("press", tab(sc, "claimant"))] + TO_BOUNTIES)
+    sc.wait_tree("bounties-new", 30, has=CLAIMANT[1])
+    sc.check_tree("non-issuer has no button", [CLAIMANT], [("bounty-detail-new-on-list", None)])
+
+
 # ---------------------------------------------------------------- T
-ELIGIBLE_TAB = Cand("eligible-tab", "Click the 'Eligible for me to claim' tab above the bounty list.",
-                    [FOCUS, ("click_text", "Eligible for me to claim"), ("wait", 1), PARK])
+ELIGIBLE_TAB = Cand("eligible-tab", "Press the 'Eligible for me to claim' tab above the bounty list.",
+                    [("press", "bounties-tab-eligible"), ("wait", 1), PARK])
 
 
 def eligible_gets(lines):
@@ -1688,72 +1600,73 @@ def logged_in_first(lines, who):
 
 
 async def scenario_t(sc):
-    house, claimant = sc.suite.keys["house"]["pub"], sc.suite.keys["claimant"]["pub"]
+    house_pub, claimant = sc.suite.keys["house"]["pub"], sc.suite.keys["claimant"]["pub"]
     other = "e" * 64
     lists = {
         claimant: [["elig-c", f"39998:{other}:eligible-claimant", 3, 3, "e2e"]],
         # The house's own bounty (rank 100 for self) and a rank-2 row on a
         # min-3 auto-pay bounty: the server sends both, the app hides both.
-        house: [["elig-h", f"39998:{other}:eligible-house", 2, None, "e2e"],
-                ["elig-own", f"39998:{house}:eligible-own", 100, 2, "e2e"],
-                ["elig-gated", f"39998:{other}:eligible-gated", 2, 3, "e2e"]],
+        house_pub: [["elig-h", f"39998:{other}:eligible-house", 2, None, "e2e"],
+                    ["elig-own", f"39998:{house_pub}:eligible-own", 100, 2, "e2e"],
+                    ["elig-gated", f"39998:{other}:eligible-gated", 2, 3, "e2e"]],
     }
     sc.box.start_fake({"eligible": lists, "eligible_delay": {claimant: 8}})
     sc.box.mark("T launch")
-    sc.box.launch("T", sc.suite.run_id)
-    # The claimant is already active at launch. The search box holds the focus
-    # then and eats super+2, and click_text "Bounties" can hit the search
-    # placeholder: click the sidebar row by its fixed point instead.
+    # The claimant is already active at launch.
+    if not await start(sc, "T"):
+        return
     await sc.step(Step("Show the Bounties screen for the claimant (the claimant's header button reads 'Submit a bounty claim').",
-                       [Cand("click-bounties", "Click 'Bounties' in the left sidebar.",
-                             [FOCUS, ("click", BOUNTIES_XY), ("wait", 1), PARK])],
+                       [Cand("press-bounties", "Press the sidebar's Bounties tab.", TO_BOUNTIES + [("wait_id", {"id": "bounties-tab-eligible", "soft": True})])],
                        "The Bounties screen shows the 'Eligible for me to claim' tab and the header button reads 'Submit a bounty claim'.", settle=3,
                        cues=("Submit a bounty claim", "New DList + bounty", "Eligible for me to claim")),
                   must_act=True, label="claimant")
-    if not sc.check_screen("claimant selected, Eligible tab shown", ["Submit a bounty claim", "Eligible for me to claim"]):
+    if not sc.check_tree("claimant selected, Eligible tab shown", [CLAIMANT, ("bounties-tab-eligible", None)]):
         return
-    # Before the step: its super+] sends the house read.
+    # Before the step: its switch sends the house read.
     sc.box.mark("T switch")
-    # One candidate: the switch must land while the claimant's 8 s GET is held.
+    # One candidate: the switch must land while the claimant's 8 s GET is
+    # held. The house's rail tab switches as super+] does (set_account) and
+    # keeps the screen.
     await sc.step(Step("Open the 'Eligible for me to claim' tab, then switch to the house account while its list is still loading.",
-                       [Cand("tab-then-switch", "Click the 'Eligible for me to claim' tab, then press super+] for the next account.",
-                             ELIGIBLE_TAB.do + [("stamp", "tab"), ("key", "super+bracketright"), ("wait", 1)])],
+                       [Cand("tab-then-switch", "Press the 'Eligible for me to claim' tab, then the house's account tab in the left rail.",
+                             [("press", "bounties-tab-eligible"), ("stamp", "tab"), ("press", tab(sc, "house")), ("wait", 1), PARK])],
                        "The eligible list shows a row on 'eligible-house' (the house is selected; on this tab its header button reads 'Submit a bounty claim').",
                        tries=1, settle=1, cues=("eligible-house", "Submit a bounty claim", "Eligible for me to claim")),
                   must_act=True, label="tab then switch")
     await asyncio.sleep(max(0, sc.stamps.get("tab", time.time()) + 12 - time.time()))
-    await sc.see("after the held claimant reply")
     # On the Eligible tab the house claims too, so its header button reads
     # "Submit a bounty claim"; only the house's eligible row marks the house.
-    sc.check_screen("house sees its own eligible list only", ["eligible-house", "you qualify", "Submit a bounty claim"],
-                    ["eligible-claimant", "eligible-own", "eligible-gated", "New DList + bounty"])
+    row = sc.tree_node(ROW, name="eligible-house")
+    sc.check_tree("house sees its own eligible list only",
+                  [(ROW, "eligible-house"), CLAIMANT] + ([(f"{row['id']}-qualify", "you qualify")] if row else []),
+                  [(ROW, "eligible-claimant"), (ROW, "eligible-own"), (ROW, "eligible-gated"), ISSUER,
+                   ("bounty-detail-title", "eligible-claimant")])
     lines = sc.log_after("T launch")
     gets = eligible_gets(lines)
     sc.check("every eligible GET is for the session's own account", gets and all(v == s for v, s in gets), gets)
     sc.check("the claimant and the house each read their list",
-             (claimant[:8], claimant[:8]) in gets and (house[:8], house[:8]) in gets, gets)
+             (claimant[:8], claimant[:8]) in gets and (house_pub[:8], house_pub[:8]) in gets, gets)
     sc.check("each account logged in before its first eligible read",
-             logged_in_first(lines, claimant[:8]) and logged_in_first(lines, house[:8]), lines)
-    sc.check("the house read went out after the switch", (house[:8], house[:8]) in eligible_gets(sc.log_after("T switch")),
+             logged_in_first(lines, claimant[:8]) and logged_in_first(lines, house_pub[:8]), lines)
+    sc.check("the house read went out after the switch", (house_pub[:8], house_pub[:8]) in eligible_gets(sc.log_after("T switch")),
              sc.log_after("T switch"))
     # Back to the claimant: its list is read again and shows.
     sc.box.mark("T back")
-    await sc.suite.driver.act("key", "super+bracketright")
-    screen = await sc.wait_for(["eligible-claimant"], timeout=20, every=3, label="claimant list")
-    sc.check_screen("the claimant's list shows after switching back", ["eligible-claimant", "Submit a bounty claim"],
-                    ["eligible-house"], screen=screen)
+    await act(sc, "the claimant's tab pressed", [("press", tab(sc, "claimant")), PARK])
+    sc.wait_tree(ROW, 20, name="eligible-claimant")
+    sc.check_tree("the claimant's list shows after switching back", [(ROW, "eligible-claimant"), CLAIMANT],
+                  [(ROW, "eligible-house"), ("bounty-detail-title", "eligible-house")])
     sc.check("a second claimant read went out", (claimant[:8], claimant[:8]) in eligible_gets(sc.log_after("T back")),
              sc.log_after("T back"))
     # Nothing left to claim: the empty line, and the detail pane lets go of
     # the row (the fake still answers its detail with the real coordinate).
     sc.box.set_mode({"eligible": {claimant: []}})
     # xfwm4 grabs Super+r on the box, so XTEST never delivers the app's refresh
-    # chord. Clicking the tab that is already open re-reads the list the same way.
-    for act in ELIGIBLE_TAB.do:
-        await sc.suite.driver.act(*act)
-    screen = await sc.wait_for(["No open bounties match"], timeout=20, every=3, label="empty list")
-    sc.check_screen("empty eligible list says so, no stale detail", ["No open bounties match", "Select a bounty"],
-                    ["eligible-claimant"], screen=screen)
+    # chord. Pressing the tab that is already open re-reads the list the same way.
+    await act(sc, "the open Eligible tab pressed again", ELIGIBLE_TAB.do)
+    sc.wait_tree("bounties-empty", 20)
+    sc.check_tree("empty eligible list says so, no stale detail",
+                  [("bounties-empty", "No open bounties match"), ("bounty-detail-empty", None)], [(ROW, "eligible-claimant")])
     sc.check("app still running", sc.box.app_alive())
 
 

@@ -9,7 +9,9 @@ e2e session bus (see suite.A11Y_ENV). Needs python3-gi and gir1.2-atspi-2.0.
     atspi.py rect   <id> [--name S] [--within WxH]
                                        its extents (window-relative)
     atspi.py name   <id> [--name S]    its role, name and description
-    atspi.py exists <id> [--name S]    how many nodes match (never an error)
+    atspi.py exists <id> [--name S] [--has S ...]
+                                       how many nodes match (none is no error;
+                                       a missing app is)
     atspi.py wait   <id> <secs> [--name S] [--has S ...]
                                        until one node matches (and its name
                                        holds one of the --has strings)
@@ -19,9 +21,12 @@ e2e session bus (see suite.A11Y_ENV). Needs python3-gi and gir1.2-atspi-2.0.
                                        account opens its card and Back returns
 
 <id> is an exact accessible id, or ~regex for a full-match pattern
-(~rail-account-[0-9a-f]{64}). --name keeps nodes whose name is exactly S.
-Labels (role label) reach AT-SPI with an empty name and no Text interface, so
-their text cannot be read here: match a Label by id only. Extents are
+(~rail-account-[0-9a-f]{64}). --name keeps nodes whose name is exactly S;
+--has keeps nodes whose name holds one of the S (curly quotes and the
+ellipsis read as their ASCII forms). Every node's name is its visible text: a
+Label's comes from its value (src/a11y.rs sets it on Linux), the others' from
+their label. A build before that change gives every Label an empty name, so
+its id is all that can be matched there. Extents are
 window-relative (Atspi.CoordType.WINDOW, what xdotool --window takes). --within fails
 unless the node's centre lies inside a window of that size: gpui presses a
 node by clicking its centre and has no scroll-into-view.
@@ -150,6 +155,18 @@ def one(pattern, name=None):
     return hits[0]
 
 
+def fold(s):
+    """Curly quotes and the ellipsis as ASCII: a --has phrase need not know
+    which one the app's copy uses."""
+    for curly, plain in (("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"'), ("\u2026", "...")):
+        s = s.replace(curly, plain)
+    return s
+
+
+def holds(name, has):
+    return not has or any(fold(h) in fold(name) for h in has)
+
+
 def press(n):
     """Run the node's one action ("click"). Read it first: the press often
     replaces the node, and a gone node answers every call with an error."""
@@ -170,7 +187,7 @@ def wait(pattern, secs, name=None, has=()):
             raise Fail(f"{len(hits)} nodes match {pattern}; need exactly one: {[acc_id(h) for h in hits][:8]}")
         if hits:
             d = info(hits[0])
-            if not has or any(h in d["name"] for h in has):
+            if holds(d["name"], has):
                 return {**d, "waited": round(secs - (end - time.time()), 1)}
         if time.time() >= end:
             seen = f"; last name {info(hits[0])['name']!r}" if hits else ""
@@ -233,7 +250,7 @@ def main(argv):
             raise Fail(f"{rest[0]} has no Component extents")
         return d
     if cmd == "exists":
-        return {"count": len(find(rest[0], opts["name"]))}
+        return {"count": sum(1 for n in find(rest[0], opts["name"]) if holds(n.get_name() or "", opts["has"]))}
     if cmd == "wait":
         return wait(rest[0], float(rest[1]) if len(rest) > 1 else 10, opts["name"], opts["has"])
     raise Fail(f"unknown command {cmd!r}")

@@ -620,7 +620,7 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 **Questions.**
 
 - **Q-AX1** gpui 0.3.4 has no disabled flag; inactive step buttons say "unavailable" in their description. Enough for the e2e driver?
-- **Q-AX2** On Linux the tree needs a session D-Bus, at-spi2-core's accessibility bus and org.a11y.Status.IsEnabled = true; the cua box has none of these set up yet.
+- **Q-AX2** On Linux the tree needs a session D-Bus, at-spi2-core's accessibility bus and org.a11y.Status.IsEnabled = true; the e2e suite starts all three in the cua box's mc container and drives every scenario through the tree (scripts/e2e-cua/atspi.py).
 
 ### Not built, or moving (designed for, not built)
 
@@ -866,7 +866,7 @@ Reference by ID. ✓ resolved (with date) · → routed to a named next step · 
 - **Q-PK2** (PK) README.md still describes a 400-line chat toy with MODEL in main.rs; DEMO.md omits the ~/.config/anthropic/key fallback. Rewrite both?
 - **Q-PK3** (PK) aws-lc-rs compiles in although ring is the provider; reqwest's rustls-tls feature pulls it too, so a gpui-kit feature alone cannot drop it.
 - **Q-AX1** (AX) gpui 0.3.4 has no disabled flag; inactive step buttons say "unavailable" in their description. Enough for the e2e driver?
-- **Q-AX2** (AX) On Linux the tree needs a session D-Bus, at-spi2-core's accessibility bus and org.a11y.Status.IsEnabled = true; the cua box has none of these set up yet.
+- **Q-AX2** (AX) On Linux the tree needs a session D-Bus, at-spi2-core's accessibility bus and org.a11y.Status.IsEnabled = true; the e2e suite starts all three in the cua box's mc container and drives every scenario through the tree (scripts/e2e-cua/atspi.py).
 - ~~**Q-UB1**~~ (UB) ✓ Accounts is built now: account cards plus the per-account page with the Trust tab (src/account.rs, this working tree). Settings is still a placeholder.
 - **Q-NA1** (NA) Which revision should the atlas track once the refactor lands: HEAD, the refactor, or both with a moving marker? → routed: _rebuild after the refactor commit_
 
