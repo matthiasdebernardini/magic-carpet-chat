@@ -25,6 +25,11 @@ APP_BIN = "/usr/local/bin/magic-carpet-chat-e2e"   # run.sh installs here; the d
 WALLET = "node /usr/local/lib/node_modules/brainstorm/node_modules/.bin/agent-wallet"
 FAKE_URL, RELAY_URL = "http://127.0.0.1:8787", "ws://127.0.0.1:10547"
 BS_URL = "http://127.0.0.1:8788"        # fake Brainstorm (same fake_instance.py)
+PAID = ("P", "R", "Y")                  # move real sats: skipped by --no-paid and on omac
+# Two 1280x960 apps side by side: xfwm adds 5 px of frame left and right, so
+# each window is 1290 wide and two fit 2580 exactly (scenarios.APP_B_AT).
+OPT_IN = ("Y",)                         # never in a default run, only via --only
+WIDE = {"Y": (2580, 960)}               # the screen and the recording are this size
 # The e2e session bus inside mc: the app registers its AccessKit tree on the
 # accessibility bus this bus's at-spi-bus-launcher hands out, and atspi.py
 # reads it there. Box.a11y_up gives the bus its own XDG_RUNTIME_DIR, so that
@@ -91,10 +96,11 @@ SIDEBAR = (70, 95, 290, 240)   # account chip: name, npub, address, remove link,
 CONTENT = (70, 90, 1280, 960)  # the window below its title bars
 
 
-def atspi(cmd, target=None, name=None, has=(), secs=None, within=None):
+def atspi(cmd, target=None, name=None, has=(), secs=None, within=None, pid=None):
     """atspi.py in the mc container (box only). Returns its JSON; raises
     RuntimeError with the helper's reason when the node is not exactly one,
-    is outside the window, or a wait times out."""
+    is outside the window, or a wait times out. `pid` pins the app (two-app
+    scenarios); without it the helper reads `pidof -s` of the e2e binary."""
     args = [cmd] + ([target] if target else []) + ([str(secs)] if secs is not None else [])
     if name is not None:
         args += ["--name", name]
@@ -102,6 +108,8 @@ def atspi(cmd, target=None, name=None, has=(), secs=None, within=None):
         args += ["--has", h]
     if within:
         args += ["--within", within]
+    if pid is not None:
+        args += ["--pid", str(pid)]
     try:
         r = dx(f"{A11Y_ENV} python3 {CDIR}/atspi.py " + " ".join(shlex.quote(a) for a in args),
                timeout=(secs or 0) + 30)
@@ -237,6 +245,18 @@ def ocr_phrase_all(data, phrase, fold=False):
     return out
 
 
+@dataclasses.dataclass
+class App:
+    """One app process of a two-app scenario: its pid (AT-SPI), X window
+    (xdotool), store, and the 1280x960 part of the screen its screenshots
+    are cropped to, so the OCR boxes line up as with one app."""
+    name: str
+    pid: int
+    wid: str
+    store: str
+    crop: tuple
+
+
 class FineDriver(Driver):
     """agent.Driver plus `click_fine` (sidebar OCR) and `click_pill`
     (accent buttons by colour — OCR cannot read their dark-on-violet text),
@@ -247,10 +267,21 @@ class FineDriver(Driver):
                        has no action, so this focuses it for "type"
       ("wait_id", t)   wait until the control is in the tree
 
+      ("select_bounty", list name)  Down, one row at a time, until
+                       bounty-detail-title names that list (at most rows + 1)
+      ("park", None)   move the pointer to the rail's foot, off any hover
+
     t is an id, a "~regex" id, or {"id": ..., "name": exact name, "has":
     [name substrings], "secs": wait timeout, "soft": True}. Exactly one node
     must match, and press/click_id refuse a control outside the window. A
-    soft wait_id returns on timeout instead of raising."""
+    soft wait_id returns on timeout instead of raising.
+
+    When the scenario has an app pinned (Scenario.use, two-app scenarios),
+    every AT-SPI call reads that app's pid, every window action addresses its
+    X window, and "key"/"type" first make that window the active one and
+    check it is: keys never land in the other app."""
+
+    last_wait_ok = False   # the last action was a wait_id that found its control
 
     # Named rail targets -> window-local point. The box coordinates were
     # measured on the suite's first build; the current rail puts the first
@@ -261,19 +292,103 @@ class FineDriver(Driver):
     # the same title.
     APP_WINDOW = f"$(xdotool search --all --pid $(pidof -s {os.path.basename(APP_BIN)}) --name 'Magic Carpet' | head -1)"
 
+    @property
+    def app(self):
+        return getattr(getattr(self, "scenario", None), "app", None)
+
+    def win(self):
+        """The X window to address: the pinned app's, else the e2e binary's."""
+        return self.app.wid if self.app else self.APP_WINDOW
+
     def a11y(self, cmd, target=None, **kw):
+        if self.app:
+            kw.setdefault("pid", self.app.pid)
         return atspi(cmd, target, **kw)
+
+    async def focus_app(self):
+        """Make the pinned app's window the active one, and check it is."""
+        wid = self.app.wid
+        if (await self.x("xdotool getactivewindow")).stdout.strip() != wid:
+            await self.x(f"xdotool windowactivate --sync {wid}")
+            got = (await self.x("xdotool getactivewindow")).stdout.strip()
+            if got != wid:
+                raise RuntimeError(f"focus: window {got} is active, not {self.app.name}'s {wid}")
 
     async def window_box(self):
         """(x, y, w, h) of the app window on the display. xwininfo, not
         xdotool getwindowgeometry, which is off by the window frame."""
-        r = await self.x(f"xwininfo -id {self.APP_WINDOW}")
+        r = await self.x(f"xwininfo -id {self.win()}")
         v = dict(re.findall(r"(Absolute upper-left X|Absolute upper-left Y|Width|Height):\s+(-?\d+)", r.stdout))
         if len(v) != 4:
             raise RuntimeError("no app window for xwininfo")
         return (int(v["Absolute upper-left X"]), int(v["Absolute upper-left Y"]), int(v["Width"]), int(v["Height"]))
 
     async def act(self, kind, arg):
+        if kind != "park":
+            self.last_wait_ok = False
+        if kind == "park":
+            if self.app:
+                await self.x(f"xdotool mousemove --window {self.app.wid} 15 684")
+            else:
+                await self.x("xdotool mousemove 20 740")
+            return None
+        if self.app and kind in ("key", "type"):
+            # Active and checked, then addressed to the window: a focus change
+            # in between drops the input instead of sending it to the other app.
+            await self.focus_app()
+            wid = self.app.wid
+            if kind == "key":
+                await self.x(f"xdotool key --window {wid} --clearmodifiers {arg}")
+            else:
+                await self.x(f"xdotool type --window {wid} --delay 20 " + json.dumps(agent.secret(arg) if arg.startswith("$") else arg))
+            return None
+        if self.app and kind == "focus":
+            await self.focus_app()
+            return await self.act("park", None)
+        if self.app and kind in ("avatar", "click", "click_text", "click_fine", "click_pill", "scroll", "scroll_until"):
+            raise RuntimeError(f"{kind}: screen-coordinate actions are not pinned to one app")
+        if self.app and kind == "click_id":
+            # A pointer click goes to whatever window is on top
+            # there: raise this app's first (and leave it the active one).
+            await self.focus_app()
+        if kind == "select_bounty":
+            # Down, one row at a time, until the detail pane is this list's
+            # bounty: a row below the fold cannot be pressed (gpui has no
+            # scroll-into-view), but the Shell's Down selects and scrolls.
+            # After each Down the title must change before the next decision
+            # (the repaint can trail the key), and a match must still hold a
+            # second later. At most one press per row, plus one. Never Enter.
+            if self.app:
+                await self.focus_app()
+                wid = self.app.wid
+            else:
+                wid = (await self.x(f"echo {self.APP_WINDOW}")).stdout.strip()
+                await self.x(f"xdotool windowactivate --sync {wid}")
+
+            def title():
+                try:
+                    return self.a11y("name", "bounty-detail-title")["name"]
+                except RuntimeError:
+                    return None
+            cap = self.a11y("exists", "~bounty-row-[0-9a-f-]{36}")["count"] + 1
+            cur = title()
+            for i in range(cap + 1):
+                if cur == arg:
+                    await asyncio.sleep(1)
+                    cur = title()
+                    if cur == arg:
+                        return f"select_bounty {arg!r} after {i} Down"
+                    continue   # moved on after all: decide again on what it shows now
+                if i == cap:
+                    break
+                await self.x(f"xdotool key --window {wid} Down")
+                prev, end = cur, time.time() + 4
+                while time.time() < end:
+                    await asyncio.sleep(0.3)
+                    cur = title()
+                    if cur != prev:
+                        break
+            raise RuntimeError(f"select_bounty: {arg!r} not reached in {cap} Down presses (last {cur!r})")
         if kind in ("press", "click_id", "wait_id"):
             t = arg if isinstance(arg, dict) else {"id": arg}
             if kind == "wait_id":
@@ -283,6 +398,7 @@ class FineDriver(Driver):
                     if not t.get("soft"):
                         raise
                     return f"wait_id {t['id']}: {e}"
+                self.last_wait_ok = True
                 return f"wait_id {out['id']} ({out['waited']} s)"
             wx, wy, ww, wh = await self.window_box()
             if kind == "press":
@@ -294,7 +410,7 @@ class FineDriver(Driver):
             dw, dh = (int(v) for v in (await self.x("xdotool getdisplaygeometry")).stdout.split())
             if not (0 <= wx + cx < dw and 0 <= wy + cy < dh):
                 raise RuntimeError(f"click_id: {out['id']} is off the display at ({wx + cx},{wy + cy})")
-            await self.x(f"xdotool mousemove --window {self.APP_WINDOW} {cx} {cy} click 1")
+            await self.x(f"xdotool mousemove --window {self.win()} {cx} {cy} click 1")
             return f"click_id {out['id']} -> ({cx},{cy}) in the window"
         if kind == "avatar":
             await self.sb.mouse.click(*self.AVATARS[arg])
@@ -395,6 +511,16 @@ class Box:
         print("a11y: the accessibility bus never came up; R cannot drive by id", flush=True)
         return False
 
+    def set_screen(self, w, h):
+        """Resize the VNC screen on :1 (Xtigervnc takes any mode via xrandr).
+        True when the screen reports that size."""
+        mode = f"{w}x{h}"
+        out = "$(xrandr | awk '/ connected/{print $1; exit}')"
+        dx(f"export DISPLAY=:1; xrandr --newmode {mode} 0 {w} 0 0 0 {h} 0 0 0 2>/dev/null; "
+           f"xrandr --addmode {out} {mode} 2>/dev/null; xrandr --output {out} --mode {mode}")
+        time.sleep(1)
+        return f"{mode} pixels" in dx("DISPLAY=:1 xdpyinfo | grep dimensions").stdout
+
     def app_version(self):
         r = dx(f"strings {APP_BIN} | grep -m1 -oE 'magic-carpet-chat/[0-9]+\\.[0-9]+\\.[0-9]+(-rc[0-9]+)?'; sha256sum {APP_BIN} | cut -c1-16")
         return " ".join(r.stdout.split())
@@ -437,23 +563,61 @@ class Box:
             time.sleep(0.25)
         dx("pkill -9 -x magic-carpet-ch; true")
 
+    def kill_pid(self, pid):
+        """Stop one app process (the other app of a two-app scenario keeps running)."""
+        dx(f"kill {int(pid)}; true")
+        for _ in range(20):
+            if dx(f"kill -0 {int(pid)}").returncode != 0:
+                return
+            time.sleep(0.25)
+        dx(f"kill -9 {int(pid)}; true")
+
+    def screen_size(self):
+        """(w, h) of the screen on :1, or None."""
+        try:
+            w, h = dx("DISPLAY=:1 xdotool getdisplaygeometry").stdout.split()
+            return int(w), int(h)
+        except ValueError:
+            return None
+
     def app_alive(self):
         return dx("pgrep -x magic-carpet-ch").returncode == 0
 
-    def launch(self, name, run_id, target="fake", seed=False, nsecs=None, extra_env=None, a11y=False):
+    def launch(self, name, run_id, target="fake", seed=False, nsecs=None, extra_env=None, a11y=False,
+               keep=False, at=None, store=None, seed_account=None):
         """Relaunch with a fresh MC_STORE_DIR. seed copies the demo store
         (/root/mc-store/accounts.json, which holds the claimant's Coinos
         login) into it, container-internal, never read here. `nsecs` overrides
-        the default house+claimant pair (per-scenario throwaway keys)."""
-        self.kill_app()
-        store = f"/root/e2e-stores/{run_id}/{name}"
+        the default house+claimant pair (per-scenario throwaway keys); "" is
+        no key at all (a first launch).
+
+        Two-app scenarios pass `at` (the window's x, y): the app is then found
+        by its own pid, placed there, and recorded as `self.last_app` (an
+        App). keep=True leaves the apps already running alone. `store`
+        relaunches on an existing MC_STORE_DIR instead of a fresh one.
+        seed_account=(accounts.json, pubkey) starts the fresh store with that
+        one account, copied inside the container (see reusable_wallets)."""
+        if not keep:
+            self.kill_app()
+        before = set(dx(f"pidof {os.path.basename(APP_BIN)}").stdout.split())
+        store = store or f"/root/e2e-stores/{run_id}/{name}"
         dx(f"mkdir -p {shlex.quote(store)} && chmod 700 /root/e2e-stores {shlex.quote(store)}")
         if seed:
             dx(f"cp /root/mc-store/accounts.json {store}/ && chmod 600 {store}/accounts.json")
+        if seed_account:
+            src, pub = seed_account
+            if not re.fullmatch(r"[0-9a-f]{64}", pub):
+                raise RuntimeError("seed_account: not a hex pubkey")
+            # jq inside mc: the account's nsec and Coinos login never leave it.
+            r = dx(f"(umask 077; jq --arg p {pub} '{{active: $p, accounts: [.accounts[] | select(.pubkey == $p)]}}' "
+                   f"{shlex.quote(src)} > {store}/accounts.json.tmp) && mv {store}/accounts.json.tmp {store}/accounts.json "
+                   f"&& chmod 600 {store}/accounts.json && jq '.accounts | length' {store}/accounts.json")
+            if r.stdout.strip() != "1":
+                raise RuntimeError(f"seed_account: the seeded store does not hold the one account (jq said {r.stdout.strip()!r})")
         base, relay = (FAKE_URL, RELAY_URL) if target == "fake" else ("http://tapestry", "ws://tapestry/relay")
         env = dict(os.environ)
         env.update({
-            "MC_NSECS": nsecs or f"{self.keys['house']['sec']},{self.keys['claimant']['sec']}",
+            "MC_NSECS": nsecs if nsecs is not None else f"{self.keys['house']['sec']},{self.keys['claimant']['sec']}",
             "MC_ISSUER_NPUB": self.keys["house"]["npub"], "MC_BASE_URL": base, "MC_RELAY_URL": relay,
             "MC_STORE_DIR": store, "MC_SENTRY_DSN": "", "DISPLAY": ":1",
         })
@@ -467,9 +631,15 @@ class Box:
             env.update({"MC_BRAINSTORM_URL": BS_URL, "MC_TRUST_RELAYS": relay})
         env.update(extra_env or {})
         env.pop("ANTHROPIC_API_KEY", None)
+        if env["MC_NSECS"] == "":
+            env.pop("MC_NSECS")
         dx(f"exec {APP_BIN} > {CDIR}/logs/{name}.app.log 2>&1", detach=True,
            env_names=tuple(k for k in env if k.startswith("MC_") or k in ("DISPLAY", "RUST_BACKTRACE", "DBUS_SESSION_BUS_ADDRESS")),
            env=env)
+        if at is not None:
+            self.last_app = self._place(name, before, at, store)
+            time.sleep(6)   # first bounty list, profile scans, relay connect
+            return store
         wid = ""
         for _ in range(60):
             wid = dx("DISPLAY=:1 xdotool search --name 'Magic Carpet' | head -1").stdout.strip()
@@ -479,8 +649,92 @@ class Box:
         if not wid:
             raise RuntimeError("the app window never appeared; see the app log")
         dx(f"DISPLAY=:1 xdotool windowsize {wid} 1280 960 windowmove {wid} 0 0 windowactivate {wid} mousemove 20 740")
+        self._fit_height(wid)
         time.sleep(6)   # first bounty list, profile scans, relay connect
         return store
+
+    def _measure(self, wid):
+        """(client top, client height, frame bottom) of a window, or None."""
+        v = dict(re.findall(r"(Absolute upper-left Y|Height):\s+(-?\d+)", dx(f"DISPLAY=:1 xwininfo -id {wid}").stdout))
+        ext = re.findall(r"\d+", dx(f"DISPLAY=:1 xprop -id {wid} _NET_FRAME_EXTENTS").stdout.split("=")[-1])
+        if len(v) != 2 or len(ext) != 4:
+            return None
+        return int(v["Absolute upper-left Y"]), int(v["Height"]), int(ext[3])
+
+    def _fit_height(self, wid):
+        """Shorten the window so all of it is on the screen: a 960-high
+        client below the panel and title bar hangs ~60 px off the bottom,
+        where the last bounty row can be neither seen nor pressed. Client
+        height = screen height - the client's top - the frame's bottom.
+        The window manager sets the frame and the position after the map, so
+        both are read until two reads agree."""
+        size = self.screen_size()
+        if not size:
+            raise RuntimeError("cannot read the screen size to fit the window")
+        last = None
+        for _ in range(20):
+            time.sleep(0.3)
+            cur = self._measure(wid)
+            if cur and cur == last:
+                break
+            last = cur
+        else:
+            raise RuntimeError(f"window {wid}: its frame and position never settled ({last})")
+        top, height, bottom = cur
+        h = size[1] - top - bottom
+        if h < height:
+            dx(f"DISPLAY=:1 xdotool windowsize --sync {wid} 1280 {h}")
+            time.sleep(0.3)
+            got = self._measure(wid)
+            if not got or got[1] != h or got[0] + got[1] + got[2] > size[1]:
+                raise RuntimeError(f"window {wid}: asked for height {h} to fit the screen, it is {got}")
+        return h
+
+    def _place(self, name, before, at, store):
+        """The just-launched app (the e2e pid not in `before`): its window,
+        sized 1280x960 at `at` and raised. Returns its App."""
+        pid = wid = ""
+        for _ in range(60):
+            new = set(dx(f"pidof {os.path.basename(APP_BIN)}").stdout.split()) - before
+            pid = next(iter(new), "") if len(new) == 1 else ""
+            if pid:
+                wid = dx(f"DISPLAY=:1 xdotool search --all --pid {pid} --name 'Magic Carpet' | head -1").stdout.strip()
+            if wid:
+                break
+            time.sleep(0.5)
+        if not wid:
+            raise RuntimeError(f"{name}: the app window never appeared; see the app log")
+        # The window can exist before the window manager places it, and the
+        # placement then overrides an early move: move until it holds.
+        x = y = None
+        for _ in range(20):
+            dx(f"DISPLAY=:1 xdotool windowsize {wid} 1280 960 windowmove {wid} {at[0]} {at[1]} windowactivate --sync {wid}")
+            time.sleep(0.5)
+            v = dict(re.findall(r"(Absolute upper-left X|Absolute upper-left Y):\s+(-?\d+)", dx(f"DISPLAY=:1 xwininfo -id {wid}").stdout))
+            x, y = int(v.get("Absolute upper-left X", -1)), int(v.get("Absolute upper-left Y", -1))
+            if abs(x - at[0]) <= 10 and abs(y - at[1]) <= 60:
+                break
+        else:
+            raise RuntimeError(f"{name}: the window stays at ({x},{y}), not at {at}")
+        self._fit_height(wid)
+        # One app's screen had the window client at (5, 56): crop so it is again.
+        x0, y0 = max(0, x - 5), max(0, y - 56)
+        return App(name, int(pid), wid, store, (x0, y0, x0 + 1280, y0 + 960))
+
+    def reusable_wallets(self, run_id):
+        """(path, [pubkey, pubkey]) of the two app-made Coinos accounts in an
+        earlier run's R store, moved to the trash at the end of that run, or
+        (path, None) when it is missing or does not hold exactly two. Only
+        the pubkeys leave the container; the logins stay in it."""
+        if not re.fullmatch(r"\d{8}-\d{6}", run_id or ""):
+            return None, None
+        path = f"/root/.trash/e2e-stores/{run_id}/R/accounts.json"
+        # An empty token is a signup whose outcome was never known: not a wallet.
+        r = dx(f"jq -r '.accounts[] | select(.created_in_app == true and .coinos != null "
+               f"and (.coinos.username // \"\") != \"\" and (.coinos.token // \"\") != \"\") | .pubkey' {path}")
+        pubs = r.stdout.split() if r.returncode == 0 else []
+        ok = len(pubs) == 2 and all(re.fullmatch(r"[0-9a-f]{64}", p) for p in pubs)
+        return path, (pubs if ok else None)
 
     def accounts_in_store(self, store):
         r = dx(f"jq '.accounts | length' {store}/accounts.json")
@@ -499,8 +753,8 @@ class Box:
             return -1
 
     # --- recording --------------------------------------------------------
-    def rec_start(self, name):
-        dx(f"exec ffmpeg -y -loglevel error -f x11grab -video_size 1280x960 -framerate 10 -i :1 "
+    def rec_start(self, name, size="1280x960"):
+        dx(f"exec ffmpeg -y -loglevel error -f x11grab -video_size {size} -framerate 10 -i :1 "
            f"-c:v libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p {CDIR}/rec/{name}.mp4 "
            f"> {CDIR}/rec/{name}.ffmpeg.log 2>&1", detach=True)
 
@@ -839,10 +1093,29 @@ class Scenario:
         self.steps, self.checks, self.frame_n, self.screen = [], [], 0, ""
         self.hist, self.skip_reason, self.store, self.notes = [], None, None, []
         self.seen_at, self.stamps = 0.0, {}
+        # Two-app scenarios: the app every action, AT-SPI read and
+        # screenshot addresses (see use), and the fast step mode.
+        self.app, self.fast = None, False
+
+    def use(self, app):
+        """Pin the driver, the AT-SPI reads and the screenshots to `app`.
+        The last observation was of the other app, so it is dropped."""
+        self.app, self.screen, self.seen_at = app, "", 0.0
 
     # --- observe ----------------------------------------------------------
-    async def snap(self, label):
+    async def grab(self):
+        """A screenshot; with an app pinned, cropped to that app's 1280x960."""
         data = shot_bytes(await self.suite.sb.screenshot())
+        if self.app is None:
+            return data
+        import io
+        from PIL import Image
+        out = io.BytesIO()
+        Image.open(io.BytesIO(data)).crop(self.app.crop).save(out, "PNG")
+        return out.getvalue()
+
+    async def snap(self, label):
+        data = await self.grab()
         return data, self.keep(data, label)
 
     def keep(self, data, label, text=None):
@@ -862,11 +1135,11 @@ class Scenario:
         import io
         from PIL import Image, ImageChops
         grab = lambda b: Image.open(io.BytesIO(b)).convert("L").point(lambda v: 255 if v > 40 else 0)
-        prev = grab(shot_bytes(await self.suite.sb.screenshot()))
+        prev = grab(await self.grab())
         end = time.time() + max_wait
         while time.time() < end:
             await asyncio.sleep(gap)
-            cur = grab(shot_bytes(await self.suite.sb.screenshot()))
+            cur = grab(await self.grab())
             if sum(ImageChops.difference(prev, cur).histogram()[1:]) < tolerance:
                 return True
             prev = cur
@@ -889,32 +1162,57 @@ class Scenario:
     async def step(self, s: Step, must_act=False, label=None, min_conf=0.4, second_look=True):
         """Mirror of agent.run for one Step. must_act drops the 'already-done'
         candidate, for steps whose goal state is already on screen before the
-        action (the refusals): the action has to happen to test anything."""
+        action (the refusals): the action has to happen to test anything.
+
+        With self.fast (two-app scenario Y): a step with one candidate runs it
+        without a Jev choose, its "before" is the previous after-look when
+        fresh (else a frame without OCR), and when its actions end in a
+        wait_id that found its control, the tree marks the next state and
+        stable() is skipped. Jev still judges every after-look."""
         label = label or s.goal[:40]
         cands = s.cands + ([] if must_act else [DONE]) + [REOBSERVE, ABSTAIN]
-        rec = {"step": label, "goal": s.goal, "cond": s.done, "picks": [], "p": None, "met": False}
+        rec = {"step": label, "goal": s.goal, "cond": s.done, "picks": [], "p": None, "met": False, "phases": {}}
+        ph = rec["phases"]
+
+        def took(phase, since):
+            ph[phase] = round(ph.get(phase, 0.0) + time.time() - since, 2)
+        fixed = self.fast and len(s.cands) == 1
         t0 = time.time()
         for attempt in range(s.tries):
             # Whether this attempt's actions raised: accept_step reads the
             # last attempt only, since its screen is the one a check reads.
             rec["raised"] = False
-            # A must_act step reuses a fresh previous observation as its
-            # "before": timed scenarios (A) cannot afford a second OCR.
-            if must_act and self.screen and time.time() - self.seen_at < 20:
-                screen = self.screen
+            fresh = self.screen and time.time() - self.seen_at < 20
+            t = time.time()
+            if fixed:
+                c = s.cands[0]
+                rec["picks"].append(c.id)
+                if not fresh:
+                    await self.snap(f"{label}-before")
+                took("ocr", t)
             else:
-                screen = await self.see(f"{label}-before")
-            pick, conf, probs = await self.suite.jev_call("choose", s.goal, screen, cands, self.hist, s.cues)
-            c = next((c for c in cands if c.id == pick), None)
-            rec["picks"].append(pick)
-            if c is not None and c.id == "reobserve":
-                await asyncio.sleep(3)
-                continue
-            p_pick, p_abst = probs.get(pick, conf), probs.get("abstain", 0.0)
-            weak = c is not None and c.id != "already-done" and (p_pick < min_conf or p_abst >= 0.3)
-            if c is None or c.id == "abstain" or weak:
-                rec["halt"] = "unknown id" if c is None else (f"weak {c.id} (p={p_pick:.2f}, abstain={p_abst:.2f})" if weak else c.id)
-                break
+                # A must_act step reuses a fresh previous observation as its
+                # "before": timed scenarios (A) cannot afford a second OCR.
+                if (must_act or self.fast) and fresh:
+                    screen = self.screen
+                else:
+                    screen = await self.see(f"{label}-before")
+                took("ocr", t)
+                t = time.time()
+                pick, conf, probs = await self.suite.jev_call("choose", s.goal, screen, cands, self.hist, s.cues)
+                took("jev_choose", t)
+                c = next((c for c in cands if c.id == pick), None)
+                rec["picks"].append(pick)
+                if c is not None and c.id == "reobserve":
+                    await asyncio.sleep(3)
+                    continue
+                p_pick, p_abst = probs.get(pick, conf), probs.get("abstain", 0.0)
+                weak = c is not None and c.id != "already-done" and (p_pick < min_conf or p_abst >= 0.3)
+                if c is None or c.id == "abstain" or weak:
+                    rec["halt"] = "unknown id" if c is None else (f"weak {c.id} (p={p_pick:.2f}, abstain={p_abst:.2f})" if weak else c.id)
+                    break
+            t = time.time()
+            self.suite.driver.last_wait_ok = False
             for kind, arg in c.do:
                 try:
                     await self.suite.driver.act(kind, arg)
@@ -922,18 +1220,34 @@ class Scenario:
                     rec.setdefault("act_errors", []).append(redact(str(e), self.suite.secrets)[:300])
                     rec["raised"] = True
                     break
+            took("act", t)
+            t = time.time()
             await asyncio.sleep(s.settle)
-            await self.stable()
+            took("settle", t)
+            t = time.time()
+            if not (self.fast and self.suite.driver.last_wait_ok and not rec["raised"]):
+                await self.stable()
+            took("stable", t)
+            t = time.time()
             screen = await self.see(f"{label}-after")
+            took("ocr", t)
+            t = time.time()
             p = await self.suite.jev_call("done", s.done, screen, s.cues)
+            took("jev_done", t)
             if p < 0.6 and second_look:
                 # A second look before the step counts as unmet: the render
                 # can trail, and a borderline verdict should not redo an
                 # action (a second Enter is a second bounty or claim).
+                t = time.time()
                 await asyncio.sleep(3)
                 await self.stable()
+                took("stable", t)
+                t = time.time()
                 screen = await self.see(f"{label}-second-look")
+                took("ocr", t)
+                t = time.time()
                 p = max(p, await self.suite.jev_call("done", s.done, screen, s.cues))
+                took("jev_done", t)
             rec["p"] = round(float(p), 3)
             self.hist.append({"step": label, "action": c.id, "done_p": p})
             if p >= 0.6:
@@ -1033,8 +1347,10 @@ class Suite:
         if self.args.mock_jev:
             os.environ.pop("TYPESAFE_API_KEY", None)
         self.jev = Jev()
-        wanted = [s.strip().upper() for s in self.args.only.split(",")] if self.args.only else list(registry)
-        paid = ("P" in wanted or "R" in wanted) and not self.args.no_paid and self.target == "box"
+        # Y is opt-in: it runs only when --only names it (two app-made
+        # accounts and up to ~556 sats with P and R).
+        wanted = [s.strip().upper() for s in self.args.only.split(",")] if self.args.only else [s for s in registry if s not in OPT_IN]
+        paid = any(s in wanted for s in PAID) and not self.args.no_paid and self.target == "box"
         meta = {"run_id": self.run_id, "target": self.target,
                 "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "jev": "live" if self.jev.live else "mock", "paid": paid}
@@ -1042,7 +1358,10 @@ class Suite:
         if paid:
             bal = self.box.float_sats()
             meta["float_before_suite"] = bal
-            need = 352 if "P" in wanted and "R" in wanted else 250 if "R" in wanted else 200   # R pays two newcomers
+            # P pays one claim (200 alone); R and Y pay two newcomers each
+            # (250 for the first, about 204 for each further one, 102 for P).
+            two = sum(1 for s in ("R", "Y") if s in wanted)
+            need = 250 + 204 * (two - 1) + (102 if "P" in wanted else 0) if two else 200
             if bal is None or bal < need:
                 print(f"PREFLIGHT: the auto-pay float is {bal} sats, below {need}. "
                       f"Stopping. fund with ~/mc/fund.sh 500", flush=True)
@@ -1076,7 +1395,7 @@ class Suite:
             for sid, (title, fn) in registry.items():
                 if sid not in wanted:
                     continue
-                if sid == "R" and self.target == "omac":
+                if sid in ("R", "Y") and self.target == "omac":
                     self.results.append({"scenario": sid, "title": title, "result": "BLOCKED",
                                          "why": "needs the real instance and live Coinos",
                                          "duration_s": 0, "evidence": "", "judge": [], "checks": []})
@@ -1086,7 +1405,7 @@ class Suite:
                                          "why": "needs the real instance and its float", "duration_s": 0,
                                          "evidence": "", "judge": [], "checks": []})
                     continue
-                if sid in ("P", "R") and not paid:
+                if sid in PAID and not paid:
                     self.results.append({"scenario": sid, "title": title, "result": "SKIP",
                                          "why": "--no-paid", "duration_s": 0, "evidence": "", "judge": [], "checks": []})
                     continue
@@ -1136,8 +1455,19 @@ class Suite:
         self.driver.scenario = sc
         print(f"== {sid}: {title}", flush=True)
         t0, err = time.time(), None
-        self.box.rec_start(sid)
+        wide = sid in WIDE and self.target == "box"
+        prior = None
         try:
+            if wide:
+                # No two-app scenario on a screen that cannot hold both apps.
+                prior = self.box.screen_size()
+                self.box.set_screen(*WIDE[sid])
+                got = self.box.screen_size()
+                if not got or got[0] < WIDE[sid][0] or got[1] < WIDE[sid][1]:
+                    raise RuntimeError(f"the screen is {got}, not {WIDE[sid][0]}x{WIDE[sid][1]}; nothing launched")
+                self.box.rec_start(sid, "%dx%d" % WIDE[sid])
+            else:
+                self.box.rec_start(sid)
             await fn(sc)
         except Exception as e:
             err = redact(f"{type(e).__name__}: {e}", self.secrets)
@@ -1148,6 +1478,12 @@ class Suite:
             except Exception:
                 pass
             self.box.rec_stop(sid)
+            if wide:
+                self.box.kill_app()   # both apps, before the screen shrinks under them
+                if not prior:
+                    sc.notes.append("the screen size before this scenario could not be read; the wide screen was not restored")
+                elif not self.box.set_screen(*prior):
+                    sc.notes.append(f"the screen did not go back to {prior[0]}x{prior[1]}")
             self.collect(sid)
         judged = [s for s in sc.steps]
         steps_ok = all(s["met"] for s in judged)
@@ -1161,19 +1497,27 @@ class Suite:
              "judge": [{"step": s["step"], "cond": s["cond"], "picks": s["picks"], "p": s["p"],
                         "met": s["met"], **({"override": s["override"]} if "override" in s else {}),
                         **({"halt": s["halt"]} if "halt" in s else {}),
-                        **({"act_errors": s["act_errors"]} if "act_errors" in s else {})} for s in judged],
+                        **({"act_errors": s["act_errors"]} if "act_errors" in s else {}),
+                        **({"phases": s["phases"]} if "phases" in s else {})} for s in judged],
              "checks": sc.checks, "notes": sc.notes}
         if err:
             r["error"] = err
         if sc.skip_reason:
             r["why"] = sc.skip_reason
+        totals = {}
+        for s in judged:
+            for k, v in s.get("phases", {}).items():
+                totals[k] = round(totals.get(k, 0.0) + v, 1)
+        r["phase_totals"] = totals
+        print(f"== {sid}: step phases (s): " + ", ".join(f"{k} {v}" for k, v in sorted(totals.items())), flush=True)
         print(f"== {sid}: {result} in {r['duration_s']} s", flush=True)
         return r
 
     def collect(self, sid):
         d = os.path.join(self.out, sid)
+        apps = [(f"{self.box.cdir}/logs/{sid}-{a}.app.log", f"app-{a}.log") for a in ("A", "B", "B2")] if sid in WIDE else []
         for src, dst in ((f"{self.box.cdir}/rec/{sid}.mp4", f"{sid}.mp4"), (f"{self.box.cdir}/logs/{sid}.app.log", "app.log"),
-                         (f"{self.box.cdir}/server.log", "fake-server.log")):
+                         (f"{self.box.cdir}/server.log", "fake-server.log"), *apps):
             p = os.path.join(d, dst)
             if self.target == "omac":
                 try:
@@ -1208,6 +1552,8 @@ class Suite:
             head.append(f"Float: {meta.get('float_before')} sats before, {meta.get('float_after')} sats after")
         if "float_before_r" in meta or "float_after_r" in meta:
             head.append(f"Float (R): {meta.get('float_before_r')} sats before, {meta.get('float_after_r')} sats after")
+        if "float_before_y" in meta or "float_after_y" in meta:
+            head.append(f"Float (Y): {meta.get('float_before_y')} sats before, {meta.get('float_after_y')} sats after")
         if meta.get("stopped"):
             head.append(f"STOPPED: {meta['stopped']} (fund with ~/mc/fund.sh 500)")
         open(os.path.join(self.out, "report.md"), "w").write("\n".join(head + [""] + rows) + "\n")
@@ -1238,6 +1584,9 @@ def main():
     ap.add_argument("--only", default="", help="comma list of scenario ids, e.g. A,G")
     ap.add_argument("--mock-jev", action="store_true", help="development only: no TypeSafe calls")
     ap.add_argument("--no-restore", action="store_true", help="box only: do not relaunch run-app.sh at the end")
+    ap.add_argument("--reuse-wallets", default="", metavar="RUN_ID",
+                    help="Y only: seed its two newcomers from that run's R store in the trash "
+                         "(two app-made Coinos accounts) instead of new Coinos signups")
     args = ap.parse_args()
     _quiet_agent_log()
     from scenarios import SCENARIOS

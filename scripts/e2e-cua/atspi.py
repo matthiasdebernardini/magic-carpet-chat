@@ -25,7 +25,8 @@ their text cannot be read here: match a Label by id only. Extents are
 window-relative (Atspi.CoordType.WINDOW, what xdotool --window takes). --within fails
 unless the node's centre lies inside a window of that size: gpui presses a
 node by clicking its centre and has no scroll-into-view.
-Only the app owned by `pidof -s magic-carpet-chat-e2e` is searched.
+Only the app owned by `pidof -s magic-carpet-chat-e2e` is searched, or with
+--pid N the app of that pid (two e2e apps on one bus).
 Prints one JSON object. Exit 1 with {"error": ...} unless exactly one node
 matches: two matches mean the wrong element could be pressed.
 """
@@ -49,10 +50,13 @@ def app_pid():
     return int(r.stdout.split()[0]) if r.returncode == 0 and r.stdout.split() else None
 
 
+PID = None   # --pid: the app to read (two apps on one bus); else pidof -s
+
+
 def apps():
     """The app's AT-SPI application node(s): named like the app and owned
-    by the pid of the binary under test, never another app on the bus."""
-    pid = app_pid()
+    by the pid of the binary under test (or --pid), never another app."""
+    pid = PID if PID is not None else app_pid()
     desk = Atspi.get_desktop(0)
     out = []
     for i in range(desk.get_child_count()):
@@ -193,11 +197,14 @@ def selfcheck():
 
 
 def main(argv):
+    global PID
     args, opts = [], {"name": None, "has": [], "within": None}
     it = iter(argv)
     for a in it:
         if a == "--name":
             opts["name"] = next(it)
+        elif a == "--pid":
+            PID = int(next(it))
         elif a == "--within":
             opts["within"] = next(it)
         elif a == "--has":

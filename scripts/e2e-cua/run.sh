@@ -10,7 +10,8 @@
 #                 omac: the local binary under test (e.g. target/release/...)
 #   installed     box: keep the e2e binary already in the mc container
 #                 (/usr/local/bin/magic-carpet-chat-e2e; the demo's binary is never touched)
-#   suite flags   --no-paid, --only A,G, --mock-jev (development only)
+#   suite flags   --no-paid, --only A,G, --mock-jev (development only),
+#                 --reuse-wallets <run-id> (Y: newcomers from that run's R store)
 #
 # box (default): never compiles, never needs a GitHub token; the report,
 # frames, recordings and logs land in /tmp/mc-e2e/<timestamp>/.
