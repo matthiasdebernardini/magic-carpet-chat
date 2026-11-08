@@ -166,17 +166,21 @@ pub fn claim(keys: &Keys, name: &str, list_coordinate: &str) -> Result<Event, Ev
         .map_err(|e| EventError::Sign(e.to_string()))
 }
 
-/// Signed kind-9734 zap request for paying a claim, the shape
-/// magic-carpet-v2/src/lib/zap-node.js `buildZapRequest` signs: content "",
+/// Signed kind-9734 zap request for paying a claim on one bounty: the shape
+/// magic-carpet-v2/src/lib/zap-node.js `buildZapRequest` signs (content "",
 /// `["p", claimant]`, `["e", claim id]`, `["a", list coordinate]`,
-/// `["amount", msats]`, `["relays", …]`. The server counts the claim paid when
-/// the receipt's description pubkey is the issuer, so `keys` must be the
-/// issuer's.
+/// `["amount", msats]`, `["relays", …]`) plus `["bounty", <server bounty
+/// id>]`, so two bounties on one list each pay a claim once and a receipt
+/// for one never counts for the other. The server matches a receipt by its
+/// `e` tag and the request's pubkey only, so the extra tag changes nothing
+/// there; it counts the claim paid when that pubkey is the issuer, so `keys`
+/// must be the issuer's.
 pub fn zap_request(
     keys: &Keys,
     claimant_hex: &str,
     claim_event_id: &str,
     list_coordinate: &str,
+    bounty_id: &str,
     sats: u64,
     relays: &[String],
 ) -> Result<Event, EventError> {
@@ -192,6 +196,7 @@ pub fn zap_request(
             tag(["p", claimant_hex])?,
             tag(["e", claim_event_id])?,
             tag(["a", list_coordinate])?,
+            tag(["bounty", bounty_id])?,
             tag(["amount", msats.as_str()])?,
             tag(relay_tag)?,
         ])
@@ -257,15 +262,17 @@ pub fn receipt_pays_claim_for(receipt: &Event, claim_event_id: &str, payer: &str
         && names(&request, "e", claim_event_id)
 }
 
-/// [`receipt_pays_claim_for`], and the zap request asks for exactly the
-/// bounty's reward (`amount`, msats) and, when it names a list (`a`), names
-/// this bounty's. A receipt for another amount or another list does not pay
-/// this bounty's claim.
+/// [`receipt_pays_claim_for`], and the zap request names this bounty
+/// (`["bounty", id]`), asks for exactly its reward (`amount`, msats) and,
+/// when it names a list (`a`), names this bounty's. A receipt without the
+/// bounty tag, or for another bounty, amount or list, does not pay this
+/// bounty's claim.
 pub fn receipt_pays_bounty_claim(
     receipt: &Event,
     claim_event_id: &str,
     payer: &str,
     list_coordinate: &str,
+    bounty_id: &str,
     reward_sats: u64,
 ) -> bool {
     if !receipt_pays_claim_for(receipt, claim_event_id, payer) {
@@ -289,7 +296,8 @@ pub fn receipt_pays_bounty_claim(
         })
     };
     let msats = reward_sats.saturating_mul(1000).to_string();
-    first("amount").as_deref() == Some(msats.as_str())
+    first("bounty").as_deref() == Some(bounty_id)
+        && first("amount").as_deref() == Some(msats.as_str())
         && first("a").is_none_or(|a| a == list_coordinate)
 }
 
@@ -477,7 +485,7 @@ mod tests {
             "wss://magic-carpet.brainstorm.world/relay".to_string(),
             "wss://nos.lol".to_string(),
         ];
-        let event = zap_request(&issuer, &claimant, "e1", COORD, 100, &relays).unwrap();
+        let event = zap_request(&issuer, &claimant, "e1", COORD, "b1", 100, &relays).unwrap();
         assert_eq!(event.kind.as_u16(), ZAP_REQUEST_KIND);
         assert_eq!(event.content, "");
         assert_eq!(event.pubkey, issuer.public_key(), "signed by the issuer");
@@ -488,6 +496,7 @@ mod tests {
                 vec!["p".to_string(), claimant],
                 vec!["e".to_string(), "e1".to_string()],
                 vec!["a".to_string(), COORD.to_string()],
+                vec!["bounty".to_string(), "b1".to_string()],
                 vec!["amount".to_string(), "100000".to_string()],
                 vec![
                     "relays".to_string(),
@@ -496,7 +505,7 @@ mod tests {
                 ],
             ]
         );
-        assert!(zap_request(&issuer, "bb", "e1", COORD, 0, &relays).is_err());
+        assert!(zap_request(&issuer, "bb", "e1", COORD, "b1", 0, &relays).is_err());
     }
 
     #[test]
@@ -513,7 +522,7 @@ mod tests {
                 .finalize(&zapper)
                 .unwrap()
         };
-        let request = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, 21, &relays).unwrap();
+        let request = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 21, &relays).unwrap();
         let payer = issuer.public_key().to_hex();
         assert!(receipt_pays_claim_for(&receipt(&request, "c1"), "c1", &payer));
         // Another claim, another payer, or a receipt naming a claim its
@@ -544,13 +553,45 @@ mod tests {
                 .unwrap()
         };
         let payer = issuer.public_key().to_hex();
-        let right = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, 100, &relays).unwrap();
-        assert!(receipt_pays_bounty_claim(&receipt(&right), "c1", &payer, COORD, 100));
+        let right = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 100, &relays).unwrap();
+        assert!(receipt_pays_bounty_claim(&receipt(&right), "c1", &payer, COORD, "b1", 100));
         // One sat short, or a zap aimed at another list, pays nothing here.
-        let short = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, 99, &relays).unwrap();
-        assert!(!receipt_pays_bounty_claim(&receipt(&short), "c1", &payer, COORD, 100));
-        let other = zap_request(&issuer, &"aa".repeat(32), "c1", "39998:aa:other", 100, &relays).unwrap();
-        assert!(!receipt_pays_bounty_claim(&receipt(&other), "c1", &payer, COORD, 100));
+        let short = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 99, &relays).unwrap();
+        assert!(!receipt_pays_bounty_claim(&receipt(&short), "c1", &payer, COORD, "b1", 100));
+        let other = zap_request(&issuer, &"aa".repeat(32), "c1", "39998:aa:other", "b1", 100, &relays).unwrap();
+        assert!(!receipt_pays_bounty_claim(&receipt(&other), "c1", &payer, COORD, "b1", 100));
+    }
+
+    #[test]
+    fn a_receipt_pays_only_the_bounty_its_request_names() {
+        let issuer = Keys::generate();
+        let zapper = Keys::generate();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let receipt = |request: &Event| -> Event {
+            EventBuilder::new(Kind::Custom(RECEIPT_KIND), "")
+                .tags([
+                    tag(["e", "c1"]).unwrap(),
+                    tag(["description", serde_json::to_string(request).unwrap().as_str()]).unwrap(),
+                ])
+                .finalize(&zapper)
+                .unwrap()
+        };
+        let payer = issuer.public_key().to_hex();
+        let for_b1 = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 100, &relays).unwrap();
+        assert!(receipt_pays_bounty_claim(&receipt(&for_b1), "c1", &payer, COORD, "b1", 100));
+        assert!(!receipt_pays_bounty_claim(&receipt(&for_b1), "c1", &payer, COORD, "b2", 100));
+        // A request with no bounty tag (the server's own shape) pays neither.
+        let untagged = EventBuilder::new(Kind::Custom(ZAP_REQUEST_KIND), "")
+            .tags([
+                tag(["p", "aa"]).unwrap(),
+                tag(["e", "c1"]).unwrap(),
+                tag(["a", COORD]).unwrap(),
+                tag(["amount", "100000"]).unwrap(),
+            ])
+            .finalize(&issuer)
+            .unwrap();
+        assert!(receipt_pays_claim_for(&receipt(&untagged), "c1", &payer));
+        assert!(!receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, COORD, "b1", 100));
     }
 
     #[test]

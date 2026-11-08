@@ -2154,6 +2154,7 @@ fn pays(receipt: &Event, bounty: &Bounty, claim_event_id: &str) -> bool {
         claim_event_id,
         &bounty.issuer_pubkey,
         &bounty.list_coordinate,
+        &bounty.id,
         bounty.amount_sats,
     )
 }
@@ -2732,6 +2733,7 @@ async fn pay_claim(
             &claim.claimant,
             &claim.event_id,
             &bounty.list_coordinate,
+            &bounty.id,
             sats,
             &relays,
         )
@@ -4250,7 +4252,7 @@ mod tests {
 
         // A receipt around the issuer's own signed request for the reward does.
         let relays = vec!["wss://nos.lol".to_string()];
-        let request = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, 100, &relays).unwrap();
+        let request = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, "b1", 100, &relays).unwrap();
         let receipts = vec![receipt_around(&request, &id)];
         let (fact, _) = facts_for(&bounty, std::slice::from_ref(&event), &receipts, &[])
             .into_iter()
@@ -4270,7 +4272,7 @@ mod tests {
         let id = event.id.to_hex();
         let relays = vec!["wss://nos.lol".to_string()];
         // A zap for 99 sats is not this bounty's 100-sat reward.
-        let short = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, 99, &relays).unwrap();
+        let short = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, "b1", 99, &relays).unwrap();
         // An attempt on another bounty at the same address is not this one's.
         let elsewhere = secrets::PayAttempt {
             bounty_id: "other".into(),
@@ -4396,7 +4398,7 @@ mod tests {
         let event = claim_at(&bob, "everything", &[COORD], 200);
         let id = event.id.to_hex();
         let relays = vec!["wss://nos.lol".to_string()];
-        let request = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, 100, &relays).unwrap();
+        let request = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, "b1", 100, &relays).unwrap();
         let receipts = vec![receipt_around(&request, &id)];
         let (fact, _) = facts_for(&bounty, std::slice::from_ref(&event), &receipts, &[])
             .into_iter()
@@ -4453,6 +4455,52 @@ mod tests {
             assert!(server_paid.detail.claims[0].zap_receipt.is_some());
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_claim_paid_on_one_bounty_is_still_payable_on_another_on_the_same_list() {
+        let issuer = Keys::generate();
+        let issuer_hex = issuer.public_key().to_hex();
+        let b1 = bounty_row(serde_json::json!({ "id": "b1", "issuer_pubkey": issuer_hex }));
+        let b2 = bounty_row(serde_json::json!({ "id": "b2", "issuer_pubkey": issuer_hex }));
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let id = event.id.to_hex();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let paid_on_b1 =
+            events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, "b1", 100, &relays).unwrap();
+        let receipts = vec![receipt_around(&paid_on_b1, &id)];
+        let fact_on = |bounty: &Bounty| {
+            let mut fact = facts_for(bounty, std::slice::from_ref(&event), &receipts, &[])
+                .into_iter()
+                .next()
+                .unwrap()
+                .0;
+            fact.rank = Some(5.0);
+            fact
+        };
+
+        let on_b1 = fact_on(&b1);
+        assert!(on_b1.paid);
+        let on_b2 = fact_on(&b2);
+        assert!(!on_b2.paid, "B1's receipt does not pay the claim on B2");
+
+        // B2 still has its slot and still pays the claim.
+        let mut b2_counted = b2.clone();
+        apply_usage(&mut b2_counted, std::slice::from_ref(&on_b2));
+        let state = b2_counted.payment_state.unwrap();
+        assert_eq!((state.paid_reward_count, state.open_reward_slots), (0, 1));
+        let policy = Policy::of(&b2, true, 2);
+        let plan: HashMap<String, Result<(), Hold>> =
+            autopay::plan(&policy, std::slice::from_ref(&on_b2)).into_iter().collect();
+        assert_eq!(plan[&on_b2.address], Ok(()));
+
+        // Neither the settled row nor the receipt shows on B2's card.
+        let merged = merge_claim(None, &on_b2, &event, &receipts, &b2, &[], 300).unwrap();
+        assert!(merged.zap_receipt.is_none());
+        assert!(merged.auto_payment.is_none());
+        let merged = merge_claim(None, &on_b1, &event, &receipts, &b1, &[], 300).unwrap();
+        assert_eq!(merged.auto_payment.map(|r| r.state).as_deref(), Some("settled"));
     }
 
     #[test]
