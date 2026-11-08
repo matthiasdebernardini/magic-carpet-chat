@@ -1230,8 +1230,10 @@ async fn publish_dlist(
 /// Create the bounty with the server's auto-pay OFF: the server pays only
 /// for allowlisted issuers, and two payers on one bounty would pay twice.
 /// `req.auto_pay` is the issuer's wish; the caller stores it as this app's
-/// own auto-pay setting once the bounty exists. The minimum rank always goes
-/// to the server (default 2), which keeps it with the bounty.
+/// own auto-pay setting once the bounty exists, minimum rank included. The
+/// minimum is sent too (default 2), but the server stores 3 whenever
+/// autoPay is false (magic-carpet-v2/src/db/bounties.js:118), so its value
+/// means nothing for these bounties ([`Bounty::claim_min_rank`]).
 async fn create_bounty(
     sessions: &SharedSessions,
     pubkey: &str,
@@ -2402,7 +2404,9 @@ where
 {
     let now = now_unix();
     for bounty in bounties.iter_mut() {
-        bounty.app_auto_pay = setting_of(store, bounty).is_some();
+        let setting = setting_of(store, bounty);
+        bounty.app_auto_pay = setting.is_some();
+        bounty.app_min_rank = setting.map(|s| s.min_rank.max(trust::INSTANCE_MIN_RANK));
         mark_expired(bounty, now);
     }
     let app_paid = |b: &Bounty| app_may_be_open(b, now);
@@ -2526,6 +2530,9 @@ where
     };
     let setting = setting_of(&store, &detail.bounty).cloned();
     detail.bounty.app_auto_pay = setting.is_some();
+    detail.bounty.app_min_rank = setting
+        .as_ref()
+        .map(|s| s.min_rank.max(trust::INSTANCE_MIN_RANK));
     if detail.bounty.server_auto_pay_on() {
         return unchanged(detail);
     }

@@ -1664,7 +1664,14 @@ impl Shell {
                 // alert dialog behind a click, so it never covers the card.
                 let notice = claim_notice(
                     self.bounty(&bounty_id)
-                        .map(|b| (b.auto_pay_on(), b.auto_pay_min_rank.unwrap_or(0), b.amount_sats)),
+                        .map(|b| {
+                            let min_rank = if b.server_auto_pay_on() {
+                                b.auto_pay_min_rank.unwrap_or(0)
+                            } else {
+                                b.claim_min_rank()
+                            };
+                            (b.auto_pay_on(), min_rank, b.amount_sats)
+                        }),
                 );
                 let mut toast = Notification::info(notice.short).title(notice.title);
                 if let Some(full) = notice.full {
@@ -3674,6 +3681,9 @@ fn optimistic_bounty(id: &str, issuer: &str, req: CreateBounty, now: u64) -> Bou
         payment_state: None,
         issuer_rank: None,
         app_auto_pay: req.auto_pay,
+        app_min_rank: req
+            .auto_pay
+            .then(|| req.auto_pay_min_rank.unwrap_or(2).max(2)),
     }
 }
 

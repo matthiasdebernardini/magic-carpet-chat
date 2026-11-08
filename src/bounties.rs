@@ -639,7 +639,14 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     if let Some(cap) = bounty.bounty_cap_sats {
         facts.push(fact("bounty-detail-cap", "CAP", format!("{} sats", timefmt::fmt_sats(cap))));
     }
-    if let Some(rank) = bounty.auto_pay_min_rank {
+    // The server's own auto-pay bounties show the server's minimum; for the
+    // rest the server's value means nothing, so the minimum this app goes by.
+    let min_rank = if bounty.server_auto_pay_on() {
+        bounty.auto_pay_min_rank
+    } else {
+        Some(bounty.claim_min_rank())
+    };
+    if let Some(rank) = min_rank {
         facts.push(fact("bounty-detail-min-rank", "MIN RANK", rank.to_string()));
     }
     if let Some(state) = &bounty.payment_state {

@@ -142,6 +142,10 @@ pub struct Bounty {
     /// app's account store). Never from the server.
     #[serde(skip)]
     pub app_auto_pay: bool,
+    /// The minimum rank in this app's auto-pay setting for the bounty, when
+    /// the issuer's setting is stored here. Never from the server.
+    #[serde(skip)]
+    pub app_min_rank: Option<u64>,
 }
 
 fn truthy(value: &Option<serde_json::Value>) -> bool {
@@ -193,15 +197,17 @@ impl Bounty {
     }
 
     /// The rank a claimant needs, whoever pays: the server rule
-    /// ([`Self::effective_min_rank`]) when the server's auto-payer pays,
-    /// else the minimum the server stored with the bounty — this app always
-    /// sends one, for the issuer's app to pay by — never below the instance
-    /// floor, and the floor alone when none is stored.
+    /// ([`Self::effective_min_rank`]) when the server's auto-payer pays.
+    /// Otherwise the server's `auto_pay_min_rank` means nothing (it stores 3
+    /// whenever autoPay is false, magic-carpet-v2/src/db/bounties.js:118):
+    /// the issuer's own app goes by its stored setting ([`Self::app_min_rank`]),
+    /// and everyone else by the instance floor, 2. A claimant between the two
+    /// can claim; the issuer's app then shows "rank too low" and does not pay.
     pub fn claim_min_rank(&self) -> u64 {
         if self.server_auto_pay_on() {
             self.effective_min_rank()
         } else {
-            INSTANCE_MIN_RANK.max(self.auto_pay_min_rank.unwrap_or(INSTANCE_MIN_RANK))
+            INSTANCE_MIN_RANK.max(self.app_min_rank.unwrap_or(INSTANCE_MIN_RANK))
         }
     }
 }
@@ -889,18 +895,31 @@ mod tests {
     }
 
     #[test]
-    fn an_app_paid_bounty_needs_its_stored_minimum() {
-        let min = |extra| eligible_row("aa", 2.into(), extra).claim_min_rank();
-        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 5})), 5);
-        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 1})), 2);
-        assert_eq!(min(serde_json::json!({})), 2);
-        assert_eq!(min(serde_json::json!({"auto_pay": 1})), 3);
+    fn an_app_paid_bounty_ignores_the_servers_minimum() {
+        let row = |extra, app_min| {
+            let mut bounty = eligible_row("aa", 2.into(), extra);
+            bounty.app_min_rank = app_min;
+            bounty
+        };
+        let min = |extra, app_min| row(extra, app_min).claim_min_rank();
+        // The server stores 3 for every bounty it doesn't pay: meaningless.
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3}), None), 2);
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 5}), None), 2);
+        assert_eq!(min(serde_json::json!({}), None), 2);
+        // The issuer's own app goes by its setting, floored at 2.
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3}), Some(2)), 2);
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3}), Some(4)), 4);
+        assert_eq!(min(serde_json::json!({"auto_pay": 0}), Some(1)), 2);
+        // The server's own auto-pay bounties keep the server rule.
+        assert_eq!(min(serde_json::json!({"auto_pay": 1}), Some(2)), 3);
+        assert_eq!(min(serde_json::json!({"auto_pay": 1, "auto_pay_min_rank": 4}), None), 4);
+        // A claimant at the floor can claim a bounty the server says needs 3.
         let list = vec![
-            eligible_row("aa", 3.into(), serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 4})),
-            eligible_row("bb", 4.into(), serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 4})),
+            eligible_row("aa", 2.into(), serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3})),
+            eligible_row("bb", 1.into(), serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3})),
         ];
         let ids: Vec<String> = claimable_by(list, "me").into_iter().map(|b| b.id).collect();
-        assert_eq!(ids, ["bb-4"], "rank 3 misses the stored minimum of 4");
+        assert_eq!(ids, ["aa-2"]);
     }
 
     #[test]
