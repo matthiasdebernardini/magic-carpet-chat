@@ -505,6 +505,21 @@ pub fn begin_attempt_within(
     })
 }
 
+/// Take back an attempt that never reached the wallet: recorded, but the
+/// invoice for it could not be had, so no payment request was made and the
+/// claim may be tried again. Only a `sending` attempt can be taken back.
+pub fn abandon_attempt_for(pubkey: &str, bounty_id: &str, claim_address: &str) -> Result<(), SecretError> {
+    modify(|store| {
+        let account = account_mut(store, pubkey)?;
+        account.pay_attempts.retain(|a| {
+            !(a.bounty_id == bounty_id
+                && a.claim_address == claim_address
+                && a.state == AttemptState::Sending)
+        });
+        Ok(())
+    })
+}
+
 /// Record how the attempt on `bounty_id` for `claim_address` ended.
 pub fn finish_attempt_for(
     pubkey: &str,

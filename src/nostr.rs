@@ -2549,24 +2549,81 @@ async fn autopay_tick(client: &Client, ctx: &AutoPayCtx, updates: &mpsc::Unbound
                 .filter(|f| f.paid)
                 .map(|f| (f.address.clone(), f.claimant.clone()))
                 .collect();
-            // `Some(Failed)` here can also mean "refused under the lock"
-            // (cap or limit): it marks the claim decided for this tick.
             match pay_claim(ctx, &api, &bounty, &facts[ix], paid, updates).await {
-                Some(state) => facts[ix].attempt = Some(state),
-                None => {
+                PayOutcome::Decided(state) => facts[ix].attempt = Some(state),
+                PayOutcome::Retry => {
                     facts.remove(ix);
                 }
+                // Another instance filled the bounty: nothing else on it
+                // can be paid this tick.
+                PayOutcome::Full => break,
             }
         }
     }
 }
 
-/// Pay one claim from the issuer's Coinos wallet as a zap. Every check that
-/// moves no sats runs first and, on a "no", leaves a note and returns
-/// `None` (tried again next tick). Then the attempt is recorded, and only
-/// after that does the payment go out; its end state is recorded and
-/// returned. An attempt another instance recorded first returns
-/// `Some(Sending)`, so this pass leaves the claim alone.
+/// What one [`pay_claim`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayOutcome {
+    /// Nothing recorded, nothing sent (a note says why): try next tick.
+    Retry,
+    /// The claim is decided for this tick: an attempt exists, by this pass
+    /// or another instance, or the per-npub limit refused it.
+    Decided(AttemptState),
+    /// The cap refused it: the bounty is full.
+    Full,
+}
+
+/// Record the attempt, then ask for the invoice: the limit recheck runs
+/// before any zap request is signed or leaves this app, so a refused one
+/// leaks nothing. `invoice` signs the request and fetches the bolt11; when
+/// it fails, no payment request was made, so the attempt is taken back and
+/// the claim tried again next tick. `Ok` carries the invoice to pay.
+async fn record_then_invoice<F, Fut>(
+    ctx: &AutoPayCtx,
+    issuer: &str,
+    attempt: secrets::PayAttempt,
+    limits: &secrets::SlotLimits,
+    invoice: F,
+) -> Result<String, PayOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let (bounty_id, address) = (attempt.bounty_id.clone(), attempt.claim_address.clone());
+    match secrets::begin_attempt_within(issuer, attempt, Some(limits)) {
+        Ok(secrets::Begin::Recorded) => {}
+        Ok(secrets::Begin::Exists) => return Err(PayOutcome::Decided(AttemptState::Sending)),
+        Ok(secrets::Begin::NoSlots) => {
+            ctx.note(&address, Hold::NoSlots.describe().unwrap_or_default());
+            return Err(PayOutcome::Full);
+        }
+        Ok(secrets::Begin::OverLimit) => {
+            ctx.note(&address, Hold::OverLimit.describe().unwrap_or_default());
+            return Err(PayOutcome::Decided(AttemptState::Failed));
+        }
+        Err(e) => {
+            ctx.note(&address, e.to_string());
+            return Err(PayOutcome::Retry);
+        }
+    }
+    match invoice().await {
+        Ok(bolt11) => Ok(bolt11),
+        Err(why) => {
+            // If taking it back fails the attempt stays `sending`: shown as
+            // unknown, never retried. The safe side.
+            let _ = secrets::abandon_attempt_for(issuer, &bounty_id, &address);
+            ctx.note(&address, why);
+            Err(PayOutcome::Retry)
+        }
+    }
+}
+
+/// Pay one claim from the issuer's Coinos wallet as a zap. The checks that
+/// need no signature run first and, on a "no", leave a note ([`PayOutcome::Retry`]).
+/// Then [`record_then_invoice`]: the attempt is recorded under the store's
+/// limit recheck, and only then is the zap request signed and the invoice
+/// fetched. Then the payment goes out, and its end state is recorded.
 async fn pay_claim(
     ctx: &AutoPayCtx,
     api: &Api,
@@ -2574,7 +2631,7 @@ async fn pay_claim(
     claim: &ClaimFacts,
     paid: Vec<(String, String)>,
     updates: &mpsc::UnboundedSender<Update>,
-) -> Option<AttemptState> {
+) -> PayOutcome {
     let issuer = &bounty.issuer_pubkey;
     let sats = bounty.amount_sats;
     let lud16 = match claimant_lud16(api, &claim.claimant).await {
@@ -2584,18 +2641,18 @@ async fn pay_claim(
                 &claim.address,
                 "No Lightning address in the claimant's profile, so it can't be paid.",
             );
-            return None;
+            return PayOutcome::Retry;
         }
         Err(()) => {
             ctx.note(&claim.address, "Couldn't read the claimant's profile. Trying again shortly.");
-            return None;
+            return PayOutcome::Retry;
         }
     };
     let login = match secrets::load_coinos_login(issuer) {
         Ok(Some(login)) if login.has_token() => login,
         _ => {
             ctx.note(&claim.address, CANNOT_SEND);
-            return None;
+            return PayOutcome::Retry;
         }
     };
     match coinos::balance(&login.token).await {
@@ -2606,42 +2663,18 @@ async fn pay_claim(
                     "Wallet empty: the issuer's Coinos wallet holds {balance} sats, and the reward is {sats}."
                 ),
             );
-            return None;
+            return PayOutcome::Retry;
         }
         Ok(_) => {}
         Err(e) => {
             ctx.note(&claim.address, format!("Couldn't read the issuer's wallet: {e}"));
-            return None;
+            return PayOutcome::Retry;
         }
     }
     let Ok(Some(keys)) = secrets::keys(issuer) else {
         ctx.note(&claim.address, "The issuer's key isn't stored here.");
-        return None;
+        return PayOutcome::Retry;
     };
-    let mut relays = vec![relay_url()];
-    relays.extend(public_relays());
-    let request = match events::zap_request(
-        &keys,
-        &claim.claimant,
-        &claim.event_id,
-        &bounty.list_coordinate,
-        sats,
-        &relays,
-    ) {
-        Ok(request) => request,
-        Err(e) => {
-            ctx.note(&claim.address, e.to_string());
-            return None;
-        }
-    };
-    let bolt11 = match coinos::lnurl_zap_invoice(&lud16, sats, &request.as_json()).await {
-        Ok(bolt11) => bolt11,
-        Err(e) => {
-            ctx.note(&claim.address, e.to_string());
-            return None;
-        }
-    };
-
     let now = now_unix();
     let attempt = secrets::PayAttempt {
         bounty_id: bounty.id.clone(),
@@ -2658,22 +2691,26 @@ async fn pay_claim(
     // The store re-counts the cap and the per-npub limit under its lock.
     let (slots, per_npub) = autopay::slots_and_limit(bounty);
     let limits = secrets::SlotLimits { slots, per_npub, paid };
-    match secrets::begin_attempt_within(issuer, attempt, Some(&limits)) {
-        Ok(secrets::Begin::Recorded) => {}
-        Ok(secrets::Begin::Exists) => return Some(AttemptState::Sending),
-        Ok(secrets::Begin::NoSlots) => {
-            ctx.note(&claim.address, Hold::NoSlots.describe().unwrap_or_default());
-            return Some(AttemptState::Failed);
-        }
-        Ok(secrets::Begin::OverLimit) => {
-            ctx.note(&claim.address, Hold::OverLimit.describe().unwrap_or_default());
-            return Some(AttemptState::Failed);
-        }
-        Err(e) => {
-            ctx.note(&claim.address, e.to_string());
-            return None;
-        }
-    }
+    let invoice = || async {
+        let mut relays = vec![relay_url()];
+        relays.extend(public_relays());
+        let request = events::zap_request(
+            &keys,
+            &claim.claimant,
+            &claim.event_id,
+            &bounty.list_coordinate,
+            sats,
+            &relays,
+        )
+        .map_err(|e| e.to_string())?;
+        coinos::lnurl_zap_invoice(&lud16, sats, &request.as_json())
+            .await
+            .map_err(|e| e.to_string())
+    };
+    let bolt11 = match record_then_invoice(ctx, issuer, attempt, &limits, invoice).await {
+        Ok(bolt11) => bolt11,
+        Err(outcome) => return outcome,
+    };
     ctx.clear_note(&claim.address);
     let report = |state: &str, reason: Option<String>| {
         let _ = updates.unbounded_send(Update::PaymentState {
@@ -2709,7 +2746,7 @@ async fn pay_claim(
         },
         reason,
     );
-    Some(state)
+    PayOutcome::Decided(state)
 }
 
 /// Poll the relay's real status so the UI dot is honest, not hopeful.
@@ -4252,6 +4289,70 @@ mod tests {
         let mut twice = list.clone();
         twice.push(row("new-2", "aa", 100, 10_003));
         assert_eq!(created_bounty(&twice, "aa", &req, sent_at), Err(()));
+    }
+
+    /// A store in its own temp dir, with one generated account.
+    fn temp_store(name: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("mc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let keys = Keys::generate();
+        let pubkey = secrets::add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true)
+            .unwrap()
+            .pubkey;
+        (dir, pubkey)
+    }
+
+    fn sending(bounty: &str, address: &str, claimant: &str) -> secrets::PayAttempt {
+        secrets::PayAttempt {
+            bounty_id: bounty.into(),
+            claim_address: address.into(),
+            claim_event_id: format!("e-{address}"),
+            claimant: claimant.into(),
+            sats: 100,
+            state: AttemptState::Sending,
+            reason: None,
+            started_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_refused_recheck_signs_nothing_and_a_failed_invoice_frees_the_claim() {
+        let (dir, me) = temp_store("record-first");
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let ctx = AutoPayCtx::default();
+        let one = secrets::SlotLimits { slots: 1, per_npub: Some(1), paid: Vec::new() };
+        let signed = std::sync::atomic::AtomicUsize::new(0);
+        let invoice = |answer: Result<String, String>| {
+            let signed = &signed;
+            move || async move {
+                signed.fetch_add(1, Ordering::SeqCst);
+                answer
+            }
+        };
+        runtime.block_on(async {
+            // Another instance already took the one slot.
+            let x = sending("b1", "x:1", "x");
+            assert!(matches!(
+                secrets::begin_attempt_within(&me, x, Some(&one)),
+                Ok(secrets::Begin::Recorded)
+            ));
+            let full = record_then_invoice(&ctx, &me, sending("b1", "y:1", "y"), &one, invoice(Ok("lnbc".into()))).await;
+            assert_eq!(full, Err(PayOutcome::Full));
+            assert_eq!(signed.load(Ordering::SeqCst), 0, "no zap request after a refusal");
+
+            // An invoice that can't be had takes the attempt back.
+            let failed = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, invoice(Err("no zaps".into()))).await;
+            assert_eq!(failed, Err(PayOutcome::Retry));
+            assert!(secrets::pay_attempts(&me).unwrap().iter().all(|a| a.bounty_id != "b2"));
+            assert_eq!(ctx.note_for("y:1").as_deref(), Some("no zaps"));
+
+            let paid = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, invoice(Ok("lnbc".into()))).await;
+            assert_eq!(paid, Ok("lnbc".to_string()));
+            assert_eq!(signed.load(Ordering::SeqCst), 2);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
