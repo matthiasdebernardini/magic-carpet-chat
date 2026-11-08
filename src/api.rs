@@ -187,6 +187,11 @@ impl Bounty {
         }
     }
 
+    /// The bounty's own expiration time has passed.
+    pub fn expired_by(&self, now: u64) -> bool {
+        self.expiration.is_some_and(|at| at < now)
+    }
+
     /// The rank a claimant needs, whoever pays: the server rule
     /// ([`Self::effective_min_rank`]) when the server's auto-payer pays,
     /// else the minimum the server stored with the bounty — this app always

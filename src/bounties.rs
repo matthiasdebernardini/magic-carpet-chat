@@ -32,7 +32,7 @@ fn status_hue(status: &str) -> u32 {
     match status {
         "open" => GREEN,
         "fulfilled" => ACCENT_LIGHT,
-        "expired" | "cancelled" => TEXT_DIM,
+        "expired" => TEXT_DIM,
         _ => AMBER,
     }
 }

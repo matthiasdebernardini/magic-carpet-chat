@@ -63,8 +63,9 @@ pub const HOUSE_ISSUER_HEX: &str =
 /// nothing to poll hot for.
 const ROWLESS_GRACE_SECS: u64 = 600;
 
-/// `derivedStatus` values after which a bounty can never pay again.
-pub const TERMINAL_STATUSES: [&str; 3] = ["fulfilled", "expired", "cancelled"];
+/// `derivedStatus` values after which a bounty can never pay again. The
+/// server's status column holds open, fulfilled and expired only.
+pub const TERMINAL_STATUSES: [&str; 2] = ["fulfilled", "expired"];
 
 /// `MC_RELAY_URL` overrides the prod relay, for rehearsals.
 pub fn relay_url() -> String {
@@ -1870,8 +1871,9 @@ async fn eligible(client: &Client, ctx: &AutoPayCtx, viewer: &str) -> Result<Vec
                 let (slots, per_npub) = autopay::slots_and_limit(b);
                 autopay::open_for(slots, per_npub, facts, viewer)
             }
-            // The server's own auto-pay bounties keep the server's count:
-            // its delegate's receipts are not the issuer's to check here.
+            // No count of the app's own: the server pays this one (its
+            // delegate's receipts are not the issuer's to check here), or
+            // the relay read failed. The server's counters stand.
             None => b.payment_state.as_ref().is_none_or(|s| s.open_reward_slots > 0),
         }
     });
@@ -2322,7 +2324,20 @@ fn app_may_be_open(bounty: &Bounty, now: u64) -> bool {
     !bounty.server_auto_pay_on()
         && open_or_full(bounty.effective_status())
         && bounty.status.as_deref().is_none_or(open_or_full)
-        && bounty.expiration.is_none_or(|at| at >= now)
+        && !bounty.expired_by(now)
+}
+
+/// A bounty the server doesn't pay whose own expiration has passed reads
+/// "expired", never the server's open or fulfilled (the server's
+/// `deriveStatus` puts fulfilled before expired, and the app ignores its
+/// fulfilled for these bounties).
+fn mark_expired(bounty: &mut Bounty, now: u64) {
+    if !bounty.server_auto_pay_on()
+        && bounty.expired_by(now)
+        && matches!(bounty.effective_status(), "open" | "fulfilled")
+    {
+        bounty.derived_status = Some("expired".into());
+    }
 }
 
 /// A bounty the app decides for itself, when the app could not count it
@@ -2368,10 +2383,28 @@ async fn fold_relay_usage(
     bounties: &mut [Bounty],
     store: &secrets::Store,
 ) -> HashMap<String, Vec<ClaimFacts>> {
+    fold_relay_usage_with(bounties, store, |coordinates, since| async move {
+        relay_claims(client, &coordinates, since).await
+    })
+    .await
+}
+
+/// [`fold_relay_usage`] with the relay read passed in, so its failure
+/// branch is testable offline.
+async fn fold_relay_usage_with<F, Fut>(
+    bounties: &mut [Bounty],
+    store: &secrets::Store,
+    read: F,
+) -> HashMap<String, Vec<ClaimFacts>>
+where
+    F: FnOnce(Vec<String>, u64) -> Fut,
+    Fut: std::future::Future<Output = Option<(Vec<Event>, Vec<Event>)>>,
+{
+    let now = now_unix();
     for bounty in bounties.iter_mut() {
         bounty.app_auto_pay = setting_of(store, bounty).is_some();
+        mark_expired(bounty, now);
     }
-    let now = now_unix();
     let app_paid = |b: &Bounty| app_may_be_open(b, now);
     let mut coordinates: Vec<String> = bounties
         .iter()
@@ -2386,7 +2419,7 @@ async fn fold_relay_usage(
         .filter_map(|b| b.created_at)
         .min()
         .unwrap_or(0);
-    let Some((claims, receipts)) = relay_claims(client, &coordinates, since).await else {
+    let Some((claims, receipts)) = read(coordinates, since).await else {
         for bounty in bounties.iter_mut() {
             forget_server_fulfilled(bounty, now);
         }
@@ -2456,7 +2489,21 @@ struct Annotated {
 /// the issuer's attempts as payment rows, the client's slot count, and each
 /// unpaid claim's reason in plain words. The server's own auto-pay bounties
 /// come back as the server sent them.
-async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -> Annotated {
+async fn annotate(ctx: &AutoPayCtx, client: &Client, detail: BountyDetail) -> Annotated {
+    annotate_with(ctx, detail, |coordinate, since| async move {
+        relay_claims(client, std::slice::from_ref(&coordinate), since).await
+    })
+    .await
+}
+
+/// [`annotate`] with the relay read passed in, so its failure exit is
+/// testable offline.
+async fn annotate_with<F, Fut>(ctx: &AutoPayCtx, mut detail: BountyDetail, read: F) -> Annotated
+where
+    F: FnOnce(String, u64) -> Fut,
+    Fut: std::future::Future<Output = Option<(Vec<Event>, Vec<Event>)>>,
+{
+    mark_expired(&mut detail.bounty, now_unix());
     // Even when nothing can be read, a receipt the server attached to a
     // bounty it does not pay is unverified: it never shows as paid.
     let unchanged = |mut detail: BountyDetail| {
@@ -2484,9 +2531,7 @@ async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -
     }
     let coordinate = detail.bounty.list_coordinate.clone();
     let since = detail.bounty.created_at.unwrap_or(0);
-    let Some((events, receipts)) =
-        relay_claims(client, std::slice::from_ref(&coordinate), since).await
-    else {
+    let Some((events, receipts)) = read(coordinate, since).await else {
         return unchanged(detail);
     };
     let issuer = detail.bounty.issuer_pubkey.clone();
@@ -3035,7 +3080,9 @@ async fn watch_bounty(
                 // needs no watcher at all: stop. A later re-watch (the user
                 // re-selecting it) does one fresh poll and stops again. An
                 // open bounty with a paid_unreceipted claim is NOT done — the
-                // slow poll below is what catches a late receipt.
+                // slow poll below is what catches a late receipt — and nor is
+                // one the app counts itself, which a freed slot reopens
+                // ([`watch_done`]).
                 if watch_done(&detail, pending) {
                     if let Some(sub) = sub_slot.lock().await.take() {
                         let _ = client.unsubscribe(&sub).await;
@@ -4728,6 +4775,101 @@ mod tests {
         let mut listed = detail(0).bounty;
         forget_server_fulfilled(&mut listed, 1_000);
         assert_eq!(listed.effective_status(), "open", "a failed list count reads open too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server detail for B2 that the server calls fulfilled, with the
+    /// server's unverified receipt on its one claim.
+    fn fulfilled_detail(extra: serde_json::Value) -> BountyDetail {
+        let mut bounty = serde_json::json!({
+            "id": "b2", "issuer_pubkey": "aa", "list_coordinate": COORD, "amount_sats": 100,
+            "status": "fulfilled", "derivedStatus": "fulfilled", "auto_pay": 0,
+        });
+        bounty.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        parse_detail(
+            &serde_json::json!({
+                "success": true,
+                "bounty": bounty,
+                "claims": [{
+                    "event": { "id": "c1", "pubkey": "bb", "kind": 39999, "created_at": 200, "tags": [], "content": "x" },
+                    "zapReceipt": { "id": "r1", "pubkey": "zz", "kind": 9735, "created_at": 300,
+                        "tags": [["e", "c1"], ["description", "{\"pubkey\":\"aa\"}"]], "content": "" },
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_bounty_past_its_own_expiration_reads_expired_not_fulfilled() {
+        let mut app_decided = fulfilled_detail(serde_json::json!({ "expiration": 999 })).bounty;
+        mark_expired(&mut app_decided, 1_000);
+        assert_eq!(app_decided.effective_status(), "expired");
+        let mut not_yet = fulfilled_detail(serde_json::json!({ "expiration": 1_001 })).bounty;
+        mark_expired(&mut not_yet, 1_000);
+        assert_eq!(not_yet.effective_status(), "fulfilled");
+        // The server's own auto-pay bounties keep the server's word.
+        let mut server_paid =
+            fulfilled_detail(serde_json::json!({ "expiration": 999, "auto_pay": 1 })).bounty;
+        mark_expired(&mut server_paid, 1_000);
+        assert_eq!(server_paid.effective_status(), "fulfilled");
+
+        // And on the way through the list fold and the detail.
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut list = vec![fulfilled_detail(serde_json::json!({ "expiration": 999 })).bounty];
+            fold_relay_usage_with(&mut list, &secrets::Store::default(), |_, _| async {
+                Some((Vec::new(), Vec::new()))
+            })
+            .await;
+            assert_eq!(list[0].effective_status(), "expired");
+        });
+    }
+
+    #[test]
+    fn a_full_count_of_the_apps_own_does_not_end_the_watch() {
+        // The app counted B2 full; a failed attempt can free a slot.
+        let own_count = fulfilled_detail(serde_json::json!({}));
+        assert!(!watch_done(&own_count, false));
+        let server_paid = fulfilled_detail(serde_json::json!({ "auto_pay": 1 }));
+        assert!(watch_done(&server_paid, false));
+    }
+
+    #[test]
+    fn a_failed_relay_read_leaves_the_list_open_not_the_servers_fulfilled() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut list = vec![
+                fulfilled_detail(serde_json::json!({})).bounty,
+                fulfilled_detail(serde_json::json!({ "id": "b9", "auto_pay": 1 })).bounty,
+            ];
+            let facts =
+                fold_relay_usage_with(&mut list, &secrets::Store::default(), |_, _| async { None })
+                    .await;
+            assert!(facts.is_empty());
+            assert_eq!(list[0].effective_status(), "open");
+            assert_eq!(list[1].effective_status(), "fulfilled", "the server pays this one");
+        });
+    }
+
+    #[test]
+    fn a_failed_relay_read_in_the_detail_shows_no_server_fulfilled_or_receipt() {
+        let _store = store_turn();
+        let dir = std::env::temp_dir().join(format!("mc-relay-down-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let ctx = AutoPayCtx::default();
+        runtime.block_on(async {
+            // The store reads fine (empty); only the relay read fails.
+            assert!(secrets::load().is_ok());
+            let annotated =
+                annotate_with(&ctx, fulfilled_detail(serde_json::json!({})), |_, _| async { None }).await;
+            assert!(annotated.policy.is_none(), "nothing decided, nothing paid");
+            assert_eq!(annotated.detail.bounty.effective_status(), "open");
+            assert!(annotated.detail.claims[0].zap_receipt.is_none());
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -618,11 +618,14 @@ fn list_has_open_bounty<'a>(known: impl IntoIterator<Item = &'a Bounty>, coordin
     // never pruned). On a bounty the server doesn't pay, "fulfilled" is the
     // app's own count and reopens when a slot frees; which copy is fresher
     // is not known, so there any open copy counts and the guard errs toward
-    // blocking a second bounty.
+    // blocking a second bounty. Its own expiration time passing ends it,
+    // whatever the server says.
+    let now = timefmt::now_unix();
     let is_final = |t: &Bounty| {
-        let status = t.effective_status();
-        nostr::TERMINAL_STATUSES.contains(&status)
-            && (t.server_auto_pay_on() || status != "fulfilled")
+        if t.server_auto_pay_on() {
+            return nostr::TERMINAL_STATUSES.contains(&t.effective_status());
+        }
+        t.effective_status() == "expired" || t.expired_by(now)
     };
     known.iter().any(|b| {
         b.list_coordinate == coordinate
@@ -4071,6 +4074,12 @@ mod tests {
         let mut app_expired = app_open.clone();
         app_expired.status = Some("expired".into());
         assert!(!list_has_open_bounty([&app_expired, &app_open], coord));
+        // So does its own expiration time passing, even while the server
+        // calls it fulfilled.
+        let mut past = app_full.clone();
+        past.expiration = Some(1);
+        assert!(!list_has_open_bounty([&past, &app_open], coord));
+        assert!(!list_has_open_bounty([&app_open, &past], coord));
     }
 
     #[test]
