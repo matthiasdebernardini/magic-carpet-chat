@@ -432,15 +432,6 @@ pub fn pay_attempts(pubkey: &str) -> Result<Vec<PayAttempt>, SecretError> {
         .unwrap_or_default())
 }
 
-/// Record a payment attempt before the payment goes out. `Ok(false)` when
-/// an attempt for the same bounty and claim address already exists, from
-/// this process or another: the caller must not pay. Read and write happen
-/// under the store's process lock, so two app instances cannot both win.
-/// No cap check: the auto-pay loop uses [`begin_attempt_within`].
-pub fn begin_attempt(pubkey: &str, attempt: PayAttempt) -> Result<bool, SecretError> {
-    begin_attempt_within(pubkey, attempt, None).map(|begun| begun == Begin::Recorded)
-}
-
 /// A bounty's limits, checked again under the store lock when an attempt
 /// is recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,10 +457,14 @@ pub enum Begin {
     OverLimit,
 }
 
-/// [`begin_attempt`], and inside the same lock the cap and the per-npub
-/// limit counted from what the store holds NOW (every instance's attempts on
-/// this bounty that may have paid) plus the receipt-paid claims: a plan made
-/// from an older snapshot can never pay past either.
+/// Record a payment attempt before the payment goes out. `Begin::Exists`
+/// when an attempt for the same bounty and claim address already exists,
+/// from this process or another: the caller must not pay. With `limits`,
+/// the cap and the per-npub limit are counted inside the same lock from
+/// what the store holds NOW (every instance's attempts on this bounty that
+/// may have paid) plus the receipt-paid claims, so a plan made from an older
+/// snapshot can never pay past either. Read and write happen under the
+/// store's process lock, so two app instances cannot both win.
 pub fn begin_attempt_within(
     pubkey: &str,
     attempt: PayAttempt,
@@ -525,28 +520,6 @@ pub fn finish_attempt_for(
             .pay_attempts
             .iter_mut()
             .find(|a| a.bounty_id == bounty_id && a.claim_address == claim_address)
-            .ok_or_else(|| SecretError::Store("No payment attempt for that claim".into()))?;
-        attempt.state = state;
-        attempt.reason = reason;
-        attempt.updated_at = at;
-        Ok(())
-    })
-}
-
-/// Record how an attempt ended.
-pub fn finish_attempt(
-    pubkey: &str,
-    claim_address: &str,
-    state: AttemptState,
-    reason: Option<String>,
-    at: u64,
-) -> Result<(), SecretError> {
-    modify(|store| {
-        let account = account_mut(store, pubkey)?;
-        let attempt = account
-            .pay_attempts
-            .iter_mut()
-            .find(|a| a.claim_address == claim_address)
             .ok_or_else(|| SecretError::Store("No payment attempt for that claim".into()))?;
         attempt.state = state;
         attempt.reason = reason;
@@ -798,17 +771,25 @@ mod tests {
             started_at: 1,
             updated_at: 1,
         };
-        assert!(begin_attempt(&record.pubkey, attempt.clone()).unwrap());
+        assert_eq!(
+            begin_attempt_within(&record.pubkey, attempt.clone(), None).unwrap(),
+            Begin::Recorded
+        );
         // A replaced claim event is the same address: never a second attempt.
         let replaced = PayAttempt { claim_event_id: "e2".into(), ..attempt.clone() };
-        assert!(!begin_attempt(&record.pubkey, replaced).unwrap());
-        finish_attempt(&record.pubkey, "bob:item", AttemptState::Unknown, Some("x".into()), 5).unwrap();
+        assert_eq!(
+            begin_attempt_within(&record.pubkey, replaced, None).unwrap(),
+            Begin::Exists
+        );
+        finish_attempt_for(&record.pubkey, "b1", "bob:item", AttemptState::Unknown, Some("x".into()), 5)
+            .unwrap();
         let stored = pay_attempts(&record.pubkey).unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].state, AttemptState::Unknown);
         assert_eq!(stored[0].claim_event_id, "e1");
         assert_eq!(stored[0].updated_at, 5);
-        assert!(finish_attempt(&record.pubkey, "nobody:x", AttemptState::Paid, None, 6).is_err());
+        assert!(finish_attempt_for(&record.pubkey, "b1", "nobody:x", AttemptState::Paid, None, 6).is_err());
+        assert!(finish_attempt_for(&record.pubkey, "b2", "bob:item", AttemptState::Paid, None, 6).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

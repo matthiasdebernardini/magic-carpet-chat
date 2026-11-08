@@ -27,7 +27,7 @@ Magic Carpet Chat is a macOS desktop app, one window on gpui-kit, for a Nostr bo
 | Chat cell | One turn per conversation cell, 409 for a second POST. A finally block releases the cell on every ending the runtime can see; a 30 s stale clock covers the one it cannot, a client hangup. No auth: the tailnet is the perimeter. | worker/src/index.ts:12-14, 55-56, 130-134, 318-325 |
 | Packaging | Ship an unsigned .app with a READ ME FIRST for Gatekeeper rather than sign and notarize. | scripts/make-app.sh:8-17 |
 | Who pays | Any account issues. Bounties are created with the server's auto-pay off; the issuer's own app pays each qualifying claim from the issuer's own Coinos wallet as a zap whose request the issuer signs. The server pays only for allowlisted issuers and ranks every claimant by the house's scores, so claims, receipts, slot counts and the eligible list are read from the relay and the issuer's Treasure Map instead. | src/autopay.rs; src/nostr.rs autopay_tick, annotate, eligible |
-| Never twice | A payment attempt is written to accounts.json under a cross-process file lock before the payment goes out, keyed by the claim's stable address. An attempt is never retried; one whose outcome is unknown is shown, not repeated. | src/secrets.rs begin_attempt; src/nostr.rs pay_claim |
+| Never twice | A payment attempt is written to accounts.json under a cross-process file lock before the payment goes out, keyed by bounty and the claim's stable address, with the cap and per-npub limit re-counted under the lock. An attempt is never retried; one whose outcome is unknown is shown, not repeated. | src/secrets.rs begin_attempt_within; src/nostr.rs pay_claim |
 | Accessibility | Every control and every state a test reads is an AccessKit node with a stable kebab-case id (AXIdentifier on macOS, AccessibleId on AT-SPI), its role and its visible text as label. The e2e driver reads and presses the tree instead of screenshots. Rows are keyed by data (pubkey, bounty id, event id), not position, except chat bubbles, which only append; no secret reaches a label. | src/a11y.rs, docs/a11y-ids.md |
 
 ## Cost model
@@ -392,7 +392,7 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 2. **Read** — Server detail, relay claims and receipts, the issuer's attempts, the issuer's ranks of each claimant.
 3. **Decide** — autopay::plan, oldest claim first; re-planned after each claim.
 4. **Check** — lud16, wallet token, balance, zap invoice: a no is a note, retried next tick.
-5. **Record** — begin_attempt: sending, under the store lock; another instance's record wins.
+5. **Record** — begin_attempt_within: sending, under the store lock; another instance's record wins.
 6. **Pay** — POST /api/payments; paid, failed, or unknown (never retried).
 
 **Questions.**
