@@ -2699,19 +2699,11 @@ impl Shell {
                 false
             }
         };
-        let rank_text = value(F_RANK);
-        let min_rank = if rank_text.is_empty() {
-            None
-        } else {
-            match parse_sats(&rank_text) {
-                Some(rank) if rank >= 1 => Some(rank),
-                _ => {
-                    fail = fail.or(Some((
-                        "Minimum rank must be a whole number, 1 or more.",
-                        F_RANK,
-                    )));
-                    None
-                }
+        let min_rank = match parse_min_rank(&value(F_RANK)) {
+            Ok(rank) => rank,
+            Err(message) => {
+                fail = fail.or(Some((message, F_RANK)));
+                None
             }
         };
 
@@ -3668,11 +3660,24 @@ fn optimistic_bounty(id: &str, issuer: &str, req: CreateBounty, now: u64) -> Bou
         reward_per_item: Some(serde_json::Value::Bool(req.reward_per_item)),
         max_rewards_per_npub: req.max_rewards_per_npub,
         auto_pay: Some(serde_json::Value::Bool(false)),
-        auto_pay_min_rank: Some(req.auto_pay_min_rank.unwrap_or(2)),
+        auto_pay_min_rank: Some(req.auto_pay_min_rank.unwrap_or(2).max(2)),
         derived_status: Some("open".into()),
         payment_state: None,
         issuer_rank: None,
         app_auto_pay: req.auto_pay,
+    }
+}
+
+/// The minimum-rank field: empty is the default (2); otherwise a whole
+/// number no lower than the instance floor, the least rank the server lists
+/// a claim at, so the form, the issuer's payer and the card all agree.
+fn parse_min_rank(value: &str) -> Result<Option<u64>, &'static str> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    match parse_sats(value.trim()) {
+        Some(rank) if rank >= magic_carpet_chat::trust::INSTANCE_MIN_RANK => Ok(Some(rank)),
+        _ => Err("Minimum rank must be a whole number, 2 or more."),
     }
 }
 
@@ -3985,6 +3990,19 @@ mod tests {
             .map(|b| b.id)
             .collect();
         assert_eq!(ids, ["open-other", "done-mine"]);
+    }
+
+    #[test]
+    fn the_minimum_rank_is_never_below_2() {
+        assert_eq!(super::parse_min_rank(""), Ok(None));
+        assert_eq!(super::parse_min_rank(" 3 "), Ok(Some(3)));
+        assert_eq!(super::parse_min_rank("2"), Ok(Some(2)));
+        assert_eq!(
+            super::parse_min_rank("1"),
+            Err("Minimum rank must be a whole number, 2 or more.")
+        );
+        assert!(super::parse_min_rank("0").is_err());
+        assert!(super::parse_min_rank("two").is_err());
     }
 
     #[test]

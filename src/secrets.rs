@@ -397,14 +397,15 @@ fn account_mut<'a>(store: &'a mut Store, pubkey: &str) -> Result<&'a mut StoredA
         .ok_or_else(|| missing(pubkey))
 }
 
-/// Turn the account's own auto-pay on for a bounty it issued.
+/// Turn the account's own auto-pay on for a bounty it issued. The minimum
+/// rank is stored no lower than the instance floor (2).
 pub fn set_auto_pay(pubkey: &str, bounty_id: &str, min_rank: u64) -> Result<(), SecretError> {
     modify(|store| {
         let account = account_mut(store, pubkey)?;
         account.auto_pay.retain(|s| s.bounty_id != bounty_id);
         account.auto_pay.push(AutoPaySetting {
             bounty_id: bounty_id.to_string(),
-            min_rank,
+            min_rank: min_rank.max(crate::trust::INSTANCE_MIN_RANK),
         });
         Ok(())
     })
@@ -892,6 +893,23 @@ mod tests {
         release.join().unwrap();
         assert!(other_task_ms < 500, "the runtime stalled for {other_task_ms} ms");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stored_minimum_rank_is_never_below_the_floor() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-floor-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let keys = Keys::generate();
+        let me = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true)
+            .unwrap()
+            .pubkey;
+        set_auto_pay(&me, "b1", 1).unwrap();
+        set_auto_pay(&me, "b2", 0).unwrap();
+        set_auto_pay(&me, "b3", 4).unwrap();
+        let ranks: Vec<u64> = auto_pay_settings().unwrap().into_iter().map(|(_, s)| s.min_rank).collect();
+        assert_eq!(ranks, [2, 2, 4]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

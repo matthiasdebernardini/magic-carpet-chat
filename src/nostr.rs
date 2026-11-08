@@ -1238,7 +1238,11 @@ async fn create_bounty(
 ) -> Result<String, BridgeError> {
     let req = &CreateBounty {
         auto_pay: false,
-        auto_pay_min_rank: Some(req.auto_pay_min_rank.unwrap_or(trust::INSTANCE_MIN_RANK)),
+        auto_pay_min_rank: Some(
+            req.auto_pay_min_rank
+                .unwrap_or(trust::INSTANCE_MIN_RANK)
+                .max(trust::INSTANCE_MIN_RANK),
+        ),
         ..req.clone()
     };
     let session = session(sessions, pubkey).await?;
@@ -2459,7 +2463,7 @@ async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -
     // paying, so a claim on its bounty waits on that app.
     let min_rank = setting
         .as_ref()
-        .map(|s| s.min_rank)
+        .map(|s| s.min_rank.max(trust::INSTANCE_MIN_RANK))
         .unwrap_or_else(|| detail.bounty.claim_min_rank());
     let policy = Policy::of(&detail.bounty, setting.is_some() || !issuer_here, min_rank);
     let decisions: HashMap<String, Result<(), Hold>> =
