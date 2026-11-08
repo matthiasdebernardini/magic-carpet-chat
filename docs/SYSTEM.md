@@ -398,7 +398,7 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 **Questions.**
 
 - **Q-IP1** A claimant's app cannot know whether the issuer's app has auto-pay on, so another issuer's bounty reads "manual pay" there, and its claims say "Waiting for the issuer's app to pay it."
-- **Q-IP2** The server still ranks by the house's scores: it hides those claims from its own claim list and never marks the bounty fulfilled. The app counts slots itself.
+- **Q-IP2** The server still ranks by the house's scores and hides those claims from its own claim list. It also counts any issuer receipt on a claim for every bounty on that list, so it can mark an app-paid bounty fulfilled (raw status too) after another bounty's payment. For bounties the server does not pay, the app ignores the server's fulfilled and decides open or full from its own verified receipts and attempts (`app_may_be_open`, `apply_usage`); cancelled, expired or any other server status stays final.
 - **Q-IP3** A receipt that never arrives after a paid attempt reads paid_unreceipted after 120 s; the slot stays held.
 
 ### The instance and the money
@@ -869,7 +869,7 @@ Reference by ID. ✓ resolved (with date) · → routed to a named next step · 
 - **Q-IA1** (IA) list_bounties and get_bounty bypass the read() helper: a non-2xx gives 200 chars of raw body instead of the server's error field (api.rs:494-498).
 - ~~**Q-IA2**~~ (IA) ✓ The current server sends paymentClaimEventId and claimAddress on every claim; autoPayBlockedReason only when the daily limit blocks a payable claim. The 2026-08-07 fixture predates them (magic-carpet-v2/src/api/bounties.js:118-133, 206-207, verified 2026-09-10).
 - **Q-IP1** (IP) A claimant's app cannot know whether the issuer's app has auto-pay on, so another issuer's bounty reads "manual pay" there, and its claims say "Waiting for the issuer's app to pay it."
-- **Q-IP2** (IP) The server still ranks by the house's scores: it hides those claims from its own claim list and never marks the bounty fulfilled. The app counts slots itself.
+- **Q-IP2** (IP) The server still ranks by the house's scores and hides those claims from its own claim list. It also counts any issuer receipt on a claim for every bounty on that list, so it can mark an app-paid bounty fulfilled (raw status too) after another bounty's payment. For bounties the server does not pay, the app ignores the server's fulfilled and decides open or full from its own verified receipts and attempts (`app_may_be_open`, `apply_usage`); cancelled, expired or any other server status stays final.
 - **Q-IP3** (IP) A receipt that never arrives after a paid attempt reads paid_unreceipted after 120 s; the slot stays held.
 - ~~**Q-IN1**~~ (IN) ✓ The binary reads no .env: no dotenv crate, no read in src/. Overrides must be in the launching shell (Cargo.toml at HEAD, verified 2026-09-10).
 - **Q-RL1** (RL) The dot reflects this socket only; API reachability shows up separately as a failed list row.
