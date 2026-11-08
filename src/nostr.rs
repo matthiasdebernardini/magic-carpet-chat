@@ -4881,6 +4881,68 @@ mod tests {
     }
 
     #[test]
+    fn the_issuers_stored_minimum_holds_a_claimant_below_it_and_reaches_the_bounty() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("stored-minimum");
+        secrets::set_auto_pay(&issuer, "b1", 4).unwrap();
+        let store = secrets::load().unwrap();
+        let bob = Keys::generate();
+        let bob_hex = bob.public_key().to_hex();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        // The server stores 3 for a bounty it doesn't pay; the app's 4 rules.
+        let detail = parse_detail(
+            &serde_json::json!({
+                "success": true,
+                "bounty": { "id": "b1", "issuer_pubkey": issuer, "list_coordinate": COORD,
+                    "amount_sats": 100, "status": "open", "created_at": 100,
+                    "auto_pay": 0, "auto_pay_min_rank": 3 },
+                "claims": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // The list fold sets the minimum from the store.
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut list = vec![detail.bounty.clone()];
+            fold_relay_usage_with(&mut list, &store, |_, _| async { Some((Vec::new(), Vec::new())) })
+                .await;
+            assert_eq!(list[0].app_min_rank, Some(4));
+            assert_eq!(list[0].claim_min_rank(), 4);
+        });
+
+        // The detail: the issuer's own scores rank bob 3 (cached, so no
+        // network), below the stored 4. Held as rank too low; nothing paid.
+        let ctx = AutoPayCtx::default();
+        runtime.block_on(async {
+            ctx.cache
+                .lock()
+                .await
+                .ranks
+                .insert((issuer.clone(), bob_hex.clone()), (now_unix(), Some(3.0)));
+            let annotated = annotate_with(&ctx, detail, |_, _| {
+                let event = event.clone();
+                async move { Some((vec![event], Vec::new())) }
+            })
+            .await;
+            assert_eq!(annotated.detail.bounty.app_min_rank, Some(4));
+            let policy = annotated.policy.expect("the issuer's app decides");
+            assert_eq!(policy.min_rank, 4);
+            let plan = autopay::plan(&policy, &annotated.facts);
+            assert_eq!(plan.len(), 1);
+            assert_eq!(plan[0].1, Err(Hold::RankTooLow { rank: Some(3.0), min: 4 }));
+            assert_eq!(
+                annotated.detail.claims[0].unpaid_reason.as_deref(),
+                Some("Rank too low: the issuer's scores rank this account 3, and the bounty needs 4.")
+            );
+            assert!(annotated.detail.claims[0].auto_payment.is_none(), "no attempt");
+        });
+        assert!(secrets::pay_attempts(&issuer).unwrap().is_empty(), "nothing paid");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_stored_attempt_reads_like_a_server_payment_row() {
         let attempt = |state| secrets::PayAttempt {
             bounty_id: "b1".into(),
