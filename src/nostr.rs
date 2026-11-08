@@ -1854,7 +1854,10 @@ async fn eligible(client: &Client, ctx: &AutoPayCtx, viewer: &str) -> Result<Vec
         .list_all_bounties()
         .await?
         .into_iter()
-        .filter(|b| b.effective_status() == "open" && b.issuer_pubkey != viewer)
+        .filter(|b| {
+            b.issuer_pubkey != viewer
+                && (b.effective_status() == "open" || app_may_be_open(b, now_unix()))
+        })
         .collect();
     let store = secrets::load().unwrap_or_default();
     let facts = fold_relay_usage(client, &mut list, &store).await;
@@ -2292,10 +2295,28 @@ fn apply_usage(bounty: &mut Bounty, facts: &[ClaimFacts]) {
     state.remaining_reward_slots = slots.saturating_sub(held);
     state.open_reward_slots = slots.saturating_sub(held);
     state.fulfilled = slots > 0 && paid >= slots;
-    if state.fulfilled && bounty.effective_status() == "open" {
-        bounty.derived_status = Some("fulfilled".into());
+    // The app's own verdict replaces the server's open/fulfilled; anything
+    // else the server says (cancelled, expired) stands.
+    if app_may_be_open(bounty, now_unix()) {
+        let full = slots > 0 && held >= slots;
+        bounty.derived_status = Some(if full { "fulfilled" } else { "open" }.into());
     }
     bounty.payment_state = Some(state);
+}
+
+/// Whether the app decides this bounty's open-or-full itself: the server
+/// does not pay it, and the server's only objection is "fulfilled". The
+/// server counts any issuer receipt on a claim for every bounty on its list
+/// and marks a bounty fulfilled (raw status too), so for an app-paid bounty
+/// that word means nothing; the app counts its own verified receipts and
+/// attempts instead ([`apply_usage`]). Cancelled, expired (by the server or
+/// by its own expiration time) or any other status stays final.
+fn app_may_be_open(bounty: &Bounty, now: u64) -> bool {
+    let open_or_full = |status: &str| matches!(status, "open" | "fulfilled");
+    !bounty.server_auto_pay_on()
+        && open_or_full(bounty.effective_status())
+        && bounty.status.as_deref().is_none_or(open_or_full)
+        && bounty.expiration.is_none_or(|at| at >= now)
 }
 
 /// The store's attempts for `issuer`; empty when it is not stored here.
@@ -2332,7 +2353,8 @@ async fn fold_relay_usage(
     for bounty in bounties.iter_mut() {
         bounty.app_auto_pay = setting_of(store, bounty).is_some();
     }
-    let app_paid = |b: &Bounty| !b.server_auto_pay_on() && b.effective_status() == "open";
+    let now = now_unix();
+    let app_paid = |b: &Bounty| app_may_be_open(b, now);
     let mut coordinates: Vec<String> = bounties
         .iter()
         .filter(|b| app_paid(b))
@@ -2555,10 +2577,8 @@ async fn autopay_tick(client: &Client, ctx: &AutoPayCtx, updates: &mpsc::Unbound
         let Ok(detail) = api.get_bounty(&setting.bounty_id).await else {
             continue;
         };
-        if detail.bounty.issuer_pubkey != issuer
-            || detail.bounty.server_auto_pay_on()
-            || TERMINAL_STATUSES.contains(&detail.bounty.effective_status())
-        {
+        // `app_may_be_open` also rules out bounties the server pays.
+        if detail.bounty.issuer_pubkey != issuer || !app_may_be_open(&detail.bounty, now_unix()) {
             continue;
         }
         let annotated = annotate(ctx, client, detail).await;
@@ -4501,6 +4521,64 @@ mod tests {
         assert!(merged.auto_payment.is_none());
         let merged = merge_claim(None, &on_b1, &event, &receipts, &b1, &[], 300).unwrap();
         assert_eq!(merged.auto_payment.map(|r| r.state).as_deref(), Some("settled"));
+    }
+
+    #[test]
+    fn the_servers_fulfilled_from_another_bountys_receipt_does_not_close_an_app_paid_bounty() {
+        let issuer = Keys::generate();
+        let issuer_hex = issuer.public_key().to_hex();
+        // The server counted B1's receipt for B2 too, and wrote it down.
+        let fulfilled = serde_json::json!({
+            "id": "b2", "issuer_pubkey": issuer_hex,
+            "status": "fulfilled", "derivedStatus": "fulfilled",
+        });
+        let b2 = bounty_row(fulfilled.clone());
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let id = event.id.to_hex();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let paid_on_b1 =
+            events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, "b1", 100, &relays).unwrap();
+        let receipts = vec![receipt_around(&paid_on_b1, &id)];
+
+        assert!(app_may_be_open(&b2, 1_000), "the tick and the lists still look at B2");
+        let mut fact = facts_for(&b2, std::slice::from_ref(&event), &receipts, &[])
+            .into_iter()
+            .next()
+            .unwrap()
+            .0;
+        fact.rank = Some(5.0);
+        let mut counted = b2.clone();
+        apply_usage(&mut counted, std::slice::from_ref(&fact));
+        assert_eq!(counted.effective_status(), "open");
+        // Payable on B2, listed (open), and eligible for a viewer with no reward.
+        let policy = Policy::of(&counted, true, 2);
+        let plan: HashMap<String, Result<(), Hold>> =
+            autopay::plan(&policy, std::slice::from_ref(&fact)).into_iter().collect();
+        assert_eq!(plan[&fact.address], Ok(()));
+        let (slots, per_npub) = autopay::slots_and_limit(&counted);
+        assert!(autopay::open_for(slots, per_npub, std::slice::from_ref(&fact), "carol"));
+
+        // Once B2's own slot is held, the app calls it full.
+        let held = ClaimFacts { attempt: Some(AttemptState::Unknown), ..fact.clone() };
+        let mut full = b2.clone();
+        apply_usage(&mut full, std::slice::from_ref(&held));
+        assert_eq!(full.effective_status(), "fulfilled");
+
+        // Issuer-set or timed-out ends stay final; the server's own
+        // auto-pay bounties keep the server's word.
+        let with = |extra: serde_json::Value| {
+            let mut row = fulfilled.clone();
+            row.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            bounty_row(row)
+        };
+        assert!(!app_may_be_open(&with(serde_json::json!({"status": "cancelled"})), 1_000));
+        assert!(!app_may_be_open(&with(serde_json::json!({"derivedStatus": "expired"})), 1_000));
+        assert!(!app_may_be_open(&with(serde_json::json!({"expiration": 999})), 1_000));
+        assert!(!app_may_be_open(&with(serde_json::json!({"auto_pay": 1})), 1_000));
+        let mut cancelled = with(serde_json::json!({"status": "cancelled", "derivedStatus": "cancelled"}));
+        apply_usage(&mut cancelled, std::slice::from_ref(&fact));
+        assert_eq!(cancelled.effective_status(), "cancelled");
     }
 
     #[test]
