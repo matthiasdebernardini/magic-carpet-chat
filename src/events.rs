@@ -262,11 +262,12 @@ pub fn receipt_pays_claim_for(receipt: &Event, claim_event_id: &str, payer: &str
         && names(&request, "e", claim_event_id)
 }
 
-/// [`receipt_pays_claim_for`], and the zap request names this bounty
-/// (`["bounty", id]`), asks for exactly its reward (`amount`, msats) and,
-/// when it names a list (`a`), names this bounty's. A receipt without the
-/// bounty tag, or for another bounty, amount or list, does not pay this
-/// bounty's claim.
+/// [`receipt_pays_claim_for`], and the zap request asks for exactly the
+/// bounty's reward (`amount`, msats) and, when it names a list (`a`), names
+/// this bounty's. A request naming a bounty (`["bounty", id]`, this app's
+/// zaps) pays only that bounty. One with no bounty tag (a payment by hand
+/// from another client, older zaps) pays the claim on every bounty on its
+/// list: that can only make the app pay too little, never twice.
 pub fn receipt_pays_bounty_claim(
     receipt: &Event,
     claim_event_id: &str,
@@ -296,7 +297,7 @@ pub fn receipt_pays_bounty_claim(
         })
     };
     let msats = reward_sats.saturating_mul(1000).to_string();
-    first("bounty").as_deref() == Some(bounty_id)
+    first("bounty").is_none_or(|b| b == bounty_id)
         && first("amount").as_deref() == Some(msats.as_str())
         && first("a").is_none_or(|a| a == list_coordinate)
 }
@@ -580,7 +581,8 @@ mod tests {
         let for_b1 = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 100, &relays).unwrap();
         assert!(receipt_pays_bounty_claim(&receipt(&for_b1), "c1", &payer, COORD, "b1", 100));
         assert!(!receipt_pays_bounty_claim(&receipt(&for_b1), "c1", &payer, COORD, "b2", 100));
-        // A request with no bounty tag (the server's own shape) pays neither.
+        // A request with no bounty tag (a payment by hand from another
+        // client) pays the claim on every bounty on its list.
         let untagged = EventBuilder::new(Kind::Custom(ZAP_REQUEST_KIND), "")
             .tags([
                 tag(["p", "aa"]).unwrap(),
@@ -591,7 +593,11 @@ mod tests {
             .finalize(&issuer)
             .unwrap();
         assert!(receipt_pays_claim_for(&receipt(&untagged), "c1", &payer));
-        assert!(!receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, COORD, "b1", 100));
+        assert!(receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, COORD, "b1", 100));
+        assert!(receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, COORD, "b2", 100));
+        // Still only for the reward, and only on the list it names.
+        assert!(!receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, COORD, "b1", 99));
+        assert!(!receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, "39998:aa:other", "b1", 100));
     }
 
     #[test]

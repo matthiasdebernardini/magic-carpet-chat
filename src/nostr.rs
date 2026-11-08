@@ -2279,9 +2279,11 @@ fn orphan_attempts(
         .collect()
 }
 
-/// The bounty's counters and status from the client's own count: paid
-/// claims, slots held by attempts, slots left. A bounty every slot of which
-/// is paid reads fulfilled even while the server still calls it open.
+/// The counters and status of a bounty the server does not pay, from the
+/// app's own count: claims a verified receipt pays, slots held by
+/// attempts, slots left. It is full ("fulfilled") once paid claims and
+/// slot-holding attempts fill the cap, and open again if one frees,
+/// whatever the server says ([`app_may_be_open`]).
 fn apply_usage(bounty: &mut Bounty, facts: &[ClaimFacts]) {
     let (slots, per_npub) = autopay::slots_and_limit(bounty);
     let (held, _) = autopay::usage(facts);
@@ -2294,12 +2296,13 @@ fn apply_usage(bounty: &mut Bounty, facts: &[ClaimFacts]) {
     state.held_reward_count = held.saturating_sub(paid);
     state.remaining_reward_slots = slots.saturating_sub(held);
     state.open_reward_slots = slots.saturating_sub(held);
-    state.fulfilled = slots > 0 && paid >= slots;
-    // The app's own verdict replaces the server's open/fulfilled; anything
-    // else the server says (cancelled, expired) stands.
+    // One rule for both: full when paid claims and held slots fill the cap.
+    state.fulfilled = slots > 0 && held >= slots;
+    // The app's own verdict replaces the server's open/fulfilled; the
+    // server's expired stands.
     if app_may_be_open(bounty, now_unix()) {
-        let full = slots > 0 && held >= slots;
-        bounty.derived_status = Some(if full { "fulfilled" } else { "open" }.into());
+        bounty.derived_status =
+            Some(if state.fulfilled { "fulfilled" } else { "open" }.into());
     }
     bounty.payment_state = Some(state);
 }
@@ -2309,14 +2312,28 @@ fn apply_usage(bounty: &mut Bounty, facts: &[ClaimFacts]) {
 /// server counts any issuer receipt on a claim for every bounty on its list
 /// and marks a bounty fulfilled (raw status too), so for an app-paid bounty
 /// that word means nothing; the app counts its own verified receipts and
-/// attempts instead ([`apply_usage`]). Cancelled, expired (by the server or
-/// by its own expiration time) or any other status stays final.
+/// attempts instead ([`apply_usage`]). Expired (by the server or by its own
+/// expiration time) stays final.
+///
+/// Until the app has counted, the server's "fulfilled" is not passed on:
+/// [`forget_server_fulfilled`].
 fn app_may_be_open(bounty: &Bounty, now: u64) -> bool {
     let open_or_full = |status: &str| matches!(status, "open" | "fulfilled");
     !bounty.server_auto_pay_on()
         && open_or_full(bounty.effective_status())
         && bounty.status.as_deref().is_none_or(open_or_full)
         && bounty.expiration.is_none_or(|at| at >= now)
+}
+
+/// A bounty the app decides for itself, when the app could not count it
+/// (a failed relay or store read): read as open, never as the server's
+/// "fulfilled". Open is the safe side: it pays nothing by itself (nothing is
+/// decided without the count), and a bounty that reads open blocks a second
+/// one on its list.
+fn forget_server_fulfilled(bounty: &mut Bounty, now: u64) {
+    if app_may_be_open(bounty, now) {
+        bounty.derived_status = Some("open".into());
+    }
 }
 
 /// The store's attempts for `issuer`; empty when it is not stored here.
@@ -2341,10 +2358,11 @@ fn setting_of<'a>(store: &'a secrets::Store, bounty: &Bounty) -> Option<&'a secr
 }
 
 /// Fold the store and the relay into a list of bounties: `app_auto_pay` on
-/// every bounty with a setting here, and for each open bounty the server
-/// does not pay itself, the client's slot count ([`apply_usage`]). Returns
-/// those bounties' claim facts by bounty id; a failed relay read leaves the
-/// server's numbers and returns nothing.
+/// every bounty with a setting here, and for each bounty the app decides
+/// for itself ([`app_may_be_open`], the server's "fulfilled" included) the
+/// app's own count and status ([`apply_usage`]). Returns those bounties'
+/// claim facts by bounty id. A failed relay read returns nothing and leaves
+/// them open ([`forget_server_fulfilled`]), never the server's "fulfilled".
 async fn fold_relay_usage(
     client: &Client,
     bounties: &mut [Bounty],
@@ -2369,6 +2387,9 @@ async fn fold_relay_usage(
         .min()
         .unwrap_or(0);
     let Some((claims, receipts)) = relay_claims(client, &coordinates, since).await else {
+        for bounty in bounties.iter_mut() {
+            forget_server_fulfilled(bounty, now);
+        }
         return HashMap::new();
     };
     let mut out = HashMap::new();
@@ -2444,6 +2465,7 @@ async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -
                 claim.zap_receipt = None;
             }
         }
+        forget_server_fulfilled(&mut detail.bounty, now_unix());
         Annotated {
             detail,
             policy: None,
@@ -2944,9 +2966,12 @@ impl WatchLedger {
 /// open: the money already left the wallet and the receipt can still import
 /// late, and only the poll notices the server row flip to `settled` (or a
 /// `zapReceipt` appear). The watch stops only when the bounty itself can
-/// never pay again AND nothing is in flight.
+/// never pay again AND nothing is in flight. A bounty the app decides for
+/// itself ([`app_may_be_open`]) is never done: a freed slot reopens it.
 fn watch_done(detail: &BountyDetail, pending: bool) -> bool {
-    TERMINAL_STATUSES.contains(&detail.bounty.effective_status()) && !pending
+    TERMINAL_STATUSES.contains(&detail.bounty.effective_status())
+        && !pending
+        && !app_may_be_open(&detail.bounty, now_unix())
 }
 
 fn now_unix() -> u64 {
@@ -4574,20 +4599,136 @@ mod tests {
         apply_usage(&mut full, std::slice::from_ref(&held));
         assert_eq!(full.effective_status(), "fulfilled");
 
-        // Issuer-set or timed-out ends stay final; the server's own
-        // auto-pay bounties keep the server's word.
+        // Timed-out ends stay final; the server's own auto-pay bounties
+        // keep the server's word.
         let with = |extra: serde_json::Value| {
             let mut row = fulfilled.clone();
             row.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             bounty_row(row)
         };
-        assert!(!app_may_be_open(&with(serde_json::json!({"status": "cancelled"})), 1_000));
         assert!(!app_may_be_open(&with(serde_json::json!({"derivedStatus": "expired"})), 1_000));
         assert!(!app_may_be_open(&with(serde_json::json!({"expiration": 999})), 1_000));
         assert!(!app_may_be_open(&with(serde_json::json!({"auto_pay": 1})), 1_000));
-        let mut cancelled = with(serde_json::json!({"status": "cancelled", "derivedStatus": "cancelled"}));
-        apply_usage(&mut cancelled, std::slice::from_ref(&fact));
-        assert_eq!(cancelled.effective_status(), "cancelled");
+        let mut expired = with(serde_json::json!({"status": "expired", "derivedStatus": "expired"}));
+        apply_usage(&mut expired, std::slice::from_ref(&fact));
+        assert_eq!(expired.effective_status(), "expired");
+    }
+
+    /// A zap request with no bounty tag, the way another client pays by hand.
+    fn untagged_request(issuer: &Keys, claimant: &str, claim_id: &str, sats: u64) -> Event {
+        let tag = |parts: &[&str]| Tag::parse(parts.iter().map(|p| p.to_string()).collect::<Vec<_>>()).unwrap();
+        let msats = (sats * 1000).to_string();
+        EventBuilder::new(Kind::Custom(events::ZAP_REQUEST_KIND), "")
+            .tags([
+                tag(&["p", claimant]),
+                tag(&["e", claim_id]),
+                tag(&["a", COORD]),
+                tag(&["amount", msats.as_str()]),
+            ])
+            .finalize(issuer)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_untagged_payment_counts_on_every_bounty_on_its_list() {
+        let issuer = Keys::generate();
+        let issuer_hex = issuer.public_key().to_hex();
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let id = event.id.to_hex();
+        let by_hand = untagged_request(&issuer, &bob.public_key().to_hex(), &id, 100);
+        let receipts = vec![receipt_around(&by_hand, &id)];
+        let fact_on = |bounty: &Bounty| {
+            facts_for(bounty, std::slice::from_ref(&event), &receipts, &[])
+                .into_iter()
+                .next()
+                .unwrap()
+                .0
+        };
+
+        // A manual one-slot bounty paid by hand from another client is full.
+        let manual = bounty_row(serde_json::json!({ "id": "m1", "issuer_pubkey": issuer_hex }));
+        let fact = fact_on(&manual);
+        assert!(fact.paid);
+        let mut counted = manual.clone();
+        apply_usage(&mut counted, std::slice::from_ref(&fact));
+        assert_eq!(counted.effective_status(), "fulfilled");
+        assert!(counted.payment_state.as_ref().unwrap().fulfilled);
+
+        // The same untagged receipt counts on both bounties on the list.
+        for id in ["b1", "b2"] {
+            let bounty = bounty_row(serde_json::json!({ "id": id, "issuer_pubkey": issuer_hex }));
+            assert!(fact_on(&bounty).paid, "untagged receipt on {id}");
+        }
+        // For another reward it counts on neither.
+        let other_reward = bounty_row(serde_json::json!({ "id": "b3", "issuer_pubkey": issuer_hex, "amount_sats": 50 }));
+        assert!(!fact_on(&other_reward).paid);
+    }
+
+    #[test]
+    fn full_means_the_same_in_the_counters_and_the_status() {
+        let bounty = bounty_row(serde_json::json!({}));
+        let held = ClaimFacts {
+            address: "bob:1".into(),
+            event_id: "e1".into(),
+            claimant: "bob".into(),
+            created_at: 1,
+            paid: false,
+            attempt: Some(AttemptState::Unknown),
+            rank: None,
+        };
+        let mut counted = bounty.clone();
+        apply_usage(&mut counted, std::slice::from_ref(&held));
+        let state = counted.payment_state.as_ref().unwrap();
+        assert!(state.fulfilled, "an attempt that may have paid fills the one slot");
+        assert_eq!(counted.effective_status(), "fulfilled");
+        let freed = ClaimFacts { attempt: Some(AttemptState::Failed), ..held };
+        apply_usage(&mut counted, std::slice::from_ref(&freed));
+        assert!(!counted.payment_state.as_ref().unwrap().fulfilled);
+        assert_eq!(counted.effective_status(), "open", "a freed slot reopens it");
+    }
+
+    #[test]
+    fn the_servers_fulfilled_never_reaches_the_screen_for_a_bounty_the_app_decides() {
+        let _store = store_turn();
+        let dir = std::env::temp_dir().join(format!("mc-stale-fulfilled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("accounts.json"), "not json").unwrap();
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let detail = |auto_pay: u64| {
+            parse_detail(
+                &serde_json::json!({
+                    "success": true,
+                    "bounty": { "id": "b2", "issuer_pubkey": "aa", "list_coordinate": COORD,
+                        "amount_sats": 100, "status": "fulfilled", "derivedStatus": "fulfilled",
+                        "auto_pay": auto_pay },
+                    "claims": [],
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let ctx = AutoPayCtx::default();
+        runtime.block_on(async {
+            let client = Client::default();
+            // Nothing could be counted (unreadable store): the detail reads
+            // open, so the watch keeps going and the one-open-bounty-per-list
+            // guard still sees an open bounty on the list.
+            let annotated = annotate(&ctx, &client, detail(0)).await;
+            assert!(annotated.policy.is_none(), "and nothing is paid");
+            assert_eq!(annotated.detail.bounty.effective_status(), "open");
+            assert!(!watch_done(&annotated.detail, false));
+            // The server's own auto-pay bounties keep the server's word.
+            let server_paid = annotate(&ctx, &client, detail(1)).await;
+            assert_eq!(server_paid.detail.bounty.effective_status(), "fulfilled");
+            assert!(watch_done(&server_paid.detail, false));
+        });
+        let mut listed = detail(0).bounty;
+        forget_server_fulfilled(&mut listed, 1_000);
+        assert_eq!(listed.effective_status(), "open", "a failed list count reads open too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
