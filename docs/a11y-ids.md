@@ -215,7 +215,7 @@ The map row's kind changes with the verdict, so match the prefix
 | `bounty-detail-status`, `bounty-detail-paymode`, `bounty-detail-qualify` | Label | the pills | |
 | `bounty-detail-criteria` | Label | criteria | |
 | `bounty-detail-reward`, `bounty-detail-cap` | Label | N sats (/ item) | |
-| `bounty-detail-min-rank` | Label | the rank | |
+| `bounty-detail-min-rank` | Label | the rank | the server's on a bounty the server pays; otherwise the issuer's own setting in the issuer's app, and 2 in any other app (the server's value means nothing there) |
 | `bounty-detail-slots` | Label | x paid · y open | |
 | `bounty-detail-new-on-list` | Button | New bounty on this list | |
 | `bounty-detail-claims-heading` | Heading | Claims | |
