@@ -4346,7 +4346,14 @@ mod tests {
         assert_eq!(created_bounty(&twice, "aa", &req, sent_at), Err(()));
     }
 
-    /// A store in its own temp dir, with one generated account.
+    /// The store lock every store-pointing test holds (see
+    /// [`secrets::STORE_DIR`]).
+    fn store_turn() -> std::sync::MutexGuard<'static, ()> {
+        secrets::STORE_DIR.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A store in its own temp dir, with one generated account. The caller
+    /// holds [`store_turn`] for as long as it uses the store.
     fn temp_store(name: &str) -> (std::path::PathBuf, String) {
         let dir = std::env::temp_dir().join(format!("mc-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4374,6 +4381,7 @@ mod tests {
 
     #[test]
     fn a_refused_recheck_signs_nothing_and_a_failed_invoice_frees_the_claim() {
+        let _store = store_turn();
         let (dir, me) = temp_store("record-first");
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let ctx = AutoPayCtx::default();
@@ -4441,6 +4449,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_store_still_hides_the_servers_unverified_receipt() {
+        let _store = store_turn();
         let dir = std::env::temp_dir().join(format!("mc-unreadable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

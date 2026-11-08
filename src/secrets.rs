@@ -628,14 +628,15 @@ pub fn import_from_env() -> Result<Vec<String>, SecretError> {
     Ok(npubs)
 }
 
+/// `MC_STORE_DIR` is process-wide. nextest gives each test its own
+/// process, but `cargo test` (CI) runs them as threads of one, so every
+/// test that points it somewhere, in any module, takes turns on this.
+#[cfg(test)]
+pub(crate) static STORE_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `MC_STORE_DIR` is process-wide. nextest gives each test its own
-    /// process, but `cargo test` (CI) runs them as threads of one, so the
-    /// store tests take turns.
-    static STORE_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn secret_never_prints_its_value() {
