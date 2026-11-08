@@ -2192,6 +2192,26 @@ fn merge_claim(
             now,
         ));
     }
+    // Without the issuer's attempt (the claimant's app, anyone else's), a
+    // verified receipt is the whole story: the same "settled" row the
+    // issuer's app shows. No start time, so no "attempted" beat is invented.
+    if claim.auto_payment.is_none()
+        && let Some(receipt) = claim.zap_receipt.as_ref()
+    {
+        claim.auto_payment = Some(AutoPaymentRow {
+            id: fact.address.clone(),
+            claim_event_id: fact.event_id.clone(),
+            bounty_id: bounty.id.clone(),
+            issuer_pubkey: Some(bounty.issuer_pubkey.clone()),
+            claimant_pubkey: Some(fact.claimant.clone()),
+            claim_address: Some(fact.address.clone()),
+            amount_sats: Some(bounty.amount_sats),
+            state: "settled".into(),
+            reason: None,
+            created_at: None,
+            updated_at: receipt.created_at,
+        });
+    }
     Some(claim)
 }
 
@@ -2393,10 +2413,19 @@ struct Annotated {
 /// unpaid claim's reason in plain words. The server's own auto-pay bounties
 /// come back as the server sent them.
 async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -> Annotated {
-    let unchanged = |detail| Annotated {
-        detail,
-        policy: None,
-        facts: Vec::new(),
+    // Even when nothing can be read, a receipt the server attached to a
+    // bounty it does not pay is unverified: it never shows as paid.
+    let unchanged = |mut detail: BountyDetail| {
+        if !detail.bounty.server_auto_pay_on() {
+            for claim in &mut detail.claims {
+                claim.zap_receipt = None;
+            }
+        }
+        Annotated {
+            detail,
+            policy: None,
+            facts: Vec::new(),
+        }
     };
     // An unreadable store is not "no attempts": without the attempts there
     // is no knowing what was paid, so nothing is decided (and nothing paid).
@@ -4355,6 +4384,73 @@ mod tests {
             let paid = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, invoice(Ok("lnbc".into()))).await;
             assert_eq!(paid, Ok("lnbc".to_string()));
             assert_eq!(signed.load(Ordering::SeqCst), 2);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_claimants_app_reads_a_verified_receipt_as_settled() {
+        let issuer = Keys::generate();
+        let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": issuer.public_key().to_hex() }));
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let id = event.id.to_hex();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let request = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, 100, &relays).unwrap();
+        let receipts = vec![receipt_around(&request, &id)];
+        let (fact, _) = facts_for(&bounty, std::slice::from_ref(&event), &receipts, &[])
+            .into_iter()
+            .next()
+            .unwrap();
+        // No attempts: this is not the issuer's app.
+        let merged = merge_claim(None, &fact, &event, &receipts, &bounty, &[], 300).unwrap();
+        let row = merged.auto_payment.expect("a payment row for the card");
+        assert_eq!(row.state, "settled");
+        assert_eq!(row.created_at, None, "no invented attempt time");
+        assert!(!row.is_pending());
+        // Unpaid, nothing is made up.
+        let (fact, _) = facts_for(&bounty, std::slice::from_ref(&event), &[], &[])
+            .into_iter()
+            .next()
+            .unwrap();
+        let unpaid = merge_claim(None, &fact, &event, &[], &bounty, &[], 300).unwrap();
+        assert!(unpaid.auto_payment.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_store_still_hides_the_servers_unverified_receipt() {
+        let dir = std::env::temp_dir().join(format!("mc-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("accounts.json"), "not json").unwrap();
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let claim: serde_json::Value = serde_json::json!({
+            "event": { "id": "c1", "pubkey": "bb", "kind": 39999, "created_at": 200, "tags": [], "content": "x" },
+            "zapReceipt": { "id": "r1", "pubkey": "zz", "kind": 9735, "created_at": 300,
+                "tags": [["e", "c1"], ["description", "{\"pubkey\":\"aa\"}"]], "content": "" },
+        });
+        let detail = |auto_pay: u64, claim: &serde_json::Value| {
+            parse_detail(
+                &serde_json::json!({
+                    "success": true,
+                    "bounty": { "id": "b1", "issuer_pubkey": "aa", "list_coordinate": COORD,
+                        "amount_sats": 100, "status": "open", "auto_pay": auto_pay },
+                    "claims": [claim],
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let ctx = AutoPayCtx::default();
+        runtime.block_on(async {
+            let client = Client::default();
+            let app_paid = annotate(&ctx, &client, detail(0, &claim)).await;
+            assert!(app_paid.policy.is_none(), "nothing decided without the store");
+            assert!(app_paid.detail.claims[0].zap_receipt.is_none());
+            // The server's own auto-pay bounties keep what the server says.
+            let server_paid = annotate(&ctx, &client, detail(1, &claim)).await;
+            assert!(server_paid.detail.claims[0].zap_receipt.is_some());
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
