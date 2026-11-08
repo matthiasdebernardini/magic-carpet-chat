@@ -257,6 +257,42 @@ pub fn receipt_pays_claim_for(receipt: &Event, claim_event_id: &str, payer: &str
         && names(&request, "e", claim_event_id)
 }
 
+/// [`receipt_pays_claim_for`], and the zap request asks for exactly the
+/// bounty's reward (`amount`, msats) and, when it names a list (`a`), names
+/// this bounty's. A receipt for another amount or another list does not pay
+/// this bounty's claim.
+pub fn receipt_pays_bounty_claim(
+    receipt: &Event,
+    claim_event_id: &str,
+    payer: &str,
+    list_coordinate: &str,
+    reward_sats: u64,
+) -> bool {
+    if !receipt_pays_claim_for(receipt, claim_event_id, payer) {
+        return false;
+    }
+    let Some(request) = receipt.tags.iter().find_map(|t| {
+        let t = t.as_slice();
+        (t.first().map(String::as_str) == Some("description"))
+            .then(|| t.get(1))
+            .flatten()
+            .and_then(|d| serde_json::from_str::<Event>(d).ok())
+    }) else {
+        return false;
+    };
+    let first = |name: &str| {
+        request.tags.iter().find_map(|t| {
+            let t = t.as_slice();
+            (t.first().map(String::as_str) == Some(name))
+                .then(|| t.get(1).cloned())
+                .flatten()
+        })
+    };
+    let msats = reward_sats.saturating_mul(1000).to_string();
+    first("amount").as_deref() == Some(msats.as_str())
+        && first("a").is_none_or(|a| a == list_coordinate)
+}
+
 /// Parse a live relay event as a receipt. `None` when it is not kind-9735.
 pub fn parse_receipt(event: &Event) -> Option<Receipt> {
     let tags: Vec<Vec<String>> = event.tags.iter().map(|t| t.as_slice().to_vec()).collect();
@@ -491,6 +527,30 @@ mod tests {
         forged["content"] = "x".into();
         let forged: Event = serde_json::from_value(forged).unwrap();
         assert!(!receipt_pays_claim_for(&receipt(&forged, "c1"), "c1", &payer));
+    }
+
+    #[test]
+    fn a_receipt_pays_a_bounty_claim_only_for_its_reward_and_list() {
+        let issuer = Keys::generate();
+        let zapper = Keys::generate();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let receipt = |request: &Event| -> Event {
+            EventBuilder::new(Kind::Custom(RECEIPT_KIND), "")
+                .tags([
+                    tag(["e", "c1"]).unwrap(),
+                    tag(["description", serde_json::to_string(request).unwrap().as_str()]).unwrap(),
+                ])
+                .finalize(&zapper)
+                .unwrap()
+        };
+        let payer = issuer.public_key().to_hex();
+        let right = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, 100, &relays).unwrap();
+        assert!(receipt_pays_bounty_claim(&receipt(&right), "c1", &payer, COORD, 100));
+        // One sat short, or a zap aimed at another list, pays nothing here.
+        let short = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, 99, &relays).unwrap();
+        assert!(!receipt_pays_bounty_claim(&receipt(&short), "c1", &payer, COORD, 100));
+        let other = zap_request(&issuer, &"aa".repeat(32), "c1", "39998:aa:other", 100, &relays).unwrap();
+        assert!(!receipt_pays_bounty_claim(&receipt(&other), "c1", &payer, COORD, 100));
     }
 
     #[test]
