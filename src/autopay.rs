@@ -63,7 +63,7 @@ pub struct Policy {
 pub fn slots_and_limit(bounty: &Bounty) -> (u64, Option<u64>) {
     let amount = bounty.amount_sats;
     let cap = bounty.bounty_cap_sats.filter(|c| *c > 0).unwrap_or(amount);
-    let slots = if amount > 0 { (cap / amount).max(1) } else { 0 };
+    let slots = cap.checked_div(amount).map_or(0, |n| n.max(1));
     let per_npub = if bounty.reward_per_item_on() {
         bounty.max_rewards_per_npub.filter(|n| *n > 0)
     } else {

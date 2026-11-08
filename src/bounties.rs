@@ -1,7 +1,7 @@
 //! The Bounties screen: the issuer's live bounty list beside a detail pane
 //! with per-claim payment timelines, plus the two forms that drive the demo —
-//! the issuer's "New DList + bounty" and the claim (everyone else's, and the
-//! issuer's own from the Eligible tab).
+//! any account's "New DList + bounty" and the claim (from the Eligible tab,
+//! never on the account's own bounty).
 //!
 //! Everything renders from `Shell` state fed by the nostr runtime. The whole
 //! screen is keyboard-reachable: ↑/↓ select, ⌘N opens the form for whichever
@@ -511,12 +511,20 @@ fn claim_card(claim: &Claim) -> AnyElement {
             };
             rows.push(timeline_row(format!("{cid}-payment"), dot, text, meta));
         }
+        // A claim this app gave a reason for has no server row to wait on.
+        None if claim.unpaid_reason.is_some() => {}
         None => rows.push(timeline_row(
             format!("{cid}-payment"),
             TEXT_DIM,
             "No auto-payment row yet".into(),
             None,
         )),
+    }
+
+    if claim.zap_receipt.is_none()
+        && let Some(reason) = claim.unpaid_reason.clone()
+    {
+        rows.push(timeline_row(format!("{cid}-unpaid-reason"), AMBER, reason, None));
     }
 
     if let Some(receipt) = claim.receipt() {
@@ -669,14 +677,12 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .a11y(
                     "claim-list-empty",
                     Role::Label,
-                    "No claims to show. Claims from accounts the issuer's score provider ranks below 2, or not at all, are hidden.",
+                    "No claims yet.",
                 )
                 .py(px(8.))
                 .text_size(px(12.))
                 .text_color(rgb(TEXT_DIM))
-                .child(
-                    "No claims to show. Claims from accounts the issuer's score provider ranks below 2, or not at all, are hidden.",
-                )
+                .child("No claims yet.")
                 .into_any_element(),
         ],
         Some(detail) => detail.claims.iter().map(claim_card).collect(),
@@ -872,13 +878,14 @@ fn labeled_input(id: &'static str, label: &'static str, input: AnyElement) -> An
 
 /// Accessibility ids of the new-bounty form's fields, parallel to
 /// `BOUNTY_FIELD_DEFS`.
-const BOUNTY_FIELD_IDS: [&str; 7] = [
+const BOUNTY_FIELD_IDS: [&str; 8] = [
     "bounty-form-item-singular",
     "bounty-form-item-plural",
     "bounty-form-description",
     "bounty-form-criteria",
     "bounty-form-amount",
     "bounty-form-cap",
+    "bounty-form-auto-pay",
     "bounty-form-min-rank",
 ];
 
@@ -942,9 +949,9 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
                 form.submitting.then_some("Publishing…")
             },
             if form.existing_list.is_some() {
-                "Enter moves to the next field. Enter on the last field creates the auto-pay bounty, which commits sats. esc cancels."
+                "Enter moves to the next field. Enter on the last field creates the bounty. With auto-pay on, this app pays qualifying claims from your Coinos wallet while it runs. esc cancels."
             } else {
-                "Enter moves to the next field. Enter on the last field publishes the list and creates the auto-pay bounty, which commits sats. esc cancels."
+                "Enter moves to the next field. Enter on the last field publishes the list and creates the bounty. With auto-pay on, this app pays qualifying claims from your Coinos wallet while it runs. esc cancels."
             },
             cx,
         ));
@@ -1005,7 +1012,7 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
 
 pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
     let claim = opens_claim(
-        shell.is_active_issuer(),
+        shell.can_issue(),
         Screen::Bounties,
         shell.bounty_tab,
         shell.bounty_form.is_some(),

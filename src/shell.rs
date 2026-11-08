@@ -478,12 +478,12 @@ pub(crate) fn short_id(id: &str) -> String {
     id.chars().take(8).collect::<String>() + "…"
 }
 
-/// The instance hides claims from keys it ranks below 2, so a new key's claim
-/// is on the relay but invisible in the list. Shown in the claim form and in
-/// the published-claim details.
-pub(crate) const RANK_NOTE: &str = "This server only shows claims from accounts the issuer's score provider \
-    ranks 2 or higher. Rank is a trust score. A new account has no rank yet, so a \
-    sent claim may not show.";
+/// Auto-pay goes by the issuer's own scores, so a new key waits until the
+/// issuer's network ranks it. Shown in the claim form and in the
+/// published-claim details.
+pub(crate) const RANK_NOTE: &str = "Auto-pay needs the issuer's own trust scores to rank you at the \
+    bounty's minimum or higher. Rank is a trust score. A new account has no rank until the \
+    issuer follows it, or someone the issuer trusts does, and the issuer recalculates.";
 
 /// The toast for a just-published claim: one short line, and the full text
 /// behind a click when there is more to say.
@@ -552,13 +552,14 @@ pub(crate) struct ActivityItem {
 // -------------------------------------------------------------------- forms
 
 /// Label, placeholder, prefilled default — in Enter-advance order.
-pub(crate) const BOUNTY_FIELD_DEFS: [(&str, &str, &str); 7] = [
+pub(crate) const BOUNTY_FIELD_DEFS: [(&str, &str, &str); 8] = [
     ("Item (singular)", "US City", ""),
     ("Items (plural)", "US Cities", ""),
     ("List description", "optional", ""),
     ("Bounty criteria", "What earns the reward", ""),
     ("Reward per item (sats)", "", "100"),
     ("Bounty cap (sats)", "", "400"),
+    ("Auto-pay (on or off)", "on", "on"),
     ("Auto-pay minimum rank", "", "2"),
 ];
 
@@ -568,9 +569,28 @@ const F_DESCRIPTION: usize = 2;
 pub(crate) const F_CRITERIA: usize = 3;
 const F_AMOUNT: usize = 4;
 const F_CAP: usize = 5;
-const F_RANK: usize = 6;
+const F_AUTO_PAY: usize = 6;
+const F_RANK: usize = 7;
 
-/// The issuer's "New DList + bounty" form. Enter advances through the fields
+/// The auto-pay field: `on`/`off` (or yes/no), any case. `None` for
+/// anything else.
+fn parse_on_off(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "yes" | "y" | "true" => Some(true),
+        "off" | "no" | "n" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// The bounties the list shows: every issuer's open ones, plus all of the
+/// stored accounts' own, whatever their status.
+fn listed_bounties(list: Vec<Bounty>, stored: &[String]) -> Vec<Bounty> {
+    list.into_iter()
+        .filter(|b| b.effective_status() == "open" || stored.contains(&b.issuer_pubkey))
+        .collect()
+}
+
+/// Any account's "New DList + bounty" form. Enter advances through the fields
 /// and submits from the last one; the flow it starts is
 /// PublishDList → DListPublished → CreateBounty → BountyCreated.
 /// Opened from the detail pane's "New bounty on this list" it is the
@@ -1067,10 +1087,10 @@ impl Shell {
             .chain(self.details.values().map(|d| &d.bounty))
     }
 
-    /// The active account IS the issuer: ⌘N opens the bounty form, except
-    /// on the Bounties screen's Eligible tab ([`opens_claim`]).
-    pub(crate) fn is_active_issuer(&self) -> bool {
-        self.active.as_deref().is_some_and(nostr::is_issuer)
+    /// Every account may issue: with one active, ⌘N opens the bounty form,
+    /// except on the Bounties screen's Eligible tab ([`opens_claim`]).
+    pub(crate) fn can_issue(&self) -> bool {
+        self.active.is_some()
     }
 
     /// The feed's name for an account: profile name, else short npub.
@@ -1523,6 +1543,8 @@ impl Shell {
                 }
             }
             Update::Bounties { list, .. } => {
+                let stored: Vec<String> = self.views.iter().map(|(p, _)| p.clone()).collect();
+                let list = listed_bounties(list, &stored);
                 if let Some(first) =
                     house_reply_pick(self.bounty_tab, self.selected.as_deref(), &list)
                 {
@@ -1613,7 +1635,8 @@ impl Shell {
                 // watch's first snapshot (or the refreshed list) replaces them.
                 if let Some(req) = self.submitted_bounty.take() {
                     on_list_created(&mut self.unknown_create, &req.list_coordinate);
-                    self.optimistic = Some(optimistic_bounty(&id, req, now));
+                    let issuer = self.active.clone().unwrap_or_default();
+                    self.optimistic = Some(optimistic_bounty(&id, &issuer, req, now));
                 }
                 self.scroll_to = Some(id.clone());
                 let _ = self.commands.unbounded_send(Command::WatchBounty { id });
@@ -2426,7 +2449,7 @@ impl Shell {
             return;
         }
         let claim = opens_claim(
-            self.is_active_issuer(),
+            self.can_issue(),
             self.screen,
             self.bounty_tab,
             self.bounty_form.is_some(),
@@ -2669,6 +2692,13 @@ impl Shell {
                     F_CAP,
                 )));
             }
+        let auto_pay = match parse_on_off(&value(F_AUTO_PAY)) {
+            Some(on) => on,
+            None => {
+                fail = fail.or(Some(("Auto-pay must be on or off.", F_AUTO_PAY)));
+                false
+            }
+        };
         let rank_text = value(F_RANK);
         let min_rank = if rank_text.is_empty() {
             None
@@ -2745,11 +2775,12 @@ impl Shell {
             amount_sats: amount.unwrap_or(0),
             criteria,
             bounty_cap_sats: cap,
-            // The rehearsed demo shape: per-item rewards, one per npub,
-            // auto-pay armed behind the rank gate.
+            // The rehearsed demo shape: per-item rewards, one per npub. The
+            // runtime keeps the server's auto-pay off and turns this into
+            // this app's own auto-pay setting.
             reward_per_item: true,
             max_rewards_per_npub: Some(1),
-            auto_pay: true,
+            auto_pay,
             auto_pay_min_rank: min_rank,
         };
         if let Some(list_coordinate) = existing_list {
@@ -2813,6 +2844,16 @@ impl Shell {
         let Some(bounty) = self.selected_bounty() else {
             return;
         };
+        // Nobody claims their own bounty: the issuer's own claim is never paid.
+        if self.active.as_deref() == Some(bounty.issuer_pubkey.as_str()) {
+            self.push_activity(
+                AMBER,
+                "That is your own bounty. Switch to another account to claim it.".into(),
+                timefmt::now_unix(),
+            );
+            cx.notify();
+            return;
+        }
         let bounty_id = bounty.id.clone();
         let coordinate = bounty.list_coordinate.clone();
 
@@ -3611,10 +3652,12 @@ fn copy_secret(secret: Secret, cx: &mut Context<Shell>) {
 /// sent, so the detail pane renders them instantly. Server data replaces it
 /// as soon as the first list/detail arrives — this is a stopgap for the
 /// seconds in between, never a source of record.
-fn optimistic_bounty(id: &str, req: CreateBounty, now: u64) -> Bounty {
+/// The just-created bounty as the server will hold it: auto-pay off on the
+/// server, on in this app when the form asked for it.
+fn optimistic_bounty(id: &str, issuer: &str, req: CreateBounty, now: u64) -> Bounty {
     Bounty {
         id: id.to_string(),
-        issuer_pubkey: nostr::issuer_pubkey(),
+        issuer_pubkey: issuer.to_string(),
         list_coordinate: req.list_coordinate,
         amount_sats: req.amount_sats,
         criteria: Some(req.criteria).filter(|c| !c.is_empty()),
@@ -3624,11 +3667,12 @@ fn optimistic_bounty(id: &str, req: CreateBounty, now: u64) -> Bounty {
         bounty_cap_sats: req.bounty_cap_sats,
         reward_per_item: Some(serde_json::Value::Bool(req.reward_per_item)),
         max_rewards_per_npub: req.max_rewards_per_npub,
-        auto_pay: Some(serde_json::Value::Bool(req.auto_pay)),
-        auto_pay_min_rank: req.auto_pay_min_rank,
+        auto_pay: Some(serde_json::Value::Bool(false)),
+        auto_pay_min_rank: Some(req.auto_pay_min_rank.unwrap_or(2)),
         derived_status: Some("open".into()),
         payment_state: None,
         issuer_rank: None,
+        app_auto_pay: req.auto_pay,
     }
 }
 
@@ -3917,6 +3961,40 @@ mod tests {
         assert_eq!(found("zz"), None);
         let loading = Load::Loading;
         assert!(find_bounty(&details, [&house, &loading], None, "e").is_none());
+    }
+
+    #[test]
+    fn the_list_shows_open_bounties_and_the_stored_accounts_own() {
+        let row = |id: &str, issuer: &str, status: &str| -> Bounty {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "issuer_pubkey": issuer,
+                "list_coordinate": "39998:aa:us-city",
+                "amount_sats": 100,
+                "status": status,
+            }))
+            .unwrap()
+        };
+        let list = vec![
+            row("open-other", "bb", "open"),
+            row("done-other", "bb", "fulfilled"),
+            row("done-mine", "me", "fulfilled"),
+        ];
+        let ids: Vec<String> = super::listed_bounties(list, &["me".to_string()])
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, ["open-other", "done-mine"]);
+    }
+
+    #[test]
+    fn the_auto_pay_field_reads_on_or_off() {
+        assert_eq!(super::parse_on_off(" On "), Some(true));
+        assert_eq!(super::parse_on_off("yes"), Some(true));
+        assert_eq!(super::parse_on_off("OFF"), Some(false));
+        assert_eq!(super::parse_on_off("no"), Some(false));
+        assert_eq!(super::parse_on_off("maybe"), None);
+        assert_eq!(super::parse_on_off(""), None);
     }
 
     #[test]

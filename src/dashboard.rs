@@ -578,7 +578,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
             .collect()
     };
 
-    let action_label = if shell.is_active_issuer() {
+    let action_label = if shell.can_issue() {
         "+ New DList + bounty"
     } else {
         "+ Submit a bounty claim"
