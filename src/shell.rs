@@ -614,14 +614,20 @@ pub(crate) struct BountyForm {
 /// `Shell::known_bounties`): the list may not have caught up.
 fn list_has_open_bounty<'a>(known: impl IntoIterator<Item = &'a Bounty>, coordinate: &str) -> bool {
     let known: Vec<&Bounty> = known.into_iter().collect();
-    // Terminal is final, so it beats a stale "open" copy of the same id
-    // (details are never pruned).
+    // A final status beats a stale "open" copy of the same id (details are
+    // never pruned). On a bounty the server doesn't pay, "fulfilled" is the
+    // app's own count and reopens when a slot frees; which copy is fresher
+    // is not known, so there any open copy counts and the guard errs toward
+    // blocking a second bounty.
+    let is_final = |t: &Bounty| {
+        let status = t.effective_status();
+        nostr::TERMINAL_STATUSES.contains(&status)
+            && (t.server_auto_pay_on() || status != "fulfilled")
+    };
     known.iter().any(|b| {
         b.list_coordinate == coordinate
             && b.effective_status() == "open"
-            && !known
-                .iter()
-                .any(|t| t.id == b.id && nostr::TERMINAL_STATUSES.contains(&t.effective_status()))
+            && !known.iter().any(|t| t.id == b.id && is_final(t))
     })
 }
 
@@ -4043,13 +4049,28 @@ mod tests {
         other_list.list_coordinate = "39998:aa:other".into();
         assert!(!list_has_open_bounty([&done, &other_list], coord));
         assert!(list_has_open_bounty([&done, &open], coord));
-        // The same id, open in a stale detail and fulfilled in the list.
+        // The same id, open in one copy and finished in another.
         let mut stale = open.clone();
         stale.id = "old".into();
+        // The server pays it: its fulfilled is final and beats the open copy.
+        stale.auto_pay = Some(serde_json::json!(1));
         let mut settled = stale.clone();
         settled.status = Some("fulfilled".into());
         assert!(!list_has_open_bounty([&settled, &stale], coord));
         assert!(!list_has_open_bounty([&stale, &settled], coord));
+        // The app decides it (server auto-pay off): fulfilled can reopen, so
+        // with no telling which copy is fresher, an open copy blocks a
+        // second bounty whichever way round they come.
+        let mut app_open = stale.clone();
+        app_open.auto_pay = None;
+        let mut app_full = app_open.clone();
+        app_full.status = Some("fulfilled".into());
+        assert!(list_has_open_bounty([&app_full, &app_open], coord));
+        assert!(list_has_open_bounty([&app_open, &app_full], coord));
+        // Expired stays final for both.
+        let mut app_expired = app_open.clone();
+        app_expired.status = Some("expired".into());
+        assert!(!list_has_open_bounty([&app_expired, &app_open], coord));
     }
 
     #[test]
