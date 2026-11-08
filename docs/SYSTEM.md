@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the map.** The interactive atlas is built from the same data. It describes commit 3bf9877; the working tree holds an uncommitted refactor (see NA)._
 
-_Question status: **54 open · 2 routed · 5 resolved**._
+_Question status: **56 open · 2 routed · 6 resolved**._
 
 ## One paragraph
 
@@ -26,6 +26,8 @@ Magic Carpet Chat is a macOS desktop app, one window on gpui-kit, for a Nostr bo
 | Chat backend | The desktop chat calls api.anthropic.com directly. The worker exists for clients that should not hold a key and is not called from src/. | src/chat.rs:29, worker/README.md:4-6 |
 | Chat cell | One turn per conversation cell, 409 for a second POST. A finally block releases the cell on every ending the runtime can see; a 30 s stale clock covers the one it cannot, a client hangup. No auth: the tailnet is the perimeter. | worker/src/index.ts:12-14, 55-56, 130-134, 318-325 |
 | Packaging | Ship an unsigned .app with a READ ME FIRST for Gatekeeper rather than sign and notarize. | scripts/make-app.sh:8-17 |
+| Who pays | Any account issues. Bounties are created with the server's auto-pay off; the issuer's own app pays each qualifying claim from the issuer's own Coinos wallet as a zap whose request the issuer signs. The server pays only for allowlisted issuers and ranks every claimant by the house's scores, so claims, receipts, slot counts and the eligible list are read from the relay and the issuer's Treasure Map instead. | src/autopay.rs; src/nostr.rs autopay_tick, annotate, eligible |
+| Never twice | A payment attempt is written to accounts.json under a cross-process file lock before the payment goes out, keyed by the claim's stable address. An attempt is never retried; one whose outcome is unknown is shown, not repeated. | src/secrets.rs begin_attempt; src/nostr.rs pay_claim |
 | Accessibility | Every control and every state a test reads is an AccessKit node with a stable kebab-case id (AXIdentifier on macOS, AccessibleId on AT-SPI), its role and its visible text as label. The e2e driver reads and presses the tree instead of screenshots. Rows are keyed by data (pubkey, bounty id, event id), not position, except chat bubbles, which only append; no secret reaches a label. | src/a11y.rs, docs/a11y-ids.md |
 
 ## Cost model
@@ -37,9 +39,9 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 2. **Two threads, one bridge** — gpui's executor is not tokio, so everything that talks Nostr, the instance or Coinos lives on a second thread and speaks to the window through two channels. _(adds BR, RT)_
 3. **Who you are: keys** — Two account slots, issuer and claimant, each an nsec in the macOS keychain; a first launch with no key anywhere opens onboarding. _(adds KS, OB)_
 4. **Reading the instance** — Bounties, claims and payment rows all come from the instance's REST API; the relay socket only feeds the rail dot until a bounty is watched. _(adds IA, IN, RL)_
-5. **The issuer publishes** — cmd-N as the issuer: seven fields, one Enter, a kind-39998 DList (the replaceable header every bounty points at) through the publish door, POST /api/strfry/publish, then a logged-in POST that creates the auto-pay bounty. _(adds FM, EV, BO)_
+5. **The issuer publishes** — cmd-N as any account: eight fields, one Enter, a kind-39998 DList (the replaceable header every bounty points at) through the publish door, POST /api/strfry/publish, then a logged-in POST that creates the auto-pay bounty. _(adds FM, EV, BO)_
 6. **The claimant claims** — cmd-] to the claimant, cmd-N, one item name, Enter: a signed kind-39999 claim goes through the same door, POST /api/strfry/publish, and the feed says so. _(adds AF)_
-7. **Watching the money move** — The app never pays: the server's auto-pay watcher does, and this app's bounty watcher polls the detail and reports each payment fact exactly once. _(adds BW, AP)_
+7. **Watching the money move** — The server's auto-pay watcher pays the house's allowlisted bounties; every other bounty with auto-pay on is paid by its issuer's own app from the issuer's Coinos wallet. This app's bounty watcher reports each payment fact exactly once. _(adds BW, AP, IP)_
 8. **A wallet for the key** — A generated key has no Lightning address, so its claims fail at payment; one click opens a Coinos wallet bound to the key. _(adds WA, CO, CX)_
 9. **Telling the payers the address** — Still inside the wallet command, the new address is merged into the key's existing kind-0 profile, only lud16 changed, and published to the instance and then three public relays. _(adds PR)_
 10. **Chat, two ways** — The cmd-8 pane streams Claude straight from Anthropic with the owner's key; a worker in the repo does the same job on a separate tailnet box, and nothing connects them. _(adds CP, AN, CC)_
@@ -287,7 +289,7 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 **Questions.**
 
 - **Q-FM1** esc between PublishDList and DListPublished orphans the DList: published and logged, no bounty (shell.rs:1187, 692-693).
-- **Q-FM2** autoPay is hardcoded true, so an issuer off the server allowlist gets 403 every time. Is a manual-pay bounty ever needed from this UI?
+- ~~**Q-FM2** autoPay is hardcoded true, so an issuer off the server allowlist gets 403 every time. Is a manual-pay bounty ever needed from this UI?~~ ✓ Resolved on feat/issuer-autopay: the form has an Auto-pay (on or off) field, the server always gets autoPay false, and an "on" becomes this app's own auto-pay setting for the bounty (shell.rs submit_bounty_form, nostr.rs create_bounty).
 - **Q-FM3** An open, unsubmitted claim form retargets to whichever bounty you arrow to (shell.rs:1116-1127). Intended for a stage demo?
 
 #### AF · Activity feed
@@ -376,13 +378,36 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 - **Q-IA1** list_bounties and get_bounty bypass the read() helper: a non-2xx gives 200 chars of raw body instead of the server's error field (api.rs:494-498).
 - ~~**Q-IA2** Claim.autoPayBlockedReason and paymentClaimEventId are parsed but absent from the fixture; does the server send them?~~ ✓ The current server sends paymentClaimEventId and claimAddress on every claim; autoPayBlockedReason only when the daily limit blocks a payable claim. The 2026-08-07 fixture predates them (magic-carpet-v2/src/api/bounties.js:118-133, 206-207, verified 2026-09-10).
 
+#### IP · Issuer-side auto-pay
+
+**In one line.** Every 30 s while the app runs, each stored account's auto-pay bounties are checked and qualifying claims paid from that account's own Coinos wallet, as a zap the issuer signs.
+
+**What it does.** Claims are read from the relay (kind 39999 on the bounty's list, newest per claimant and d-tag), not from the server, which hides claimants the house ranks below 2. A claim counts as paid when a kind-9735 on the relay carries a zap request signed by the issuer for it. A claim is paid when auto-pay is on for it here, the claimant is not the issuer, a slot is left, the claimant is under its per-npub limit, it was never attempted, and the issuer's own scores rank the claimant at the minimum or higher. Checks that move no sats (Lightning address, wallet token, balance, zap support) run first and leave a note on the claim card; then the attempt is written to accounts.json; then the payment goes out. Every unpaid claim on a bounty the server does not pay itself carries its reason in plain words.
+
+**How it's built.** `autopay::plan` and `autopay::decide` (`src/autopay.rs`) are the pure decision. `autopay_loop`/`autopay_tick`, `annotate`, `pay_claim`, `issuer_ranks` and `relay_claims` in `src/nostr.rs`. Ranks: the issuer's kind-10040 `30382:rank` row, then that key's kind-30382 with d = claimant on the row's relay, cached 60 s (maps 10 min). Zap: kind 9734, tags p, e, a, amount (msat), relays (MC_RELAY_URL then the public set); `coinos::lnurl_zap_invoice` refuses an LNURL without `allowsNostr`. Attempts: `secrets::begin_attempt` under `accounts.json.lock`. The watcher shows attempts as payment rows (attempting, paid, settled, paid_unreceipted after 120 s, failed, unknown). Interval override: `MC_AUTOPAY_POLL_SECS`.
+
+**Steps in execution.**
+
+1. **Tick** — Every MC_AUTOPAY_POLL_SECS (30): each stored auto-pay setting, skipping terminal bounties and ones the server pays.
+2. **Read** — Server detail, relay claims and receipts, the issuer's attempts, the issuer's ranks of each claimant.
+3. **Decide** — autopay::plan, oldest claim first; re-planned after each claim.
+4. **Check** — lud16, wallet token, balance, zap invoice: a no is a note, retried next tick.
+5. **Record** — begin_attempt: sending, under the store lock; another instance's record wins.
+6. **Pay** — POST /api/payments; paid, failed, or unknown (never retried).
+
+**Questions.**
+
+- **Q-IP1** A claimant's app cannot know whether the issuer's app has auto-pay on, so another issuer's bounty reads "manual pay" there, and its claims say "Waiting for the issuer's app to pay it."
+- **Q-IP2** The server still ranks by the house's scores: it hides those claims from its own claim list and never marks the bounty fulfilled. The app counts slots itself.
+- **Q-IP3** A receipt that never arrives after a paid attempt reads paid_unreceipted after 120 s; the slot stays held.
+
 ### The instance and the money
 
 #### IN · Magic Carpet instance
 
 **In one line.** The server at magic-carpet.brainstorm.world: a REST API in front of a strfry relay, holding bounties, claims, payment rows and receipts.
 
-**What it does.** The app reads and writes only here. Bounties and payment state come from GET /api/bounties. Events go in through POST /api/strfry/publish, which pipes them into strfry. Login is a signed challenge. The house issuer 853baa94… is the default whose bounties the app lists; an imported issuer key or MC_ISSUER_NPUB overrides it.
+**What it does.** The app reads and writes only here. Bounties and payment state come from GET /api/bounties. Events go in through POST /api/strfry/publish, which pipes them into strfry. Login is a signed challenge. The app lists every issuer's bounties (GET /api/bounties?status=all); the house issuer 853baa94… (or MC_ISSUER_NPUB) is only the recommended follow and the instance's score provider.
 
 **How it's built.** Lives in the sibling repo magic-carpet-v2. The publish route runs the global auth middleware but is absent from its write list, so it falls through as read-only access; it checks only that id, sig and pubkey are present and never verifies the signature before `strfry import` (10 s timeout). verify-user mints the session cookie and accepts any well-formed pubkey; the real gate is on POST /api/bounties, where autoPay needs owner, admin or AUTO_PAY_ALLOWLIST_PUBKEYS (403 otherwise). Claims from keys ranked below 2 are hidden from claims[] unless they already hold a payment row. The detail endpoint embeds the auto_payments row and the validated kind-9735 per claim; the server checks the receipt's description pubkey against the issuer or its delegate, which this app cannot know. A kind-0 posted through the door is also fanned out to the server's own profile relays.
 
@@ -709,7 +734,7 @@ Payload shapes are illustrative; the ids and the 27 s timing come from the 2026-
 | 7 | IA → IN | GET /api/strfry/scan | `{}` |
 | 8 | IN → IA | kind 0 | `{"name":"Matthias","lud16":"m_f_debern@strike.me"}` |
 | 9 | RT → BR | AccountLoaded, ProfileLoaded | `{"npub":"npub1su7gycf…","name":"Matthias","lud16":"m_f_debern@strike.me"}` |
-| 10 | RT → IA | list_bounties | `{"issuer":"853baa94…","status":"all"}` |
+| 10 | RT → IA | list_all_bounties | `{"status":"all","limit":500}` |
 | 11 | IA → IN | GET /api/bounties | `{}` |
 | 12 | IN → IA | bounties | `{"count":4}` |
 | 13 | RT → BR | Update::Bounties | `{"count":4,"side_effect":"select and watch the first row"}` |
@@ -737,7 +762,7 @@ Payload shapes are illustrative; the ids and the 27 s timing come from the 2026-
 | 12 | SH → BR | Command::CreateBounty | `{"listCoordinate":"39998:…:us-city","amountSats":100,"bountyCapSats":400,"autoPay":true,"autoPayMinRank":2}` |
 | 13 | BR → RT | dispatch | `{}` |
 | 14 | RT → IA | login once, then create | `{"login":"kind 22242 \"Tapestry authentication\""}` |
-| 15 | IA → IN | POST /api/bounties | `{"cookie":"session","autoPay":true}` |
+| 15 | IA → IN | POST /api/bounties | `{"cookie":"session","autoPay":false,"autoPayMinRank":2}` |
 | 16 | IN → IA | bounty | `{"success":true,"bounty":{"id":"<uuid>","auto_pay":1}}` |
 | 17 | RT → BR | Update::BountyCreated | `{"id":"<uuid>"}` |
 | 18 | BR → SH | apply | `{"feed":"Bounty … created — watching for claims","optimistic":true}` |
@@ -832,7 +857,7 @@ Reference by ID. ✓ resolved (with date) · → routed to a named next step · 
 - **Q-RT1** (RT) spawn_runtime reports a thread or tokio build failure as Error { Runtime }, but the handle then has no live receiver. Does the UI treat that as fatal?
 - ~~**Q-RT2**~~ (RT) ✓ create_bounty now treats a 401 as an expired session: it clears logged_in, logs in again on the same cookie jar and retries once. The server cookie lasts 24 h with no rolling renewal (magic-carpet-v2/src/middleware/sessionStore.js:9,146; fixed 2026-09-22).
 - **Q-FM1** (FM) esc between PublishDList and DListPublished orphans the DList: published and logged, no bounty (shell.rs:1187, 692-693).
-- **Q-FM2** (FM) autoPay is hardcoded true, so an issuer off the server allowlist gets 403 every time. Is a manual-pay bounty ever needed from this UI?
+- ~~**Q-FM2**~~ (FM) ✓ Resolved on feat/issuer-autopay: the form has an Auto-pay (on or off) field, the server always gets autoPay false, and an "on" becomes this app's own auto-pay setting for the bounty (shell.rs submit_bounty_form, nostr.rs create_bounty).
 - **Q-FM3** (FM) An open, unsubmitted claim form retargets to whichever bounty you arrow to (shell.rs:1116-1127). Intended for a stage demo?
 - **Q-AF1** (AF) A relaunch loses the feed and re-selecting a bounty replays its history once more. Should it read server history?
 - **Q-AF2** (AF) Rows always insert at index 0, so a late poll with an old server timestamp can appear above newer rows.
@@ -843,6 +868,9 @@ Reference by ID. ✓ resolved (with date) · → routed to a named next step · 
 - **Q-BW3** (BW) nostr-sdk pushes an event only the first time the client sees it; a receipt already pushed under an earlier watcher is not re-pushed, so the poll is its only path.
 - **Q-IA1** (IA) list_bounties and get_bounty bypass the read() helper: a non-2xx gives 200 chars of raw body instead of the server's error field (api.rs:494-498).
 - ~~**Q-IA2**~~ (IA) ✓ The current server sends paymentClaimEventId and claimAddress on every claim; autoPayBlockedReason only when the daily limit blocks a payable claim. The 2026-08-07 fixture predates them (magic-carpet-v2/src/api/bounties.js:118-133, 206-207, verified 2026-09-10).
+- **Q-IP1** (IP) A claimant's app cannot know whether the issuer's app has auto-pay on, so another issuer's bounty reads "manual pay" there, and its claims say "Waiting for the issuer's app to pay it."
+- **Q-IP2** (IP) The server still ranks by the house's scores: it hides those claims from its own claim list and never marks the bounty fulfilled. The app counts slots itself.
+- **Q-IP3** (IP) A receipt that never arrives after a paid attempt reads paid_unreceipted after 120 s; the slot stays held.
 - ~~**Q-IN1**~~ (IN) ✓ The binary reads no .env: no dotenv crate, no read in src/. Overrides must be in the launching shell (Cargo.toml at HEAD, verified 2026-09-10).
 - **Q-RL1** (RL) The dot reflects this socket only; API reachability shows up separately as a failed list row.
 - **Q-RL2** (RL) "Relay disconnected" has no retry button. Is reconnect fully automatic in nostr-sdk, or can the user get stuck?
