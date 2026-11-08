@@ -1703,9 +1703,11 @@ async fn remove_account(
 
 /// The instance's house issuer: `MC_ISSUER_NPUB` (npub or hex), else
 /// [`HOUSE_ISSUER_HEX`]. Not who may issue (every account may); it is the
-/// instance owner the community panel recommends following, whose map names
-/// the instance's score provider, and whose wallet this app never touches.
-/// Public material only.
+/// instance owner the community panel recommends following and whose map
+/// names the instance's score provider. The wallet panel never opens or
+/// re-points a wallet for it, but if its key and a Coinos login are stored
+/// here and it issues a bounty with auto-pay on, this app pays that bounty's
+/// claims from that wallet like any issuer's. Public material only.
 pub fn issuer_pubkey() -> String {
     issuer_pubkey_from(std::env::var("MC_ISSUER_NPUB").ok().as_deref())
 }
@@ -2062,6 +2064,55 @@ fn current_claims<'a>(events: &'a [Event], coordinate: &str, since: u64) -> Vec<
     out
 }
 
+/// Whether a relay receipt pays this bounty's claim `claim_event_id`: the
+/// issuer signed the zap request, for the bounty's reward, on its list.
+fn pays(receipt: &Event, bounty: &Bounty, claim_event_id: &str) -> bool {
+    events::receipt_pays_bounty_claim(
+        receipt,
+        claim_event_id,
+        &bounty.issuer_pubkey,
+        &bounty.list_coordinate,
+        bounty.amount_sats,
+    )
+}
+
+/// One relay claim joined with the server's copy of it, for a bounty the
+/// server does not pay itself. The receipt is only one this app verified
+/// ([`pays`]): the server attaches a receipt by the description's pubkey
+/// alone, so a forged one could mark the claim paid and use up its slot. The
+/// issuer's attempt on this bounty becomes the payment row.
+fn merge_claim(
+    server: Option<Claim>,
+    fact: &ClaimFacts,
+    event: &Event,
+    receipts: &[Event],
+    bounty: &Bounty,
+    attempts: &[secrets::PayAttempt],
+    now: u64,
+) -> Option<Claim> {
+    let mut claim = match server {
+        Some(claim) => claim,
+        None => Claim::from_event(RawEvent::from_event(event)?),
+    };
+    claim.zap_receipt = receipts
+        .iter()
+        .find(|r| pays(r, bounty, &fact.event_id))
+        .and_then(RawEvent::from_event);
+    if claim.auto_payment.is_none()
+        && let Some(attempt) = attempts
+            .iter()
+            .find(|a| a.bounty_id == bounty.id && a.claim_address == fact.address)
+    {
+        claim.auto_payment = Some(attempt_row(
+            attempt,
+            &fact.event_id,
+            claim.zap_receipt.is_some(),
+            now,
+        ));
+    }
+    Some(claim)
+}
+
 /// One bounty's claims as decision facts, each with its event: paid when a
 /// relay receipt carries the issuer's signed zap request for it, attempted
 /// when the issuer's store has an attempt at its address. Ranks are filled
@@ -2078,12 +2129,10 @@ fn facts_for<'a>(
         .filter_map(|event| {
             let address = claim_address(event)?;
             let id = event.id.to_hex();
-            let paid = receipts
-                .iter()
-                .any(|r| events::receipt_pays_claim_for(r, &id, &bounty.issuer_pubkey));
+            let paid = receipts.iter().any(|r| pays(r, bounty, &id));
             let attempt = attempts
                 .iter()
-                .find(|a| a.claim_address == address)
+                .find(|a| a.bounty_id == bounty.id && a.claim_address == address)
                 .map(|a| a.state);
             Some((
                 ClaimFacts {
@@ -2262,14 +2311,18 @@ struct Annotated {
 /// unpaid claim's reason in plain words. The server's own auto-pay bounties
 /// come back as the server sent them.
 async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -> Annotated {
-    let store = secrets::load().unwrap_or_default();
-    let setting = setting_of(&store, &detail.bounty).cloned();
-    detail.bounty.app_auto_pay = setting.is_some();
     let unchanged = |detail| Annotated {
         detail,
         policy: None,
         facts: Vec::new(),
     };
+    // An unreadable store is not "no attempts": without the attempts there
+    // is no knowing what was paid, so nothing is decided (and nothing paid).
+    let Ok(store) = secrets::load() else {
+        return unchanged(detail);
+    };
+    let setting = setting_of(&store, &detail.bounty).cloned();
+    detail.bounty.app_auto_pay = setting.is_some();
     if detail.bounty.server_auto_pay_on() {
         return unchanged(detail);
     }
@@ -2292,42 +2345,22 @@ async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -
     let now = now_unix();
     let mut claims: Vec<Claim> = Vec::new();
     for (fact, event) in facts_for(&detail.bounty, &events, &receipts, attempts) {
-        let mut claim = match by_id.remove(&fact.event_id) {
-            Some(claim) => claim,
-            None => match RawEvent::from_event(event) {
-                Some(raw) => Claim::from_event(raw),
-                None => continue,
-            },
-        };
-        if claim.zap_receipt.is_none()
-            && let Some(receipt) = receipts
-                .iter()
-                .find(|r| events::receipt_pays_claim_for(r, &fact.event_id, &issuer))
-        {
-            claim.zap_receipt = RawEvent::from_event(receipt);
-        }
-        if claim.auto_payment.is_none()
-            && let Some(attempt) = attempts.iter().find(|a| a.claim_address == fact.address)
-        {
-            claim.auto_payment = Some(attempt_row(
-                attempt,
-                &fact.event_id,
-                claim.zap_receipt.is_some(),
-                now,
-            ));
-        }
-        // A delegate's receipt the server vouched for counts as paid too.
-        let fact = ClaimFacts {
-            paid: fact.paid || claim.zap_receipt.is_some(),
-            ..fact
+        let server = by_id.remove(&fact.event_id);
+        let Some(claim) =
+            merge_claim(server, &fact, event, &receipts, &detail.bounty, attempts, now)
+        else {
+            continue;
         };
         facts.push(fact);
         claims.push(claim);
     }
     // Claims the server lists that the relay no longer serves keep their
-    // place, with what the server says about them; attempts whose claim is
-    // gone keep their slot.
-    claims.extend(by_id.into_values());
+    // place, without the server's unverified receipt; attempts whose claim
+    // is gone keep their slot.
+    claims.extend(by_id.into_values().map(|claim| Claim {
+        zap_receipt: None,
+        ..claim
+    }));
     let orphans = orphan_attempts(&detail.bounty, &facts, attempts);
     facts.extend(orphans);
     claims.sort_by_key(|c| (c.event.created_at.unwrap_or(0), c.event.id.clone()));
@@ -2433,7 +2466,14 @@ async fn autopay_tick(client: &Client, ctx: &AutoPayCtx, updates: &mpsc::Unbound
             let Some(ix) = facts.iter().position(|f| f.address == address) else {
                 break;
             };
-            match pay_claim(ctx, &api, &bounty, &facts[ix], updates).await {
+            let paid: Vec<(String, String)> = facts
+                .iter()
+                .filter(|f| f.paid)
+                .map(|f| (f.address.clone(), f.claimant.clone()))
+                .collect();
+            // `Some(Failed)` here can also mean "refused under the lock"
+            // (cap or limit): it marks the claim decided for this tick.
+            match pay_claim(ctx, &api, &bounty, &facts[ix], paid, updates).await {
                 Some(state) => facts[ix].attempt = Some(state),
                 None => {
                     facts.remove(ix);
@@ -2454,6 +2494,7 @@ async fn pay_claim(
     api: &Api,
     bounty: &Bounty,
     claim: &ClaimFacts,
+    paid: Vec<(String, String)>,
     updates: &mpsc::UnboundedSender<Update>,
 ) -> Option<AttemptState> {
     let issuer = &bounty.issuer_pubkey;
@@ -2535,9 +2576,21 @@ async fn pay_claim(
         started_at: now,
         updated_at: now,
     };
-    match secrets::begin_attempt(issuer, attempt) {
-        Ok(true) => {}
-        Ok(false) => return Some(AttemptState::Sending),
+    // The plan came from a snapshot; another instance may have paid since.
+    // The store re-counts the cap and the per-npub limit under its lock.
+    let (slots, per_npub) = autopay::slots_and_limit(bounty);
+    let limits = secrets::SlotLimits { slots, per_npub, paid };
+    match secrets::begin_attempt_within(issuer, attempt, Some(&limits)) {
+        Ok(secrets::Begin::Recorded) => {}
+        Ok(secrets::Begin::Exists) => return Some(AttemptState::Sending),
+        Ok(secrets::Begin::NoSlots) => {
+            ctx.note(&claim.address, Hold::NoSlots.describe().unwrap_or_default());
+            return Some(AttemptState::Failed);
+        }
+        Ok(secrets::Begin::OverLimit) => {
+            ctx.note(&claim.address, Hold::OverLimit.describe().unwrap_or_default());
+            return Some(AttemptState::Failed);
+        }
         Err(e) => {
             ctx.note(&claim.address, e.to_string());
             return None;
@@ -2562,7 +2615,14 @@ async fn pay_claim(
     };
     // A failed write leaves the attempt `sending`: shown as unknown, never
     // retried. That is the safe side.
-    let _ = secrets::finish_attempt(issuer, &claim.address, state, reason.clone(), now_unix());
+    let _ = secrets::finish_attempt_for(
+        issuer,
+        &bounty.id,
+        &claim.address,
+        state,
+        reason.clone(),
+        now_unix(),
+    );
     report(
         match state {
             AttemptState::Paid => "paid",
@@ -3986,6 +4046,102 @@ mod tests {
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].address, "bob:y");
         assert_eq!(orphans[0].attempt, Some(AttemptState::Paid));
+    }
+
+    /// A kind-9735 from some zapper around `request`, naming `claim_id`.
+    fn receipt_around(request: &Event, claim_id: &str) -> Event {
+        EventBuilder::new(Kind::Custom(events::RECEIPT_KIND), "")
+            .tags([
+                Tag::parse(vec!["e".to_string(), claim_id.to_string()]).unwrap(),
+                Tag::parse(vec![
+                    "description".to_string(),
+                    serde_json::to_string(request).unwrap(),
+                ])
+                .unwrap(),
+            ])
+            .finalize(&Keys::generate())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_server_receipt_the_app_cannot_verify_does_not_pay_the_claim() {
+        let issuer = Keys::generate();
+        let issuer_hex = issuer.public_key().to_hex();
+        let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": issuer_hex }));
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let id = event.id.to_hex();
+        let (fact, _) = facts_for(&bounty, std::slice::from_ref(&event), &[], &[])
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(!fact.paid);
+
+        // What the server attaches: description pubkey = issuer, junk sig.
+        let forged = RawEvent {
+            id: "f0".into(),
+            pubkey: "zz".into(),
+            kind: Some(events::RECEIPT_KIND),
+            created_at: Some(300),
+            tags: vec![
+                vec!["e".into(), id.clone()],
+                vec![
+                    "description".into(),
+                    serde_json::json!({ "pubkey": issuer_hex, "kind": 9734, "sig": "00" }).to_string(),
+                ],
+            ],
+            content: String::new(),
+            sig: Some("00".into()),
+        };
+        let server = Claim {
+            zap_receipt: Some(forged),
+            ..Claim::from_event(RawEvent::from_event(&event).unwrap())
+        };
+        let merged = merge_claim(Some(server), &fact, &event, &[], &bounty, &[], 300).unwrap();
+        assert!(merged.zap_receipt.is_none(), "the forged receipt must not count");
+
+        // A receipt around the issuer's own signed request for the reward does.
+        let relays = vec!["wss://nos.lol".to_string()];
+        let request = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, 100, &relays).unwrap();
+        let receipts = vec![receipt_around(&request, &id)];
+        let (fact, _) = facts_for(&bounty, std::slice::from_ref(&event), &receipts, &[])
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(fact.paid);
+        let merged = merge_claim(None, &fact, &event, &receipts, &bounty, &[], 300).unwrap();
+        assert!(merged.zap_receipt.is_some());
+    }
+
+    #[test]
+    fn facts_count_only_this_bountys_reward_and_attempts() {
+        let issuer = Keys::generate();
+        let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": issuer.public_key().to_hex() }));
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let id = event.id.to_hex();
+        let relays = vec!["wss://nos.lol".to_string()];
+        // A zap for 99 sats is not this bounty's 100-sat reward.
+        let short = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, 99, &relays).unwrap();
+        // An attempt on another bounty at the same address is not this one's.
+        let elsewhere = secrets::PayAttempt {
+            bounty_id: "other".into(),
+            claim_address: format!("{}:everything", bob.public_key().to_hex()),
+            claim_event_id: id.clone(),
+            claimant: bob.public_key().to_hex(),
+            sats: 100,
+            state: AttemptState::Paid,
+            reason: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        let receipts = vec![receipt_around(&short, &id)];
+        let (fact, _) = facts_for(&bounty, std::slice::from_ref(&event), &receipts, &[elsewhere])
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(!fact.paid);
+        assert_eq!(fact.attempt, None);
     }
 
     #[test]
