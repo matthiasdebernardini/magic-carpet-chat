@@ -10,7 +10,7 @@
 //! anywhere in the app, or a secret embedded in an error chain, cannot leak
 //! the value into a log line.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -252,12 +252,23 @@ fn process_lock() -> Result<std::fs::File, SecretError> {
 }
 
 fn modify<T>(change: impl FnOnce(&mut Store) -> Result<T, SecretError>) -> Result<T, SecretError> {
-    let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _file_lock = process_lock()?;
-    let mut store = load()?;
-    let out = change(&mut store)?;
-    save(&store)?;
-    Ok(out)
+    let locked = || {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file_lock = process_lock()?;
+        let mut store = load()?;
+        let out = change(&mut store)?;
+        save(&store)?;
+        Ok(out)
+    };
+    // The lock can wait on another app instance. On the runtime's worker
+    // threads that wait must not stall every other task, so the worker hands
+    // its queue to a fresh thread for the duration.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(locked)
+        }
+        _ => locked(),
+    }
 }
 
 fn missing(pubkey: &str) -> SecretError {
@@ -422,21 +433,103 @@ pub fn pay_attempts(pubkey: &str) -> Result<Vec<PayAttempt>, SecretError> {
 }
 
 /// Record a payment attempt before the payment goes out. `Ok(false)` when
-/// an attempt for the same claim address already exists, from this process
-/// or another: the caller must not pay. Read and write happen under the
-/// store's process lock, so two app instances cannot both win.
+/// an attempt for the same bounty and claim address already exists, from
+/// this process or another: the caller must not pay. Read and write happen
+/// under the store's process lock, so two app instances cannot both win.
+/// No cap check: the auto-pay loop uses [`begin_attempt_within`].
 pub fn begin_attempt(pubkey: &str, attempt: PayAttempt) -> Result<bool, SecretError> {
+    begin_attempt_within(pubkey, attempt, None).map(|begun| begun == Begin::Recorded)
+}
+
+/// A bounty's limits, checked again under the store lock when an attempt
+/// is recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotLimits {
+    /// How many rewards the bounty pays in all.
+    pub slots: u64,
+    /// How many one claimant may get; `None` is no limit.
+    pub per_npub: Option<u64>,
+    /// `(claim address, claimant)` of every claim a verified receipt already
+    /// pays, whoever paid it.
+    pub paid: Vec<(String, String)>,
+}
+
+/// What [`begin_attempt_within`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Begin {
+    Recorded,
+    /// An attempt for this bounty and claim address already exists.
+    Exists,
+    /// Paid claims and slot-holding attempts already fill the bounty.
+    NoSlots,
+    /// The claimant already holds its most rewards on this bounty.
+    OverLimit,
+}
+
+/// [`begin_attempt`], and inside the same lock the cap and the per-npub
+/// limit counted from what the store holds NOW (every instance's attempts on
+/// this bounty that may have paid) plus the receipt-paid claims: a plan made
+/// from an older snapshot can never pay past either.
+pub fn begin_attempt_within(
+    pubkey: &str,
+    attempt: PayAttempt,
+    limits: Option<&SlotLimits>,
+) -> Result<Begin, SecretError> {
     modify(|store| {
         let account = account_mut(store, pubkey)?;
+        let same_bounty = |a: &&PayAttempt| a.bounty_id == attempt.bounty_id;
         if account
             .pay_attempts
             .iter()
+            .filter(same_bounty)
             .any(|a| a.claim_address == attempt.claim_address)
         {
-            return Ok(false);
+            return Ok(Begin::Exists);
+        }
+        if let Some(limits) = limits {
+            let mut holders: HashMap<&str, &str> = account
+                .pay_attempts
+                .iter()
+                .filter(same_bounty)
+                .filter(|a| a.state.holds_slot())
+                .map(|a| (a.claim_address.as_str(), a.claimant.as_str()))
+                .collect();
+            for (address, claimant) in &limits.paid {
+                holders.insert(address.as_str(), claimant.as_str());
+            }
+            if holders.len() as u64 >= limits.slots {
+                return Ok(Begin::NoSlots);
+            }
+            let mine = holders.values().filter(|c| **c == attempt.claimant).count() as u64;
+            if limits.per_npub.is_some_and(|limit| mine >= limit) {
+                return Ok(Begin::OverLimit);
+            }
         }
         account.pay_attempts.push(attempt);
-        Ok(true)
+        Ok(Begin::Recorded)
+    })
+}
+
+/// Record how the attempt on `bounty_id` for `claim_address` ended.
+pub fn finish_attempt_for(
+    pubkey: &str,
+    bounty_id: &str,
+    claim_address: &str,
+    state: AttemptState,
+    reason: Option<String>,
+    at: u64,
+) -> Result<(), SecretError> {
+    modify(|store| {
+        let account = account_mut(store, pubkey)?;
+        let attempt = account
+            .pay_attempts
+            .iter_mut()
+            .find(|a| a.bounty_id == bounty_id && a.claim_address == claim_address)
+            .ok_or_else(|| SecretError::Store("No payment attempt for that claim".into()))?;
+        attempt.state = state;
+        attempt.reason = reason;
+        attempt.updated_at = at;
+        Ok(())
     })
 }
 
@@ -716,6 +809,92 @@ mod tests {
         assert_eq!(stored[0].claim_event_id, "e1");
         assert_eq!(stored[0].updated_at, 5);
         assert!(finish_attempt(&record.pubkey, "nobody:x", AttemptState::Paid, None, 6).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn attempt_on(bounty: &str, address: &str, claimant: &str) -> PayAttempt {
+        PayAttempt {
+            bounty_id: bounty.into(),
+            claim_address: address.into(),
+            claim_event_id: format!("e-{address}"),
+            claimant: claimant.into(),
+            sats: 100,
+            state: AttemptState::Sending,
+            reason: None,
+            started_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn recording_an_attempt_rechecks_the_cap_and_the_per_npub_limit() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-cap-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let keys = Keys::generate();
+        let me = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true)
+            .unwrap()
+            .pubkey;
+
+        // Another instance already paid X on a one-slot bounty: Y waits.
+        let one = SlotLimits { slots: 1, per_npub: Some(1), paid: Vec::new() };
+        let begin = |a: PayAttempt, l: &SlotLimits| begin_attempt_within(&me, a, Some(l)).unwrap();
+        assert_eq!(begin(attempt_on("b1", "x:1", "x"), &one), Begin::Recorded);
+        assert_eq!(begin(attempt_on("b1", "y:1", "y"), &one), Begin::NoSlots);
+        // The same claim on another bounty is its own attempt.
+        assert_eq!(begin(attempt_on("b2", "x:1", "x"), &one), Begin::Recorded);
+        assert_eq!(begin(attempt_on("b2", "x:1", "x"), &one), Begin::Exists);
+
+        // Two slots, one per claimant: bob's second claim is refused.
+        let two = SlotLimits { slots: 2, per_npub: Some(1), paid: Vec::new() };
+        assert_eq!(begin(attempt_on("b3", "bob:1", "bob"), &two), Begin::Recorded);
+        assert_eq!(begin(attempt_on("b3", "bob:2", "bob"), &two), Begin::OverLimit);
+        // A failed attempt frees its slot; a receipt-paid claim takes one.
+        finish_attempt_for(&me, "b3", "bob:1", AttemptState::Failed, None, 2).unwrap();
+        let paid = SlotLimits {
+            slots: 2,
+            per_npub: Some(1),
+            paid: vec![("carol:1".into(), "carol".into()), ("dave:1".into(), "dave".into())],
+        };
+        assert_eq!(begin(attempt_on("b3", "erin:1", "erin"), &paid), Begin::NoSlots);
+        assert_eq!(begin(attempt_on("b3", "erin:1", "erin"), &two), Begin::Recorded);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_store_write_waiting_on_the_lock_does_not_stall_the_runtime() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-lock-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let keys = Keys::generate();
+        let me = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true)
+            .unwrap()
+            .pubkey;
+
+        // Another instance holds the store lock for a second.
+        let held = process_lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_000));
+            drop(held);
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let other_task_ms = runtime.block_on(async move {
+            let start = std::time::Instant::now();
+            let write = tokio::spawn(async move { set_active(&me) });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // With one worker, this runs only if the write gave the worker up.
+            let other = tokio::spawn(async move { start.elapsed().as_millis() }).await.unwrap();
+            write.await.unwrap().unwrap();
+            other
+        });
+        release.join().unwrap();
+        assert!(other_task_ms < 500, "the runtime stalled for {other_task_ms} ms");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
