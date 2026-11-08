@@ -226,6 +226,37 @@ impl Receipt {
     }
 }
 
+/// Whether a relay's kind-9735 pays `claim_event_id` on `payer`'s behalf:
+/// the receipt names the claim, and the zap request inside its
+/// `description` is a valid kind-9734 SIGNED by `payer` that names the claim
+/// too. Stricter than the server, which reads the description's pubkey
+/// without checking its signature: anyone can publish a 9735, so a forged
+/// one could otherwise use up a bounty's slots from the issuer's own view.
+pub fn receipt_pays_claim_for(receipt: &Event, claim_event_id: &str, payer: &str) -> bool {
+    let names = |event: &Event, name: &str, value: &str| {
+        event.tags.iter().any(|t| {
+            let t = t.as_slice();
+            t.first().map(String::as_str) == Some(name) && t.get(1).map(String::as_str) == Some(value)
+        })
+    };
+    if receipt.kind.as_u16() != RECEIPT_KIND || !names(receipt, "e", claim_event_id) {
+        return false;
+    }
+    let Some(description) = receipt.tags.iter().find_map(|t| {
+        let t = t.as_slice();
+        (t.first().map(String::as_str) == Some("description")).then(|| t.get(1)).flatten()
+    }) else {
+        return false;
+    };
+    let Ok(request) = serde_json::from_str::<Event>(description) else {
+        return false;
+    };
+    request.kind.as_u16() == ZAP_REQUEST_KIND
+        && request.pubkey.to_hex() == payer
+        && request.verify().is_ok()
+        && names(&request, "e", claim_event_id)
+}
+
 /// Parse a live relay event as a receipt. `None` when it is not kind-9735.
 pub fn parse_receipt(event: &Event) -> Option<Receipt> {
     let tags: Vec<Vec<String>> = event.tags.iter().map(|t| t.as_slice().to_vec()).collect();
@@ -430,6 +461,36 @@ mod tests {
             ]
         );
         assert!(zap_request(&issuer, "bb", "e1", COORD, 0, &relays).is_err());
+    }
+
+    #[test]
+    fn only_a_receipt_around_the_payers_signed_request_pays_the_claim() {
+        let issuer = Keys::generate();
+        let zapper = Keys::generate();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let receipt = |request: &Event, e: &str| -> Event {
+            EventBuilder::new(Kind::Custom(RECEIPT_KIND), "")
+                .tags([
+                    tag(["e", e]).unwrap(),
+                    tag(["description", serde_json::to_string(request).unwrap().as_str()]).unwrap(),
+                ])
+                .finalize(&zapper)
+                .unwrap()
+        };
+        let request = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, 21, &relays).unwrap();
+        let payer = issuer.public_key().to_hex();
+        assert!(receipt_pays_claim_for(&receipt(&request, "c1"), "c1", &payer));
+        // Another claim, another payer, or a receipt naming a claim its
+        // request does not: none of them pay.
+        assert!(!receipt_pays_claim_for(&receipt(&request, "c1"), "c2", &payer));
+        assert!(!receipt_pays_claim_for(&receipt(&request, "c2"), "c2", &payer));
+        let stranger = Keys::generate().public_key().to_hex();
+        assert!(!receipt_pays_claim_for(&receipt(&request, "c1"), "c1", &stranger));
+        // A request whose signature does not hold is not the payer's.
+        let mut forged: serde_json::Value = serde_json::to_value(&request).unwrap();
+        forged["content"] = "x".into();
+        let forged: Event = serde_json::from_value(forged).unwrap();
+        assert!(!receipt_pays_claim_for(&receipt(&forged, "c1"), "c1", &payer));
     }
 
     #[test]
