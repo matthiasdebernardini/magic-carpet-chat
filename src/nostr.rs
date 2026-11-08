@@ -892,6 +892,7 @@ async fn run(
                 let sessions = sessions.clone();
                 let updates = updates.clone();
                 tokio::spawn(async move {
+                    let sent_at = now_unix();
                     let update = match create_bounty(&sessions, &pubkey, &req).await {
                         Ok(id) => {
                             let min_rank = req.auto_pay_min_rank.unwrap_or(trust::INSTANCE_MIN_RANK);
@@ -907,14 +908,25 @@ async fn run(
                             }
                             Update::BountyCreated { id }
                         }
-                        Err(e) => Update::Error {
-                            source: if matches!(e, BridgeError::OutcomeUnknown(_)) {
-                                ErrorSource::BountyOutcomeUnknown
-                            } else {
-                                ErrorSource::Bounty
-                            },
-                            message: e.to_string(),
-                        },
+                        Err(e) => {
+                            let unknown = matches!(e, BridgeError::OutcomeUnknown(_));
+                            if unknown && req.auto_pay {
+                                tokio::spawn(recover_auto_pay(
+                                    pubkey.clone(),
+                                    req.clone(),
+                                    sent_at,
+                                    updates.clone(),
+                                ));
+                            }
+                            Update::Error {
+                                source: if unknown {
+                                    ErrorSource::BountyOutcomeUnknown
+                                } else {
+                                    ErrorSource::Bounty
+                                },
+                                message: e.to_string(),
+                            }
+                        }
                     };
                     let _ = updates.unbounded_send(update);
                 });
@@ -1105,6 +1117,72 @@ async fn run(
         watcher.task.abort();
     }
     client.disconnect().await;
+}
+
+/// The bounty a create whose outcome is unknown may have made: this
+/// issuer's, on the same list, for the same reward and criteria, created no
+/// earlier than a minute before the request went out. `Ok(None)` when there
+/// is none yet; `Err(())` when more than one fits, so none can be picked.
+fn created_bounty(
+    list: &[Bounty],
+    issuer: &str,
+    req: &CreateBounty,
+    sent_at: u64,
+) -> Result<Option<String>, ()> {
+    let fits: Vec<&Bounty> = list
+        .iter()
+        .filter(|b| {
+            b.issuer_pubkey == issuer
+                && b.list_coordinate == req.list_coordinate
+                && b.amount_sats == req.amount_sats
+                && b.criteria.as_deref().map(str::trim) == Some(req.criteria.trim())
+                && b.created_at.is_some_and(|at| at + 60 >= sent_at)
+        })
+        .collect();
+    match fits.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.id.clone())),
+        _ => Err(()),
+    }
+}
+
+/// A create with auto-pay on timed out: the server may have made the
+/// bounty, and without its id the auto-pay setting has nothing to attach
+/// to. Look for it a few times; save the setting when exactly one bounty
+/// fits, else say plainly that auto-pay was not saved.
+async fn recover_auto_pay(
+    pubkey: String,
+    req: CreateBounty,
+    sent_at: u64,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let not_saved = |why: &str| {
+        let _ = updates.unbounded_send(Update::Error {
+            source: ErrorSource::Watch,
+            message: format!(
+                "Auto-pay wasn't saved for the bounty whose create timed out: {why} If it shows up in the list, pay its claims by hand."
+            ),
+        });
+    };
+    for wait in [5, 15, 45] {
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        let Ok(api) = Api::new() else { continue };
+        let Ok(list) = api.list_all_bounties().await else {
+            continue;
+        };
+        match created_bounty(&list, &pubkey, &req, sent_at) {
+            Ok(Some(id)) => {
+                let min_rank = req.auto_pay_min_rank.unwrap_or(trust::INSTANCE_MIN_RANK);
+                if let Err(e) = secrets::set_auto_pay(&pubkey, &id, min_rank) {
+                    not_saved(&e.to_string());
+                }
+                return;
+            }
+            Ok(None) => continue,
+            Err(()) => return not_saved("more than one bounty on that list matches it."),
+        }
+    }
+    not_saved("the server never listed it.");
 }
 
 /// Lazily open one session per account: keys from the store, a fresh `Api`
@@ -4142,6 +4220,38 @@ mod tests {
             .unwrap();
         assert!(!fact.paid);
         assert_eq!(fact.attempt, None);
+    }
+
+    #[test]
+    fn a_timed_out_create_is_matched_to_exactly_one_new_bounty() {
+        let req = CreateBounty {
+            list_coordinate: COORD.into(),
+            amount_sats: 100,
+            criteria: "Bagel shops".into(),
+            bounty_cap_sats: None,
+            reward_per_item: true,
+            max_rewards_per_npub: Some(1),
+            auto_pay: true,
+            auto_pay_min_rank: Some(2),
+        };
+        let row = |id: &str, issuer: &str, amount: u64, at: u64| {
+            bounty_row(serde_json::json!({
+                "id": id, "issuer_pubkey": issuer, "amount_sats": amount,
+                "criteria": "Bagel shops", "created_at": at,
+            }))
+        };
+        let sent_at = 10_000;
+        let list = vec![
+            row("old", "aa", 100, 1_000),
+            row("theirs", "bb", 100, 10_001),
+            row("other-reward", "aa", 50, 10_001),
+            row("new", "aa", 100, 10_002),
+        ];
+        assert_eq!(created_bounty(&list, "aa", &req, sent_at), Ok(Some("new".into())));
+        assert_eq!(created_bounty(&list[..3], "aa", &req, sent_at), Ok(None));
+        let mut twice = list.clone();
+        twice.push(row("new-2", "aa", 100, 10_003));
+        assert_eq!(created_bounty(&twice, "aa", &req, sent_at), Err(()));
     }
 
     #[test]
