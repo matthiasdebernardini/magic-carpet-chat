@@ -104,7 +104,7 @@ fn timeline_row(id: String, dot: u32, text: String, meta: Option<String>) -> Any
 // ------------------------------------------------------------------- list
 
 /// The eligible list's chip: the issuer's rank of the viewer against the
-/// bounty's effective minimum. `None` outside the eligible list, whose rows
+/// bounty's claim minimum. `None` outside the eligible list, whose rows
 /// alone carry `issuerRank`.
 fn qualify_chip(bounty: &Bounty) -> Option<String> {
     let rank = bounty.issuer_rank?;
@@ -116,7 +116,7 @@ fn qualify_chip(bounty: &Bounty) -> Option<String> {
     };
     Some(format!(
         "you qualify — rank {rank} ≥ {}",
-        bounty.effective_min_rank()
+        bounty.claim_min_rank()
     ))
 }
 

@@ -186,6 +186,19 @@ impl Bounty {
             INSTANCE_MIN_RANK
         }
     }
+
+    /// The rank a claimant needs, whoever pays: the server rule
+    /// ([`Self::effective_min_rank`]) when the server's auto-payer pays,
+    /// else the minimum the server stored with the bounty — this app always
+    /// sends one, for the issuer's app to pay by — never below the instance
+    /// floor, and the floor alone when none is stored.
+    pub fn claim_min_rank(&self) -> u64 {
+        if self.server_auto_pay_on() {
+            self.effective_min_rank()
+        } else {
+            INSTANCE_MIN_RANK.max(self.auto_pay_min_rank.unwrap_or(INSTANCE_MIN_RANK))
+        }
+    }
 }
 
 /// The eligible list as the viewer can act on it. The server keeps the
@@ -195,7 +208,7 @@ impl Bounty {
 pub fn claimable_by(list: Vec<Bounty>, viewer: &str) -> Vec<Bounty> {
     list.into_iter()
         .filter(|b| b.issuer_pubkey != viewer)
-        .filter(|b| b.issuer_rank.unwrap_or(0.0) >= b.effective_min_rank() as f64)
+        .filter(|b| b.issuer_rank.unwrap_or(0.0) >= b.claim_min_rank() as f64)
         .collect()
 }
 
@@ -868,6 +881,21 @@ mod tests {
         ];
         let ids: Vec<String> = claimable_by(list, "me").into_iter().map(|b| b.id).collect();
         assert_eq!(ids, ["bb-2", "cc-3"]);
+    }
+
+    #[test]
+    fn an_app_paid_bounty_needs_its_stored_minimum() {
+        let min = |extra| eligible_row("aa", 2.into(), extra).claim_min_rank();
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 5})), 5);
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 1})), 2);
+        assert_eq!(min(serde_json::json!({})), 2);
+        assert_eq!(min(serde_json::json!({"auto_pay": 1})), 3);
+        let list = vec![
+            eligible_row("aa", 3.into(), serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 4})),
+            eligible_row("bb", 4.into(), serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 4})),
+        ];
+        let ids: Vec<String> = claimable_by(list, "me").into_iter().map(|b| b.id).collect();
+        assert_eq!(ids, ["bb-4"], "rank 3 misses the stored minimum of 4");
     }
 
     #[test]

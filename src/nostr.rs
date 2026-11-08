@@ -2349,7 +2349,7 @@ async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -
     let min_rank = setting
         .as_ref()
         .map(|s| s.min_rank)
-        .unwrap_or_else(|| detail.bounty.effective_min_rank());
+        .unwrap_or_else(|| detail.bounty.claim_min_rank());
     let policy = Policy::of(&detail.bounty, setting.is_some() || !issuer_here, min_rank);
     let decisions: HashMap<String, Result<(), Hold>> =
         autopay::plan(&policy, &facts).into_iter().collect();
