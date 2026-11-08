@@ -25,6 +25,9 @@ pub const DLIST_KIND: u16 = 39998;
 pub const CLAIM_KIND: u16 = 39999;
 /// NIP-57 zap receipt. Joins a claim through its `e` tag.
 pub const RECEIPT_KIND: u16 = 9735;
+/// NIP-57 zap request: signed by the payer, carried to the recipient's LNURL
+/// server, embedded in the receipt's `description` tag.
+pub const ZAP_REQUEST_KIND: u16 = 9734;
 
 #[derive(thiserror::Error, Debug)]
 pub enum EventError {
@@ -158,6 +161,39 @@ pub fn claim(keys: &Keys, name: &str, list_coordinate: &str) -> Result<Event, Ev
             tag(["d", dtag.as_str()])?,
             tag(["z", list_coordinate])?,
             tag(["name", name])?,
+        ])
+        .finalize(keys)
+        .map_err(|e| EventError::Sign(e.to_string()))
+}
+
+/// Signed kind-9734 zap request for paying a claim, the shape
+/// magic-carpet-v2/src/lib/zap-node.js `buildZapRequest` signs: content "",
+/// `["p", claimant]`, `["e", claim id]`, `["a", list coordinate]`,
+/// `["amount", msats]`, `["relays", …]`. The server counts the claim paid when
+/// the receipt's description pubkey is the issuer, so `keys` must be the
+/// issuer's.
+pub fn zap_request(
+    keys: &Keys,
+    claimant_hex: &str,
+    claim_event_id: &str,
+    list_coordinate: &str,
+    sats: u64,
+    relays: &[String],
+) -> Result<Event, EventError> {
+    if sats == 0 {
+        return Err(EventError::Invalid("A zap needs at least 1 sat.".into()));
+    }
+    let msats = sats.saturating_mul(1000).to_string();
+    let relay_tag: Vec<&str> = std::iter::once("relays")
+        .chain(relays.iter().map(String::as_str))
+        .collect();
+    EventBuilder::new(Kind::Custom(ZAP_REQUEST_KIND), "")
+        .tags([
+            tag(["p", claimant_hex])?,
+            tag(["e", claim_event_id])?,
+            tag(["a", list_coordinate])?,
+            tag(["amount", msats.as_str()])?,
+            tag(relay_tag)?,
         ])
         .finalize(keys)
         .map_err(|e| EventError::Sign(e.to_string()))
@@ -364,6 +400,36 @@ mod tests {
         assert_eq!(receipt.amount_msats, Some(100_000));
         assert_eq!(receipt.amount_sats(), Some(100));
         assert_eq!(receipt.created_at, 1_786_093_481);
+    }
+
+    #[test]
+    fn a_zap_request_matches_the_server_shape() {
+        let issuer = Keys::generate();
+        let claimant = "aa".repeat(32);
+        let relays = vec![
+            "wss://magic-carpet.brainstorm.world/relay".to_string(),
+            "wss://nos.lol".to_string(),
+        ];
+        let event = zap_request(&issuer, &claimant, "e1", COORD, 100, &relays).unwrap();
+        assert_eq!(event.kind.as_u16(), ZAP_REQUEST_KIND);
+        assert_eq!(event.content, "");
+        assert_eq!(event.pubkey, issuer.public_key(), "signed by the issuer");
+        assert!(event.verify().is_ok());
+        assert_eq!(
+            tags_of(&event),
+            vec![
+                vec!["p".to_string(), claimant],
+                vec!["e".to_string(), "e1".to_string()],
+                vec!["a".to_string(), COORD.to_string()],
+                vec!["amount".to_string(), "100000".to_string()],
+                vec![
+                    "relays".to_string(),
+                    relays[0].clone(),
+                    relays[1].clone(),
+                ],
+            ]
+        );
+        assert!(zap_request(&issuer, "bb", "e1", COORD, 0, &relays).is_err());
     }
 
     #[test]
