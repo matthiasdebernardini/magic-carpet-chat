@@ -25,11 +25,12 @@ APP_BIN = "/usr/local/bin/magic-carpet-chat-e2e"   # run.sh installs here; the d
 WALLET = "node /usr/local/lib/node_modules/brainstorm/node_modules/.bin/agent-wallet"
 FAKE_URL, RELAY_URL = "http://127.0.0.1:8787", "ws://127.0.0.1:10547"
 BS_URL = "http://127.0.0.1:8788"        # fake Brainstorm (same fake_instance.py)
-PAID = ("P", "R", "Y")                  # move real sats: skipped by --no-paid
+PAID = ("P", "R", "Y", "Z")             # move real sats: skipped by --no-paid
 # Two 1280x960 apps side by side: xfwm adds 5 px of frame left and right, so
-# each window is 1290 wide and two fit 2580 exactly (scenarios.APP_B_AT).
-OPT_IN = ("Y",)                         # never in a default run, only via --only
-WIDE = {"Y": (2580, 960)}               # the screen and the recording are this size
+# each window is 1290 wide and two fit 2580 exactly (scenarios.APP_B_AT),
+# three 3870 (scenarios.Z_AT).
+OPT_IN = ("Y", "Z")                     # never in a default run, only via --only
+WIDE = {"Y": (2580, 960), "Z": (3870, 960)}   # the screen and the recording are this size
 # The e2e session bus inside mc: the app registers its AccessKit tree on the
 # accessibility bus this bus's at-spi-bus-launcher hands out, and atspi.py
 # reads it there. Box.a11y_up gives the bus its own XDG_RUNTIME_DIR, so that
@@ -450,8 +451,10 @@ class Box:
         by its own pid, placed there, and recorded as `self.last_app` (an
         App). keep=True leaves the apps already running alone. `store`
         relaunches on an existing MC_STORE_DIR instead of a fresh one.
-        seed_account=(accounts.json, pubkey) starts the fresh store with that
-        one account, copied inside the container (see reusable_wallets).
+        seed_account=(accounts.json, pubkey or [pubkeys]) starts the fresh
+        store with those accounts (the first active), copied inside the
+        container without their auto-pay switches, so a reused account never
+        pays an earlier run's bounty (see reusable_wallets).
         The app always gets the e2e session bus, so its AccessKit tree
         reaches atspi.py (a11y_up must have answered first)."""
         if not keep:
@@ -462,15 +465,17 @@ class Box:
         if seed:
             dx(f"cp /root/mc-store/accounts.json {store}/ && chmod 600 {store}/accounts.json")
         if seed_account:
-            src, pub = seed_account
-            if not re.fullmatch(r"[0-9a-f]{64}", pub):
+            src, pubs = seed_account
+            pubs = [pubs] if isinstance(pubs, str) else list(pubs)
+            if not pubs or not all(re.fullmatch(r"[0-9a-f]{64}", p) for p in pubs):
                 raise RuntimeError("seed_account: not a hex pubkey")
-            # jq inside mc: the account's nsec and Coinos login never leave it.
-            r = dx(f"(umask 077; jq --arg p {pub} '{{active: $p, accounts: [.accounts[] | select(.pubkey == $p)]}}' "
+            # jq inside mc: the accounts' nsecs and Coinos logins never leave it.
+            r = dx(f"(umask 077; jq --argjson ps '{json.dumps(pubs)}' '{{active: $ps[0], accounts: "
+                   f"[.accounts[] | select(.pubkey as $k | $ps | index($k)) | del(.auto_pay)]}}' "
                    f"{shlex.quote(src)} > {store}/accounts.json.tmp) && mv {store}/accounts.json.tmp {store}/accounts.json "
                    f"&& chmod 600 {store}/accounts.json && jq '.accounts | length' {store}/accounts.json")
-            if r.stdout.strip() != "1":
-                raise RuntimeError(f"seed_account: the seeded store does not hold the one account (jq said {r.stdout.strip()!r})")
+            if r.stdout.strip() != str(len(pubs)):
+                raise RuntimeError(f"seed_account: the seeded store does not hold the {len(pubs)} account(s) (jq said {r.stdout.strip()!r})")
         base, relay = (FAKE_URL, RELAY_URL) if target == "fake" else ("http://tapestry", "ws://tapestry/relay")
         env = dict(os.environ)
         env.update({
@@ -583,12 +588,33 @@ class Box:
         if not re.fullmatch(r"\d{8}-\d{6}", run_id or ""):
             return None, None
         path = f"/root/.trash/e2e-stores/{run_id}/R/accounts.json"
+        pubs = self._app_made_wallets(path)
+        return path, (pubs if len(pubs) == 2 else None)
+
+    def reusable_z_wallets(self, run_id):
+        """{"A": (path, [a]), "B": (path, [b]), "C": (path, [c, d])}: the
+        app-made Coinos accounts of an earlier Z run's three stores, in the
+        trash, in the order they were made; None unless each holds exactly
+        those (1, 1 and 2). Only the pubkeys leave the container."""
+        if not re.fullmatch(r"\d{8}-\d{6}", run_id or ""):
+            return None
+        out = {}
+        for who, n in (("A", 1), ("B", 1), ("C", 2)):
+            path = f"/root/.trash/e2e-stores/{run_id}/Z-{who}/accounts.json"
+            pubs = self._app_made_wallets(path)
+            if len(pubs) != n:
+                return None
+            out[who] = (path, pubs)
+        return out
+
+    def _app_made_wallets(self, path):
+        """Pubkeys of the app-made accounts in `path` with a Coinos login
+        and token, in store order."""
         # An empty token is a signup whose outcome was never known: not a wallet.
         r = dx(f"jq -r '.accounts[] | select(.created_in_app == true and .coinos != null "
                f"and (.coinos.username // \"\") != \"\" and (.coinos.token // \"\") != \"\") | .pubkey' {path}")
         pubs = r.stdout.split() if r.returncode == 0 else []
-        ok = len(pubs) == 2 and all(re.fullmatch(r"[0-9a-f]{64}", p) for p in pubs)
-        return path, (pubs if ok else None)
+        return pubs if all(re.fullmatch(r"[0-9a-f]{64}", p) for p in pubs) else []
 
     def accounts_in_store(self, store):
         r = dx(f"jq '.accounts | length' {store}/accounts.json")
@@ -925,8 +951,9 @@ class Suite:
         if self.args.mock_jev:
             os.environ.pop("TYPESAFE_API_KEY", None)
         self.jev = Jev()
-        # Y is opt-in: it runs only when --only names it (two app-made
-        # accounts and up to ~556 sats with P and R).
+        # Y and Z are opt-in: they run only when --only names them (Y: two
+        # app-made accounts and up to ~556 sats with P and R; Z: four
+        # accounts and ~800 sats of float, most of it swept back).
         wanted = [s.strip().upper() for s in self.args.only.split(",")] if self.args.only else [s for s in registry if s not in OPT_IN]
         paid = any(s in wanted for s in PAID) and not self.args.no_paid
         meta = {"run_id": self.run_id,
@@ -938,8 +965,10 @@ class Suite:
             meta["float_before_suite"] = bal
             # P pays one claim (200 alone); R and Y pay two newcomers each
             # (250 for the first, about 204 for each further one, 102 for P).
+            # Z funds three wallets with 250 each, plus fees (800).
             two = sum(1 for s in ("R", "Y") if s in wanted)
-            need = 250 + 204 * (two - 1) + (102 if "P" in wanted else 0) if two else 200
+            need = 250 + 204 * (two - 1) + (102 if "P" in wanted else 0) if two else (200 if "P" in wanted else 0)
+            need += 800 if "Z" in wanted else 0
             if bal is None or bal < need:
                 print(f"PREFLIGHT: the auto-pay float is {bal} sats, below {need}. "
                       f"Stopping. fund with ~/mc/fund.sh 500", flush=True)
@@ -1058,7 +1087,7 @@ class Suite:
 
     def collect(self, sid):
         d = os.path.join(self.out, sid)
-        apps = [(f"{CDIR}/logs/{sid}-{a}.app.log", f"app-{a}.log") for a in ("A", "B", "B2")] if sid in WIDE else []
+        apps = [(f"{CDIR}/logs/{sid}-{a}.app.log", f"app-{a}.log") for a in ("A", "B", "B2", "C")] if sid in WIDE else []
         for src, dst in ((f"{CDIR}/rec/{sid}.mp4", f"{sid}.mp4"), (f"{CDIR}/logs/{sid}.app.log", "app.log"),
                          (f"{CDIR}/server.log", "fake-server.log"), *apps):
             p = os.path.join(d, dst)
@@ -1091,6 +1120,8 @@ class Suite:
             head.append(f"Float (R): {meta.get('float_before_r')} sats before, {meta.get('float_after_r')} sats after")
         if "float_before_y" in meta or "float_after_y" in meta:
             head.append(f"Float (Y): {meta.get('float_before_y')} sats before, {meta.get('float_after_y')} sats after")
+        if "float_before_z" in meta or "float_after_z" in meta:
+            head.append(f"Float (Z): {meta.get('float_before_z')} sats before, {meta.get('float_after_z')} sats after (leftovers swept back)")
         if meta.get("stopped"):
             head.append(f"STOPPED: {meta['stopped']} (fund with ~/mc/fund.sh 500)")
         open(os.path.join(self.out, "report.md"), "w").write("\n".join(head + [""] + rows) + "\n")
@@ -1113,13 +1144,14 @@ def _quiet_agent_log():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", default=time.strftime("%Y%m%d-%H%M%S"))
-    ap.add_argument("--no-paid", action="store_true", help="development only: skip P, R and Y")
+    ap.add_argument("--no-paid", action="store_true", help="development only: skip P, R, Y and Z")
     ap.add_argument("--only", default="", help="comma list of scenario ids, e.g. A,G")
     ap.add_argument("--mock-jev", action="store_true", help="development only: no TypeSafe calls")
     ap.add_argument("--no-restore", action="store_true", help="do not relaunch run-app.sh at the end")
     ap.add_argument("--reuse-wallets", default="", metavar="RUN_ID",
-                    help="Y only: seed its two newcomers from that run's R store in the trash "
-                         "(two app-made Coinos accounts) instead of new Coinos signups")
+                    help="Y: seed its two newcomers from that run's R store in the trash "
+                         "(two app-made Coinos accounts); Z: seed A, B, C and D from that run's "
+                         "Z stores; instead of new Coinos signups")
     args = ap.parse_args()
     _quiet_agent_log()
     from scenarios import SCENARIOS
