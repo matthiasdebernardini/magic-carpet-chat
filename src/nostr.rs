@@ -1781,8 +1781,7 @@ async fn eligible(client: &Client, ctx: &AutoPayCtx, viewer: &str) -> Result<Vec
         match facts.get(&b.id) {
             Some(facts) => {
                 let (slots, per_npub) = autopay::slots_and_limit(b);
-                let facts: Vec<ClaimFacts> = facts.iter().map(|(f, _)| f.clone()).collect();
-                autopay::open_for(slots, per_npub, &facts, viewer)
+                autopay::open_for(slots, per_npub, facts, viewer)
             }
             // The server's own auto-pay bounties keep the server's count:
             // its delegate's receipts are not the issuer's to check here.
@@ -2102,6 +2101,29 @@ fn facts_for<'a>(
         .collect()
 }
 
+/// The issuer's attempts on this bounty that no current claim carries (the
+/// claim was replaced away or deleted from the relay), as facts that hold
+/// their slot: money that may have left must keep counting against the cap.
+fn orphan_attempts(
+    bounty: &Bounty,
+    facts: &[ClaimFacts],
+    attempts: &[secrets::PayAttempt],
+) -> Vec<ClaimFacts> {
+    attempts
+        .iter()
+        .filter(|a| a.bounty_id == bounty.id && !facts.iter().any(|f| f.address == a.claim_address))
+        .map(|a| ClaimFacts {
+            address: a.claim_address.clone(),
+            event_id: a.claim_event_id.clone(),
+            claimant: a.claimant.clone(),
+            created_at: a.started_at,
+            paid: false,
+            attempt: Some(a.state),
+            rank: None,
+        })
+        .collect()
+}
+
 /// The bounty's counters and status from the client's own count: paid
 /// claims, slots held by attempts, slots left. A bounty every slot of which
 /// is paid reads fulfilled even while the server still calls it open.
@@ -2154,7 +2176,7 @@ async fn fold_relay_usage(
     client: &Client,
     bounties: &mut [Bounty],
     store: &secrets::Store,
-) -> HashMap<String, Vec<(ClaimFacts, Event)>> {
+) -> HashMap<String, Vec<ClaimFacts>> {
     for bounty in bounties.iter_mut() {
         bounty.app_auto_pay = setting_of(store, bounty).is_some();
     }
@@ -2177,13 +2199,13 @@ async fn fold_relay_usage(
     };
     let mut out = HashMap::new();
     for bounty in bounties.iter_mut().filter(|b| app_paid(b)) {
-        let facts: Vec<(ClaimFacts, Event)> =
-            facts_for(bounty, &claims, &receipts, attempts_of(store, &bounty.issuer_pubkey))
-                .into_iter()
-                .map(|(f, e)| (f, e.clone()))
-                .collect();
-        let plain: Vec<ClaimFacts> = facts.iter().map(|(f, _)| f.clone()).collect();
-        apply_usage(bounty, &plain);
+        let attempts = attempts_of(store, &bounty.issuer_pubkey);
+        let mut facts: Vec<ClaimFacts> = facts_for(bounty, &claims, &receipts, attempts)
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        facts.extend(orphan_attempts(bounty, &facts, attempts));
+        apply_usage(bounty, &facts);
         out.insert(bounty.id.clone(), facts);
     }
     out
@@ -2303,8 +2325,11 @@ async fn annotate(ctx: &AutoPayCtx, client: &Client, mut detail: BountyDetail) -
         claims.push(claim);
     }
     // Claims the server lists that the relay no longer serves keep their
-    // place, with what the server says about them.
+    // place, with what the server says about them; attempts whose claim is
+    // gone keep their slot.
     claims.extend(by_id.into_values());
+    let orphans = orphan_attempts(&detail.bounty, &facts, attempts);
+    facts.extend(orphans);
     claims.sort_by_key(|c| (c.event.created_at.unwrap_or(0), c.event.id.clone()));
 
     let pairs: Vec<(String, String)> = facts
@@ -3927,6 +3952,40 @@ mod tests {
         apply_usage(&mut bounty, &[paid(1, "bob"), paid(2, "carol")]);
         assert!(bounty.payment_state.as_ref().unwrap().fulfilled);
         assert_eq!(bounty.effective_status(), "fulfilled");
+    }
+
+    #[test]
+    fn an_attempt_whose_claim_left_the_relay_still_holds_its_slot() {
+        let bounty = bounty_row(serde_json::json!({}));
+        let attempt = |bounty_id: &str, address: &str| secrets::PayAttempt {
+            bounty_id: bounty_id.into(),
+            claim_address: address.into(),
+            claim_event_id: "gone".into(),
+            claimant: "bob".into(),
+            sats: 100,
+            state: AttemptState::Paid,
+            reason: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        let present = ClaimFacts {
+            address: "carol:x".into(),
+            event_id: "e1".into(),
+            claimant: "carol".into(),
+            created_at: 1,
+            paid: false,
+            attempt: Some(AttemptState::Paid),
+            rank: None,
+        };
+        let attempts = [
+            attempt("b1", "bob:y"),
+            attempt("b1", "carol:x"),
+            attempt("other", "dave:z"),
+        ];
+        let orphans = orphan_attempts(&bounty, std::slice::from_ref(&present), &attempts);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].address, "bob:y");
+        assert_eq!(orphans[0].attempt, Some(AttemptState::Paid));
     }
 
     #[test]
