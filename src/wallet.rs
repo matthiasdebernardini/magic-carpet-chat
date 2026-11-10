@@ -487,7 +487,7 @@ pub fn panel(
             .gap(px(10.))
             .child(line(
                 "wallet-no-address",
-                "No Lightning address yet — claims are accepted but never paid.",
+                "No Lightning address yet: claims are accepted but never paid.",
                 AMBER,
             ))
             .child(

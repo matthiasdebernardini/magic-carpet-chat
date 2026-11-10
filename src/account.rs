@@ -423,7 +423,7 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
     let card_id = format!("accounts-card-{}", view.pubkey);
     let name = display_name(view);
     let payout = match view.payout_address() {
-        Some(address) => format!("payouts → {address}"),
+        Some(address) => format!("payouts to {address}"),
         None => "no payout address yet".to_string(),
     };
     h_flex()
@@ -1507,7 +1507,7 @@ fn map_card(
     if let Some(message) = failed_message {
         let checked = match state.checked_at {
             Some(at) => format!(
-                "Last successful check: {} — {}",
+                "Last successful check: {} ({})",
                 timefmt::relative(now, at),
                 timefmt::month_day_year(at)
             ),

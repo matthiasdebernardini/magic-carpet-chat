@@ -459,15 +459,15 @@ def create_account(who, stamp, first_run=False):
         open_setup = Step(f"On the first-run 'Your Nostr account' card, choose 'Create a new account' for newcomer {who}.",
                           [Cand("press-create", "Press the 'Create a new account' button.",
                                 [("wait_id", "setup-create"), ("press", "setup-create"), ("wait_id", "setup-name"), PARK])],
-                          "The 'Create a new account' card is open with a 'Name (optional)' input and a 'Create — Enter' button.",
-                          tries=1, settle=1, cues=("Name (optional)", "Create — Enter", "Create a new account", "I already have a key"))
+                          "The 'Create a new account' card is open with a 'Name (optional)' input and a 'Create (Enter)' button.",
+                          tries=1, settle=1, cues=("Name (optional)", "Create (Enter)", "Create a new account", "I already have a key"))
     else:
         open_setup = Step(f"Open account setup from the '+' in the left rail and choose 'Create a new account' for newcomer {who}.",
                           [Cand("press-add-then-create", "Press the rail's 'Add account' (+) button, then the 'Create a new account' button.",
                                 [("press", "rail-add-account"), ("wait_id", "setup-create"), ("press", "setup-create"),
                                  ("wait_id", "setup-name"), PARK])],
-                          "The 'Create a new account' card is open with a 'Name (optional)' input and a 'Create — Enter' button.",
-                          tries=1, settle=1, cues=("Name (optional)", "Create — Enter", "Create a new account", "I already have a key"))
+                          "The 'Create a new account' card is open with a 'Name (optional)' input and a 'Create (Enter)' button.",
+                          tries=1, settle=1, cues=("Name (optional)", "Create (Enter)", "Create a new account", "I already have a key"))
     return [
         open_setup,
         # tries=1: a second Create is a second account and wallet.
@@ -477,7 +477,7 @@ def create_account(who, stamp, first_run=False):
              [Cand("name-then-enter", "Click into the Name input, type the name, then press Enter.",
                    [FOCUS, ("click_id", "setup-name"), ("type", name), ("wait", 0.4), ("key", "Return"), ("wait", 1)])],
              "The account is being created, or the ready panel shows 'Coinos wallet ready'.",
-             tries=1, settle=10, cues=("Coinos wallet ready", "Creating", "Create — Enter", "Couldn't")),
+             tries=1, settle=10, cues=("Coinos wallet ready", "Creating", "Create (Enter)", "Couldn't")),
     ]
 
 

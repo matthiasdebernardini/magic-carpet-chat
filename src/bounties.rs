@@ -362,7 +362,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .py(px(12.))
                 .child({
                     let text = format!(
-                        "{} didn't load: {message} Click Retry.",
+                        "{} didn't load: {message}",
                         if eligible { "Eligible bounties" } else { "Bounties" }
                     );
                     div()
@@ -503,7 +503,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
                 .unwrap_or_default();
             let (dot, text) = match row.state.as_str() {
                 "attempting" => (ACCENT, "Auto-pay attempting…".to_string()),
-                "paid" => (AMBER, "Paid — waiting for the zap receipt".to_string()),
+                "paid" => (AMBER, "Paid, waiting for the zap receipt".to_string()),
                 "settled" => (GREEN, "Payment settled".to_string()),
                 "paid_unreceipted" => (AMBER, format!("Paid, no receipt{why}")),
                 "failed" => (RED, format!("Auto-pay failed{why}")),
@@ -665,7 +665,7 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
             let text = if shell.selected_is_optimistic() {
                 // The header above renders the just-submitted values; be
                 // honest that the server has not echoed them back yet.
-                "Created — syncing with the instance…"
+                "Created, syncing with the instance…"
             } else {
                 "Loading claims…"
             };

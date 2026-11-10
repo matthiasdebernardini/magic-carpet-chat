@@ -3561,11 +3561,11 @@ impl Shell {
                         .a11y(
                             "wallet-no-account",
                             Role::Label,
-                            "No account — press + in the rail to add one.",
+                            "No account. Press + in the rail to add one.",
                         )
                         .text_size(px(12.5))
                         .text_color(rgb(TEXT_MUTED))
-                        .child("No account — press + in the rail to add one.")
+                        .child("No account. Press + in the rail to add one.")
                         .into_any_element(),
                 };
                 div()
