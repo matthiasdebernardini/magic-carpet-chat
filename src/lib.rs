@@ -11,9 +11,13 @@ pub const USER_AGENT: &str = concat!("magic-carpet-chat/", env!("CARGO_PKG_VERSI
 
 pub mod api;
 pub mod autopay;
+pub mod bounty_search;
+pub mod bounty_toml;
 pub mod brainstorm;
 pub mod coinos;
+pub mod diag;
 pub mod events;
 pub mod nostr;
 pub mod secrets;
+pub mod timefmt;
 pub mod trust;

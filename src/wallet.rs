@@ -336,8 +336,17 @@ fn send_block(state: &WalletState, inputs: &SendInputs, cx: &mut Context<Shell>)
 
 /// The panel for `view`: `view.lud16` is the profile as the relays have it,
 /// `view.wallet` the stored or just-opened Coinos wallet, if any. `send` is
-/// the Wallet screen's input pair; the account screen passes `None`, because
-/// a wallet that is waiting for its first sats has nothing to send.
+/// the send form's input pair, passed by the Wallet screen and by the Account
+/// page's Wallet tab when its account is the active one ([`shows_send`]).
+/// The account setup screen passes `None`, because a wallet that is waiting
+/// for its first sats has nothing to send.
+/// The Account page's Wallet tab shows the send form only for the active
+/// account: `Shell::send_sats` pays from the active account, so a form on
+/// any other account's page would pay from a wallet that is not on screen.
+pub fn shows_send(active: Option<&str>, page_pubkey: &str) -> bool {
+    active == Some(page_pubkey)
+}
+
 pub fn panel(
     view: &AccountView,
     first_funding: bool,
@@ -521,6 +530,14 @@ mod tests {
                 format!("was {}", timefmt::fmt_sats(1_000))
             )
         );
+    }
+
+    #[test]
+    fn the_send_form_shows_only_on_the_active_accounts_page() {
+        use super::shows_send;
+        assert!(shows_send(Some("a"), "a"));
+        assert!(!shows_send(Some("a"), "b"));
+        assert!(!shows_send(None, "a"));
     }
 
     #[test]

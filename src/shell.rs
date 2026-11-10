@@ -15,11 +15,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::component::{
     Root, TitleBar, WindowExt as _, h_flex, notification::Notification,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, MoveDown, MoveUp},
     v_flex,
 };
 
-use magic_carpet_chat::api::{Bounty, BountyDetail, CreateBounty, claimable_by};
+use magic_carpet_chat::api::{Bounty, BountyDetail, Claim, CreateBounty, claimable_by};
+use magic_carpet_chat::bounty_search::{self, Snapshot, Visits};
 use magic_carpet_chat::coinos;
 use magic_carpet_chat::events;
 use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated};
@@ -31,6 +32,7 @@ use crate::account_setup::{self, AccountSetup, Path as SetupPath, ReadySummary};
 use crate::bounties;
 use crate::chat::Chat;
 use crate::community::CommunityState;
+use crate::debug_report;
 use crate::dashboard::{self, MONO, avatar};
 use crate::icons::icon;
 use crate::palette::*;
@@ -110,32 +112,87 @@ actions!(
     shell,
     [
         GoDashboard, GoBounties, GoPayments, GoClaimants, GoBoards, GoWallet, GoTags, GoChat,
-        PrevAccount, NextAccount, Refresh, NewItem, CloseForm, SelectPrev, SelectNext, Confirm
+        PrevAccount, NextAccount, Refresh, NewItem, CloseForm, CancelForm, SelectPrev, SelectNext, Confirm,
+        CopyDebugInfo
     ]
 );
+
+/// The app shortcuts, one row each: keystroke, action, what the pill says.
+/// The bindings, the pill's text and the capture listeners that show it all
+/// come from this table, so they cannot drift apart.
+macro_rules! shortcuts {
+    ($(($keys:literal, $action:ident, $label:literal)),* $(,)?) => {
+        fn shortcut_bindings() -> Vec<KeyBinding> {
+            vec![$(KeyBinding::new($keys, $action, None)),*]
+        }
+
+        /// The keystroke and label of the action named `name`.
+        fn shortcut_of(name: &str) -> Option<(&'static str, &'static str)> {
+            $(if name == <$action as Action>::name_for_type() {
+                return Some(($keys, $label));
+            })*
+            None
+        }
+
+        /// Capture-phase listeners that flash the pill, then let the
+        /// action reach its own handler.
+        fn watch_shortcuts<E: InteractiveElement>(element: E, cx: &mut Context<Shell>) -> E {
+            $(let element = element.capture_action(
+                cx.listener(|this, action: &$action, window, cx| this.flash_shortcut(action, window, cx)),
+            );)*
+            element
+        }
+    };
+}
+
+shortcuts![
+    ("cmd-1", GoDashboard, "Dashboard"),
+    ("cmd-2", GoBounties, "Bounties"),
+    ("cmd-3", GoPayments, "Payments"),
+    ("cmd-4", GoClaimants, "Claimants"),
+    ("cmd-5", GoBoards, "Boards"),
+    ("cmd-6", GoWallet, "Wallet"),
+    ("cmd-7", GoTags, "Tags"),
+    ("cmd-8", GoChat, "Chat"),
+    ("cmd-[", PrevAccount, "Previous account"),
+    ("cmd-]", NextAccount, "Next account"),
+    ("cmd-r", Refresh, "Refresh"),
+    ("cmd-n", NewItem, "New"),
+    ("cmd-shift-c", CopyDebugInfo, "Copy debug info"),
+    // The text inputs bind escape themselves but propagate it when they
+    // have nothing to do; cmd-. is the cancel that no input ever eats.
+    // Only escape first clears a non-empty search (CloseForm); cmd-.
+    // (CancelForm) always cancels.
+    ("escape", CloseForm, "Cancel"),
+    ("cmd-.", CancelForm, "Cancel"),
+];
+
+/// How long the shortcut pill stays after the last shortcut.
+const SHORTCUT_SHOWN_FOR: Duration = Duration::from_secs(2);
+
+/// A binding's keystroke as shown: `cmd-shift-c` → `⌘⇧C`, `escape` → `esc`.
+fn shortcut_text(keys: &str) -> String {
+    if keys == "escape" {
+        return "esc".to_string();
+    }
+    keys.split('-')
+        .map(|part| match part {
+            "cmd" => "⌘".to_string(),
+            "shift" => "⇧".to_string(),
+            "ctrl" => "⌃".to_string(),
+            "alt" => "⌥".to_string(),
+            key => key.to_uppercase(),
+        })
+        .collect()
+}
 
 /// cmd-1…cmd-8 follow the nav order; cmd-[ / cmd-] step through accounts.
 /// Keyboard routes exist for their own sake, but they are also the only input
 /// UI automation can drive: gpui ignores synthetic mouse events posted to the
 /// process, while key events arrive fine. The full demo path is in DEMO.md.
 pub fn keybindings() -> Vec<KeyBinding> {
-    vec![
-        KeyBinding::new("cmd-1", GoDashboard, None),
-        KeyBinding::new("cmd-2", GoBounties, None),
-        KeyBinding::new("cmd-3", GoPayments, None),
-        KeyBinding::new("cmd-4", GoClaimants, None),
-        KeyBinding::new("cmd-5", GoBoards, None),
-        KeyBinding::new("cmd-6", GoWallet, None),
-        KeyBinding::new("cmd-7", GoTags, None),
-        KeyBinding::new("cmd-8", GoChat, None),
-        KeyBinding::new("cmd-[", PrevAccount, None),
-        KeyBinding::new("cmd-]", NextAccount, None),
-        KeyBinding::new("cmd-r", Refresh, None),
-        KeyBinding::new("cmd-n", NewItem, None),
-        // The text inputs bind escape themselves but propagate it when they
-        // have nothing to do; cmd-. is the cancel that no input ever eats.
-        KeyBinding::new("escape", CloseForm, None),
-        KeyBinding::new("cmd-.", CloseForm, None),
+    let mut bindings = shortcut_bindings();
+    bindings.extend([
         // Scoped to the Shell node: a focused text input is deeper in the
         // key-context stack, so its own up/down/enter bindings win there.
         // Context-less (None) versions of these would shadow every input's
@@ -146,7 +203,79 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", SelectNext, Some("Shell")),
         // The account screen's "Start": only fires when the shell itself has focus.
         KeyBinding::new("enter", Confirm, Some("Shell")),
-    ]
+    ]);
+    bindings
+}
+
+/// The claim a payment fact is about. The claim event is replaceable and the
+/// payment row keeps the id it paid, so a republished claim carries that id
+/// in `payment_claim_event_id` instead of `event.id`.
+fn paid_claim<'a>(claims: &'a [Claim], claim_id: &str) -> Option<&'a Claim> {
+    claims.iter().find(|c| {
+        c.event.id == claim_id || c.payment_claim_event_id.as_deref() == Some(claim_id)
+    })
+}
+
+/// What a shortcut's pill says, given the state it is pressed in: the
+/// table's label unless the press means something more specific.
+fn press_label(name: &str, label: &'static str, state: PressState) -> &'static str {
+    if name == <CloseForm as Action>::name_for_type() && state.search_has_text {
+        "Clear search"
+    } else if name == <NewItem as Action>::name_for_type() {
+        if !state.has_account {
+            "Add account"
+        } else if state.opens_claim {
+            "Claim"
+        } else {
+            "New bounty"
+        }
+    } else {
+        label
+    }
+}
+
+/// The state a shortcut is pressed in (before its handler runs).
+#[derive(Clone, Copy)]
+struct PressState {
+    has_account: bool,
+    opens_claim: bool,
+    /// The search field has focus and text: escape clears it.
+    search_has_text: bool,
+}
+
+/// Who a paid claim belongs to, for the toast: `None` when the claimant is not
+/// a stored account; "You" for the active account (or when only one is
+/// stored); else that account's display name. `stored` is (pubkey, name).
+fn payee_label(stored: &[(&str, String)], active: Option<&str>, claimant: &str) -> Option<String> {
+    let (_, name) = stored.iter().find(|(pubkey, _)| *pubkey == claimant)?;
+    Some(if stored.len() > 1 && active != Some(claimant) {
+        name.clone()
+    } else {
+        "You".to_string()
+    })
+}
+
+/// The toast for a payment fact, once. Only a settled payment (paid, with
+/// its receipt) whose own timestamp is at or after this launch counts, so a
+/// bounty's replayed history stays quiet; `who` is `None` for someone else's
+/// claim; `toasted` remembers claims already announced.
+fn paid_toast(
+    state: &str,
+    ts: u64,
+    launched_at: u64,
+    claim_id: &str,
+    who: Option<&str>,
+    toasted: &mut HashSet<String>,
+    (sats, item, list): (u64, &str, &str),
+) -> Option<String> {
+    if state != "settled" || ts < launched_at {
+        return None;
+    }
+    let who = who?;
+    if !toasted.insert(claim_id.to_string()) {
+        return None;
+    }
+    Some(format!("{who} got paid {} sats for \"{item}\" on {list}.", timefmt::fmt_sats(sats)))
 }
 
 /// The nav column order. Counts are computed from live state at render.
@@ -272,6 +401,27 @@ pub(crate) fn relay_address_gap(relay_lud16: Option<&str>) -> Option<String> {
         .then(|| "Your public profile does not list this address yet.".to_string())
 }
 
+/// The small "Copy debug info" button: bottom of the rail, and on the
+/// first-launch account screen where there is no rail.
+pub(crate) fn debug_button(cx: &mut Context<Shell>) -> impl IntoElement {
+    div()
+        .id("copy-debug-info")
+        .w(px(54.))
+        .px(px(4.))
+        .py(px(3.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(rgb(BORDER_2))
+        .cursor_pointer()
+        .text_size(px(9.))
+        .text_color(rgb(TEXT_DIM))
+        .text_center()
+        .hover(|this| this.text_color(rgb(TEXT)).border_color(rgb(BORDER_3)))
+        .a11y("copy-debug-info", Role::Button, "Copy debug info")
+        .child("Copy debug info")
+        .on_click(cx.listener(|this, _, window, cx| this.copy_debug_info(window, cx)))
+}
+
 /// The two hue pairs from the mock, alternated down the rail by position.
 pub(crate) fn account_hue(ix: usize) -> (u32, u32) {
     if ix.is_multiple_of(2) {
@@ -304,7 +454,7 @@ fn still_checking_list(checking: Option<u64>, update: &Update) -> Option<u64> {
 
 /// A bounty form is locked while its request is out, or while the list
 /// read after an unknown outcome is.
-fn form_locked(submitting: bool, checking_list: Option<u64>) -> bool {
+pub(crate) fn form_locked(submitting: bool, checking_list: Option<u64>) -> bool {
     submitting || checking_list.is_some()
 }
 
@@ -749,6 +899,22 @@ fn house_reply_pick(tab: BountyTab, selected: Option<&str>, list: &[Bounty]) -> 
         .flatten()
 }
 
+/// Whose wallet panel is on screen, if any: the setup screen's ready panel,
+/// ⌘6's active account, or the account an Account page's Wallet tab is for.
+fn wallet_shown<'a>(
+    screen: Screen,
+    ready: Option<&'a str>,
+    active: Option<&'a str>,
+    page: Option<(&'a str, Tab)>,
+) -> Option<&'a str> {
+    match screen {
+        Screen::AccountSetup => ready,
+        Screen::Wallet => active,
+        Screen::Account => page.filter(|(_, tab)| *tab == Tab::Wallet).map(|(pubkey, _)| pubkey),
+        _ => None,
+    }
+}
+
 /// ⌘N and the Bounties header button open a claim rather than the bounty
 /// form: always for a claimant, and for the issuer while the Bounties
 /// screen shows its Eligible tab and no bounty form is open. An open one,
@@ -896,6 +1062,20 @@ pub struct Shell {
     pub(crate) commands: mpsc::UnboundedSender<Command>,
     chat: Entity<Chat>,
     search: Entity<InputState>,
+    /// The search text as of the last change, and the order the list was
+    /// last shown in: a snapshot, so a click's visit never reorders it
+    /// ([`Shell::refresh_order`]).
+    pub(crate) query: String,
+    snapshot: Snapshot,
+    /// The visit log behind the default (frecency) order.
+    visits: Visits,
+    _search_sub: Subscription,
+    /// The shortcut pill's text, and the task that clears it.
+    shortcut: Option<SharedString>,
+    shortcut_timer: Option<Task<()>>,
+    /// When this run started, and the claims already toasted as paid.
+    launched_at: u64,
+    paid_toasted: HashSet<String>,
     /// Keeps key dispatch anchored inside the shell on screens with no input
     /// of their own, so the cmd-N bindings always land.
     focus: FocusHandle,
@@ -918,7 +1098,7 @@ pub struct Shell {
     /// The last `FetchBounties` sequence number sent.
     bounties_seq: u64,
     /// The Wallet screen's recipient and amount; cleared on an account switch.
-    send_inputs: SendInputs,
+    pub(crate) send_inputs: SendInputs,
     /// Per-account NIP-85 state (Treasure Map, assertions, follows), keyed by
     /// pubkey. Each entry carries the fetch generation it answers to.
     pub(crate) trust: HashMap<String, TrustState>,
@@ -1015,6 +1195,14 @@ impl Shell {
             }
         });
 
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search bounties…"));
+        let search_sub = cx.subscribe_in(&search, window, |this: &mut Self, input, event, window, cx| {
+            if let InputEvent::Change = event {
+                let query = input.read(cx).value().to_string();
+                this.on_query_changed(query, window, cx);
+            }
+        });
+
         Self {
             screen: Screen::Dashboard,
             views: Vec::new(),
@@ -1040,9 +1228,15 @@ impl Shell {
             scroll_to: None,
             commands,
             chat,
-            search: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Search lists, bounties, profiles…")
-            }),
+            search,
+            query: String::new(),
+            snapshot: Snapshot::default(),
+            visits: Visits::load(),
+            _search_sub: search_sub,
+            shortcut: None,
+            shortcut_timer: None,
+            launched_at: timefmt::now_unix(),
+            paid_toasted: HashSet::new(),
             focus,
             _updates,
             _clock,
@@ -1146,12 +1340,98 @@ impl Shell {
         }
     }
 
+    /// The rows the Bounties screen shows: the shown list through the search
+    /// and the snapshot order. Only a view: the lists, the watches and the
+    /// counts stay whole. A list the snapshot was not taken from is ordered
+    /// afresh.
+    pub(crate) fn displayed(&self) -> Vec<&Bounty> {
+        let Load::Ready(list) = self.shown_list() else {
+            return Vec::new();
+        };
+        self.snapshot.view(list).unwrap_or_else(|| {
+            bounty_search::order(list, &self.query, &self.visits, timefmt::now_unix())
+                .into_iter()
+                .map(|ix| &list[ix])
+                .collect()
+        })
+    }
+
+    /// Shows the pill for the shortcut `action` just pressed, even when it
+    /// has nothing to do, and restarts the 2 s timer (replacing the task
+    /// drops, and so cancels, the old one).
+    fn flash_shortcut(&mut self, action: &dyn Action, window: &Window, cx: &mut Context<Self>) {
+        let Some((keys, label)) = shortcut_of(action.name()) else {
+            return;
+        };
+        let label = press_label(
+            action.name(),
+            label,
+            PressState {
+                has_account: self.active.is_some(),
+                opens_claim: opens_claim(
+                    self.can_issue(),
+                    self.screen,
+                    self.bounty_tab,
+                    self.bounty_form.is_some(),
+                ),
+                search_has_text: self.search_clearable(window, cx),
+            },
+        );
+        self.shortcut = Some(format!("{} {label}", shortcut_text(keys)).into());
+        self.shortcut_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SHORTCUT_SHOWN_FOR).await;
+            let _ = this.update(cx, |shell, cx| {
+                shell.shortcut = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// The only place `bounty_tab` is assigned: a tab change retakes the order.
+    fn switch_tab(&mut self, tab: BountyTab) {
+        self.bounty_tab = tab;
+        self.refresh_order();
+    }
+
+    /// Retake the snapshot. Called when a list lands, the query or the tab
+    /// changes, or a bounty is created; never for a recorded visit.
+    fn refresh_order(&mut self) {
+        let snapshot = match self.shown_list() {
+            Load::Ready(list) => {
+                Snapshot::take(list, &self.query, &self.visits, timefmt::now_unix())
+            }
+            _ => Snapshot::default(),
+        };
+        self.snapshot = snapshot;
+    }
+
+    /// A deliberate visit (row click, bounty created, claim published) counts
+    /// towards the frecency order. A small synchronous write: the store's own
+    /// writes run on the runtime, but this file is one tiny JSON.
+    pub(crate) fn record_visit(&mut self, id: &str) {
+        self.visits.record_and_save(id, timefmt::now_unix());
+    }
+
+    fn on_query_changed(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(query) = bounty_search::next_query(&self.query, &query) else {
+            return;
+        };
+        self.query = query;
+        self.refresh_order();
+        if self.screen != Screen::Bounties && !self.query.trim().is_empty() {
+            self.go(Screen::Bounties, window, cx);
+            self.search.update(cx, |state, cx| state.focus(window, cx));
+        }
+        cx.notify();
+    }
+
     /// Asks for the active account's eligible list. Read-only mode has none,
     /// and the Eligible tab goes with it.
     fn fetch_eligible(&mut self) {
         let Some(pubkey) = self.active.clone() else {
             self.eligible = None;
-            self.bounty_tab = BountyTab::House;
+            self.switch_tab(BountyTab::House);
             return;
         };
         let read = next_eligible_read(&mut self.eligible, &mut self.eligible_seq, &pubkey);
@@ -1166,10 +1446,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.bounty_tab = tab;
+        self.switch_tab(tab);
         if tab == BountyTab::Eligible {
             self.fetch_eligible();
         }
+        self.refresh_order();
         self.reconcile_selection(window, cx);
         cx.notify();
     }
@@ -1185,7 +1466,12 @@ impl Shell {
             BountyTab::House => self.optimistic.as_ref().map(|b| b.id.as_str()),
             BountyTab::Eligible => None,
         };
-        let next = selection_for(self.selected.as_deref(), self.shown_list(), pending);
+        let mut next = selection_for(self.selected.as_deref(), self.shown_list(), pending);
+        // A selection the list does not hold falls back to the first row as
+        // shown (selection_for knows the server order only).
+        if next.is_some() && next != self.selected && pending != next.as_deref() {
+            next = self.displayed().first().map(|b| b.id.clone());
+        }
         if self
             .claim_form
             .as_ref()
@@ -1219,6 +1505,33 @@ impl Shell {
     pub(crate) fn push_activity(&mut self, dot: u32, text: String, at: u64) {
         self.activity.insert(0, ActivityItem { dot, text, at });
         self.activity.truncate(200);
+    }
+
+    /// The "you got paid" toast text for a payment fact, if it is a new one
+    /// for a claim of a stored account ([`paid_toast`]). A notice only.
+    fn paid_notice(&mut self, bounty_id: &str, claim_id: &str, state: &str, ts: u64) -> Option<String> {
+        let detail = self.details.get(bounty_id)?;
+        let claim = paid_claim(&detail.claims, claim_id)?;
+        let stored: Vec<(&str, String)> =
+            self.views.iter().map(|(p, v)| (p.as_str(), display_name(v))).collect();
+        let who = payee_label(&stored, self.active.as_deref(), &claim.event.pubkey);
+        let sats = claim
+            .auto_payment
+            .as_ref()
+            .and_then(|row| row.amount_sats)
+            .or(claim.payment_amount_sats)
+            .unwrap_or(detail.bounty.amount_sats);
+        let item = claim.item_name().to_string();
+        let list = bounty_search::coordinate_dtag(&detail.bounty.list_coordinate).to_string();
+        paid_toast(
+            state,
+            ts,
+            self.launched_at,
+            claim_id,
+            who.as_deref(),
+            &mut self.paid_toasted,
+            (sats, &item, &list),
+        )
     }
 
     fn claim_name(&self, bounty_id: &str, claim_event_id: &str) -> String {
@@ -1554,8 +1867,10 @@ impl Shell {
             Update::Bounties { list, .. } => {
                 let stored: Vec<String> = self.views.iter().map(|(p, _)| p.clone()).collect();
                 let list = listed_bounties(list, &stored);
+                let order = bounty_search::order(&list, &self.query, &self.visits, now);
+                let ordered: Vec<Bounty> = order.iter().map(|ix| list[*ix].clone()).collect();
                 if let Some(first) =
-                    house_reply_pick(self.bounty_tab, self.selected.as_deref(), &list)
+                    house_reply_pick(self.bounty_tab, self.selected.as_deref(), &ordered)
                 {
                     self.select(first);
                 }
@@ -1566,12 +1881,17 @@ impl Shell {
                         self.optimistic = None;
                     }
                 // A bounty created this session scrolls into view as soon as
-                // it exists in the list.
+                // it exists in the list; one the search hides is let go, so
+                // a later reply does not scroll the list unexpectedly.
                 if let Some(target) = self.scroll_to.take() {
-                    match list.iter().position(|b| b.id == target) {
+                    match ordered.iter().position(|b| b.id == target) {
                         Some(ix) => self.bounty_list_scroll.scroll_to_item(ix),
+                        None if list.iter().any(|b| b.id == target) => {}
                         None => self.scroll_to = Some(target),
                     }
+                }
+                if self.bounty_tab == BountyTab::House {
+                    self.snapshot = Snapshot::of(&list, &order);
                 }
                 self.bounties = Load::Ready(list);
             }
@@ -1586,6 +1906,7 @@ impl Shell {
                 if land_eligible(self.eligible.as_mut(), &pubkey, seq, Ok(list))
                     && self.bounty_tab == BountyTab::Eligible
                 {
+                    self.refresh_order();
                     self.reconcile_selection(window, cx);
                 }
             }
@@ -1601,6 +1922,7 @@ impl Shell {
                         now,
                     );
                     if self.bounty_tab == BountyTab::Eligible {
+                        self.refresh_order();
                         self.reconcile_selection(window, cx);
                     }
                 }
@@ -1638,8 +1960,10 @@ impl Shell {
                 self.list_submit = None;
                 self.focus.focus(window, cx);
                 self.selected = Some(id.clone());
-                // The new bounty is on the house list; show that list.
-                self.bounty_tab = BountyTab::House;
+                // The new bounty is on the house list; show that list, with
+                // the new bounty (a visit) in its frecency place.
+                self.switch_tab(BountyTab::House);
+                self.record_visit(&id);
                 // The detail pane shows the submitted values immediately; the
                 // watch's first snapshot (or the refreshed list) replaces them.
                 if let Some(req) = self.submitted_bounty.take() {
@@ -1656,6 +1980,7 @@ impl Shell {
                 event_id,
             } => {
                 self.push_activity(GREEN, format!("Claim {} sent", short_id(&event_id)), now);
+                self.record_visit(&bounty_id);
                 self.claim_form = None;
                 self.focus.focus(window, cx);
                 // Say how this bounty pays: the claim card alone reads as
@@ -1717,6 +2042,9 @@ impl Shell {
                     other => (TEXT_MUTED, format!("\"{name}\" payment status: {other}{why}")),
                 };
                 self.push_activity(dot, text, if ts > 0 { ts } else { now });
+                if let Some(text) = self.paid_notice(&bounty_id, &claim_event_id, &state, ts) {
+                    window.push_notification(Notification::info(text), cx);
+                }
             }
             Update::ReceiptSeen {
                 bounty_id: _,
@@ -1824,14 +2152,18 @@ impl Shell {
     }
 
     /// Is this account's wallet panel what the person is looking at? The
-    /// same rule `sync_balance_poll` uses: ⌘6's active account, or the
-    /// account screen's ready panel.
+    /// same rule `sync_balance_poll` uses ([`wallet_shown`]).
     fn wallet_on_screen(&self, pubkey: &str) -> bool {
-        match self.screen {
-            Screen::Wallet => self.active.as_deref() == Some(pubkey),
-            Screen::AccountSetup => self.setup.ready.as_ref().is_some_and(|r| r.pubkey == pubkey),
-            _ => false,
-        }
+        self.wallet_shown() == Some(pubkey)
+    }
+
+    fn wallet_shown(&self) -> Option<&str> {
+        wallet_shown(
+            self.screen,
+            self.setup.ready.as_ref().map(|r| r.pubkey.as_str()),
+            self.active.as_deref(),
+            self.account_page.as_ref().map(|p| (p.pubkey.as_str(), p.tab)),
+        )
     }
 
     // ------------------------------------------------------------ navigation
@@ -2116,6 +2448,23 @@ impl Shell {
         }
     }
 
+    /// The search field has focus and text, so escape clears it.
+    fn search_clearable(&self, window: &Window, cx: &App) -> bool {
+        self.search.focus_handle(cx).is_focused(window) && !self.search.read(cx).value().is_empty()
+    }
+
+    /// The escape key: in a non-empty search it clears the search and does
+    /// nothing else; anywhere else it is [`Self::cancel`].
+    fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_clearable(window, cx) {
+            self.search.update(cx, |state, cx| state.set_value("", window, cx));
+            // set_value emits no Change event: retake the query by hand.
+            self.on_query_changed(String::new(), window, cx);
+            return;
+        }
+        self.cancel(window, cx);
+    }
+
     /// esc / ⌘.: on the account screen this leaves it; everywhere else it
     /// cancels whichever form is open.
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2151,7 +2500,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// "Send" on the Wallet screen, and Enter in either of its fields: the
+    /// "Send" on the Wallet screen or the Account page's Wallet tab, and
+    /// Enter in either of the form's fields: the
     /// active account pays what the inputs say. The obvious mistakes (no
     /// amount, not an address) are caught here; everything else comes back
     /// as `Sent` or `SendFailed` for this pubkey. Inert while a send is in
@@ -2350,16 +2700,14 @@ impl Shell {
         cx.notify();
     }
 
-    /// The wallet on screen — the ready panel's account, or ⌘6's active one
-    /// — is polled every 3 s while it has a token. Restarted only when the
-    /// target changes, so re-renders never reset the cadence.
-    fn sync_balance_poll(&mut self, cx: &mut Context<Self>) {
-        let target = match self.screen {
-            Screen::AccountSetup => self.setup.ready.as_ref().map(|r| r.pubkey.clone()),
-            Screen::Wallet => self.active.clone(),
-            _ => None,
-        }
-        .filter(|pubkey| self.view(pubkey).is_some_and(|v| v.wallet.has_token));
+    /// The wallet on screen ([`wallet_shown`]) is polled every 3 s while it
+    /// has a token. Restarted only when the target changes, so re-renders
+    /// never reset the cadence.
+    pub(crate) fn sync_balance_poll(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .wallet_shown()
+            .filter(|pubkey| self.view(pubkey).is_some_and(|v| v.wallet.has_token))
+            .map(str::to_string);
         if self.balance_poll.as_ref().map(|(p, _)| p) == target.as_ref() {
             return;
         }
@@ -2432,9 +2780,7 @@ impl Shell {
         if self.screen != Screen::Bounties {
             return;
         }
-        let Load::Ready(list) = self.shown_list() else {
-            return;
-        };
+        let list = self.displayed();
         if list.is_empty() {
             return;
         }
@@ -2633,6 +2979,61 @@ impl Shell {
         cx.notify();
     }
 
+    /// "Paste TOML": fills the bounty form's fields from the clipboard (see
+    /// `bounty_toml`). All or nothing; never submits.
+    pub(crate) fn paste_bounty_toml(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.bounty_form else {
+            return;
+        };
+        if form_locked(form.submitting, form.checking_list) {
+            return;
+        }
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        match magic_carpet_chat::bounty_toml::parse(clipboard.as_deref(), form.existing_list.is_some())
+        {
+            Ok(fills) => self.fill_bounty_form(&fills, window, cx),
+            Err(message) => form.error = Some(message),
+        }
+        cx.notify();
+    }
+
+    /// Cmd-V in a bounty field: true when the clipboard is form TOML (filled,
+    /// or its error shown) and the paste is swallowed; false is a normal paste.
+    pub(crate) fn paste_over_bounty_field(
+        &mut self,
+        text: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use magic_carpet_chat::bounty_toml::{PasteDecision, paste_decision};
+        let Some(form) = &mut self.bounty_form else {
+            return false;
+        };
+        if form_locked(form.submitting, form.checking_list) {
+            return false;
+        }
+        match paste_decision(text, form.existing_list.is_some()) {
+            PasteDecision::Normal => return false,
+            PasteDecision::Fill(fills) => self.fill_bounty_form(&fills, window, cx),
+            PasteDecision::Reject(message) => form.error = Some(message),
+        }
+        cx.notify();
+        true
+    }
+
+    fn fill_bounty_form(&mut self, fills: &[(usize, String)], window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.bounty_form else {
+            return;
+        };
+        form.error = None;
+        for (ix, text) in fills {
+            form.fields[*ix].update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+        }
+        let n = fills.len();
+        let noun = if n == 1 { "field" } else { "fields" };
+        window.push_notification(Notification::info(format!("Filled {n} {noun}")), cx);
+    }
+
     /// Enter in field `ix`: advance the caret, or submit from the last field.
     fn bounty_form_step(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix + 1 < BOUNTY_FIELD_DEFS.len() {
@@ -2642,7 +3043,7 @@ impl Shell {
         }
     }
 
-    fn submit_bounty_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit_bounty_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &self.bounty_form else {
             return;
         };
@@ -2883,7 +3284,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn submit_claim_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit_claim_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &self.claim_form else {
             return;
         };
@@ -2914,6 +3315,66 @@ impl Shell {
             form.submitting = true;
         }
         cx.notify();
+    }
+
+    /// Copies the debug report to the clipboard and says so in a toast.
+    fn copy_debug_info(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = debug_report::render(&self.debug_report());
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        window.push_notification(Notification::info("Debug info copied"), cx);
+    }
+
+    fn debug_report(&self) -> debug_report::Report {
+        let now = timefmt::now_unix();
+        let tab = match (&self.screen, &self.account_page) {
+            (Screen::Account, Some(page)) => Some(format!("{:?}", page.tab)),
+            _ => None,
+        };
+        debug_report::Report {
+            version: env!("CARGO_PKG_VERSION").into(),
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            now: format!(
+                "{} {}Z",
+                timefmt::month_day_year(now),
+                timefmt::hhmmss_utc(now)
+            ),
+            store_dir: secrets::store_dir()
+                .map_or_else(|e| e.to_string(), |dir| dir.display().to_string()),
+            base_url: magic_carpet_chat::api::base_url(),
+            relay_url: nostr::relay_url(),
+            public_relays: nostr::public_relays(),
+            env: debug_report::env_lines(std::env::vars()),
+            relay_connected: self.relay_connected,
+            // The variant name: `label` reads "Account" for both the setup
+            // screen and an account page.
+            screen: format!("{:?}", self.screen),
+            tab,
+            active: self
+                .active_view()
+                .map(|view| format!("{} {}", display_name(view), view.npub)),
+            accounts: self
+                .views()
+                .map(|view| debug_report::AccountLine {
+                    name: display_name(view),
+                    npub: view.npub.clone(),
+                    lud16: view.lud16.clone(),
+                    coinos_username: view
+                        .wallet
+                        .created
+                        .as_ref()
+                        .map(|created| created.username.clone()),
+                    balance: view.wallet.balance,
+                })
+                .collect(),
+            on_screen: crate::a11y::on_screen(),
+            activity: self
+                .activity
+                .iter()
+                .map(|item| format!("{} {}", timefmt::hhmmss_utc(item.at), item.text))
+                .collect(),
+            diagnostics: magic_carpet_chat::diag::snapshot(),
+        }
     }
 
     // ------------------------------------------------------------ icon rail
@@ -3029,6 +3490,7 @@ impl Shell {
                     })),
             )
             .child(div().flex_1())
+            .child(debug_button(cx))
             .child(
                 v_flex()
                     .a11y(
@@ -3412,7 +3874,7 @@ impl Shell {
 
     // ------------------------------------------------------------- top bar
 
-    fn top_bar(&self) -> impl IntoElement {
+    fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // The pill tells the truth about the focused bounty, or stays away.
         let armed = self.selected_bounty().map(|b| b.auto_pay_on());
 
@@ -3423,6 +3885,7 @@ impl Shell {
             .px(px(26.))
             .py(px(10.))
             .min_h(px(46.))
+            .relative()
             .border_b_1()
             .border_color(rgb(LINE))
             .child(
@@ -3430,12 +3893,47 @@ impl Shell {
                     .flex_1()
                     .min_w(px(170.))
                     .text_size(px(12.5))
+                    // Capture phase, before the single-line input swallows up
+                    // and down: they walk the results, other keys type.
+                    .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                        if this.screen == Screen::Bounties {
+                            this.select_step(-1, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                        if this.screen == Screen::Bounties {
+                            this.select_step(1, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .child(
                         Input::new(&self.search)
                             .accessibility_id("top-search")
                             .aria_label("Search"),
                     ),
             )
+            .when_some(self.shortcut.clone(), |this, text| {
+                // Overlaid, so it never shifts the bar; it sits left of the
+                // auto-pay pill (about 180 px wide) when there is one.
+                this.child(
+                    div()
+                        .a11y("top-shortcut", Role::Label, text.clone())
+                        .absolute()
+                        .top(px(10.))
+                        .right(px(if armed.is_some() { 206. } else { 26. }))
+                        .px(px(12.))
+                        .py(px(5.))
+                        .rounded_full()
+                        .bg(rgb(BG_NAV_ON))
+                        .border_1()
+                        .border_color(rgb(BORDER_3))
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT))
+                        .child(text),
+                )
+            })
             .when_some(armed, |this, armed| {
                 this.child(if armed {
                     h_flex()
@@ -3712,6 +4210,9 @@ fn parse_sats(value: &str) -> Option<u64> {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The root of the window's views: everything labelled this frame is
+        // recorded after this, the chat pane included.
+        crate::a11y::begin_frame();
         // The account screen takes the whole window: no rail, no sidebar, no
         // top bar — one decision at a time.
         let body: AnyElement = if self.screen == Screen::AccountSetup {
@@ -3729,7 +4230,7 @@ impl Render for Shell {
                     v_flex()
                         .flex_1()
                         .min_w(px(0.))
-                        .child(self.top_bar())
+                        .child(self.top_bar(cx))
                         .child(self.main(cx)),
                 )
                 .into_any_element()
@@ -3745,6 +4246,7 @@ impl Render for Shell {
             // shadows the input's Enter everywhere (GPUI treats no-context
             // bindings as deepest-context, later registration wins).
             .key_context("Shell")
+            .map(|this| watch_shortcuts(this, cx))
             .on_action(cx.listener(|this, _: &GoDashboard, w, cx| this.go(Screen::Dashboard, w, cx)))
             .on_action(cx.listener(|this, _: &GoBounties, w, cx| this.go(Screen::Bounties, w, cx)))
             .on_action(cx.listener(|this, _: &GoPayments, w, cx| this.go(Screen::Payments, w, cx)))
@@ -3757,7 +4259,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &NextAccount, w, cx| this.step_account(1, w, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &NewItem, w, cx| this.new_item(w, cx)))
-            .on_action(cx.listener(|this, _: &CloseForm, w, cx| this.cancel(w, cx)))
+            .on_action(cx.listener(|this, _: &CopyDebugInfo, w, cx| this.copy_debug_info(w, cx)))
+            .on_action(cx.listener(|this, _: &CloseForm, w, cx| this.escape(w, cx)))
+            .on_action(cx.listener(|this, _: &CancelForm, w, cx| this.cancel(w, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.select_step(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.select_step(1, cx)))
             .on_action(cx.listener(|this, _: &Confirm, w, cx| this.confirm(w, cx)))
@@ -3784,6 +4288,7 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
+    use super::{F_AMOUNT, F_AUTO_PAY, F_CAP, F_CRITERIA, F_DESCRIPTION, F_PLURAL, F_RANK, F_SINGULAR};
     use super::{
         BalanceCheck, RANK_NOTE, RemoveAction, UnknownCreate, bounty_form_refused,
         can_post_on_list, claim_notice,
@@ -3931,6 +4436,19 @@ mod tests {
         // An empty or failed Eligible list cleared the selection: a house
         // reply landing after it must not fill the detail pane.
         assert_eq!(house_reply_pick(BountyTab::Eligible, None, &list), None);
+    }
+
+    #[test]
+    fn the_wallet_shown_follows_the_screen_and_the_account_pages_wallet_tab() {
+        use super::{Tab, wallet_shown};
+        let shown = |screen, page| wallet_shown(screen, Some("ready"), Some("active"), page);
+        assert_eq!(shown(Screen::AccountSetup, None), Some("ready"));
+        assert_eq!(shown(Screen::Wallet, Some(("other", Tab::Wallet))), Some("active"));
+        // The page's own account, active or not, and only on its Wallet tab.
+        assert_eq!(shown(Screen::Account, Some(("other", Tab::Wallet))), Some("other"));
+        assert_eq!(shown(Screen::Account, Some(("other", Tab::Trust))), None);
+        assert_eq!(shown(Screen::Account, None), None);
+        assert_eq!(shown(Screen::Dashboard, Some(("other", Tab::Wallet))), None);
     }
 
     #[test]
@@ -4210,6 +4728,138 @@ mod tests {
         assert!(accepts_for("b", 1));
         // A removed account has no panel at all.
         assert!(!accepts_for("gone", 5));
+    }
+
+    #[test]
+    fn a_paid_claim_toasts_once_and_only_for_new_payments_of_ours() {
+        use super::{paid_toast, payee_label};
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let info = (100, "Dozen Bakery", "nashville-croissant-spot");
+        let text = "You got paid 100 sats for \"Dozen Bakery\" on nashville-croissant-spot.";
+        let mut toast = |state, ts, who, claim| paid_toast(state, ts, 1_000, claim, who, &mut seen, info);
+        // Ours, paid after launch: once.
+        assert_eq!(toast("settled", 1_500, Some("You"), "c1").as_deref(), Some(text));
+        assert_eq!(toast("settled", 1_500, Some("You"), "c1"), None, "the same fact again");
+        // Someone else's claim, a payment before launch, and a state that is not settled.
+        assert_eq!(toast("settled", 1_500, None, "c2"), None);
+        assert_eq!(toast("settled", 999, Some("You"), "c3"), None);
+        assert_eq!(toast("paid", 1_500, Some("You"), "c4"), None);
+        // A replayed old fact does not use up the claim: it is simply quiet.
+        assert!(toast("settled", 1_000, Some("You"), "c3").is_some());
+        // A stored account that is not the active one goes by name.
+        let stored = [("a", "Matthias".to_string()), ("b", "Other".to_string())];
+        assert_eq!(payee_label(&stored, Some("b"), "a").as_deref(), Some("Matthias"));
+        assert_eq!(payee_label(&stored, Some("a"), "a").as_deref(), Some("You"));
+        assert_eq!(payee_label(&stored[..1], Some("b"), "a").as_deref(), Some("You"));
+        assert_eq!(payee_label(&stored, Some("a"), "stranger"), None);
+    }
+
+    #[test]
+    fn a_replaced_claim_is_found_by_the_id_the_payment_paid() {
+        let claim = |id: &str, paid: Option<&str>| -> super::Claim {
+            serde_json::from_value(serde_json::json!({
+                "event": {"id": id, "pubkey": "pk"},
+                "paymentClaimEventId": paid,
+            }))
+            .unwrap()
+        };
+        let claims = [claim("other", None), claim("new", Some("old"))];
+        assert_eq!(super::paid_claim(&claims, "old").map(|c| c.event.id.as_str()), Some("new"));
+        assert_eq!(super::paid_claim(&claims, "other").map(|c| c.event.id.as_str()), Some("other"));
+        assert!(super::paid_claim(&claims, "nope").is_none());
+    }
+
+    #[test]
+    fn the_pill_says_what_the_press_did() {
+        use super::{PressState, press_label, shortcut_of};
+        use gpui_kit::Action as _;
+        let state = |has_account, opens_claim, search_has_text| PressState {
+            has_account,
+            opens_claim,
+            search_has_text,
+        };
+        let esc = super::CloseForm::name_for_type();
+        let new = super::NewItem::name_for_type();
+        let (_, esc_label) = shortcut_of(esc).unwrap();
+        let (_, new_label) = shortcut_of(new).unwrap();
+        assert_eq!(press_label(esc, esc_label, state(true, false, true)), "Clear search");
+        assert_eq!(press_label(esc, esc_label, state(true, false, false)), "Cancel");
+        assert_eq!(press_label(new, new_label, state(false, false, false)), "Add account");
+        assert_eq!(press_label(new, new_label, state(true, true, false)), "Claim");
+        assert_eq!(press_label(new, new_label, state(true, false, false)), "New bounty");
+        let refresh = super::Refresh::name_for_type();
+        assert_eq!(press_label(refresh, "Refresh", state(true, true, true)), "Refresh");
+    }
+
+    #[test]
+    fn the_key_bindings_are_pinned() {
+        let got: Vec<(String, String, Option<String>)> = super::keybindings()
+            .iter()
+            .map(|b| {
+                (
+                    b.keystrokes().iter().map(|k| k.inner().unparse()).collect::<Vec<_>>().join(" "),
+                    b.action().name().to_string(),
+                    b.predicate().map(|p| p.to_string()),
+                )
+            })
+            .collect();
+        let row = |k: &str, a: &str, c: Option<&str>| {
+            (k.to_string(), a.to_string(), c.map(str::to_string))
+        };
+        let want = vec![
+            row("cmd-1", "shell::GoDashboard", None),
+            row("cmd-2", "shell::GoBounties", None),
+            row("cmd-3", "shell::GoPayments", None),
+            row("cmd-4", "shell::GoClaimants", None),
+            row("cmd-5", "shell::GoBoards", None),
+            row("cmd-6", "shell::GoWallet", None),
+            row("cmd-7", "shell::GoTags", None),
+            row("cmd-8", "shell::GoChat", None),
+            row("cmd-[", "shell::PrevAccount", None),
+            row("cmd-]", "shell::NextAccount", None),
+            row("cmd-r", "shell::Refresh", None),
+            row("cmd-n", "shell::NewItem", None),
+            row("cmd-shift-c", "shell::CopyDebugInfo", None),
+            row("escape", "shell::CloseForm", None),
+            row("cmd-.", "shell::CancelForm", None),
+            row("up", "shell::SelectPrev", Some("Shell")),
+            row("down", "shell::SelectNext", Some("Shell")),
+            row("enter", "shell::Confirm", Some("Shell")),
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn shortcuts_read_as_mac_key_combos() {
+        use super::{shortcut_of, shortcut_text};
+        assert_eq!(shortcut_text("cmd-r"), "⌘R");
+        assert_eq!(shortcut_text("cmd-shift-c"), "⌘⇧C");
+        assert_eq!(shortcut_text("cmd-2"), "⌘2");
+        assert_eq!(shortcut_text("cmd-["), "⌘[");
+        assert_eq!(shortcut_text("cmd-."), "⌘.");
+        assert_eq!(shortcut_text("escape"), "esc");
+        // The table is what answers for an action.
+        use gpui_kit::Action as _;
+        assert_eq!(
+            shortcut_of(super::Refresh::name_for_type()),
+            Some(("cmd-r", "Refresh"))
+        );
+    }
+
+    #[test]
+    fn the_toml_keys_line_up_with_the_form_fields() {
+        use magic_carpet_chat::bounty_toml::KEYS;
+        assert_eq!(KEYS.len(), super::BOUNTY_FIELD_DEFS.len());
+        let at = |key: &str| KEYS.iter().position(|k| *k == key);
+        assert_eq!(at("item_singular"), Some(F_SINGULAR));
+        assert_eq!(at("item_plural"), Some(F_PLURAL));
+        assert_eq!(at("description"), Some(F_DESCRIPTION));
+        assert_eq!(at("criteria"), Some(F_CRITERIA));
+        assert_eq!(at("amount"), Some(F_AMOUNT));
+        assert_eq!(at("cap"), Some(F_CAP));
+        assert_eq!(at("auto_pay"), Some(F_AUTO_PAY));
+        assert_eq!(at("min_rank"), Some(F_RANK));
     }
 
     #[test]

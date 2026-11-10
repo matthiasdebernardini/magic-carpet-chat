@@ -6,7 +6,6 @@ use gpui_kit::*;
 use qrcode::{Color, QrCode};
 
 use crate::a11y::Accessible as _;
-use crate::dashboard::muted;
 use crate::palette::*;
 
 /// LUD-01 asks for a 4-module quiet zone around the code.
@@ -28,7 +27,12 @@ pub fn npub_link(npub: &str) -> String {
 /// side in pixels, quiet zone included.
 pub fn view(code: Option<Arc<QrCode>>, edge: f32) -> AnyElement {
     let Some(code) = code else {
-        return muted("Could not draw the QR code.", RED);
+        return div()
+            .text_size(px(12.5))
+            .text_color(rgb(RED))
+            .child("Could not draw the QR code.")
+            .a11y("qr-error", Role::Label, "Could not draw the QR code.")
+            .into_any_element();
     };
     canvas(
         |_, _, _| (),

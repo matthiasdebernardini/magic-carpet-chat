@@ -24,6 +24,7 @@ use crate::api::{Api, ApiError, AutoPaymentRow, Bounty, BountyDetail, Claim, Cre
 use crate::autopay::{self, AttemptState, ClaimFacts, Hold, Policy};
 use crate::brainstorm::{self, RunState, SearchHit};
 use crate::coinos;
+use crate::diag;
 use crate::events::{self, EventError};
 use crate::secrets::{self, Secret, SecretError};
 use crate::trust::{self, Assertion, BrainstormKey, Designation};
@@ -1294,7 +1295,9 @@ async fn publish_claim(
 /// screen).
 async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<String>, ()> {
     let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
-    let events = api.scan(&filter).await.map_err(|_| ())?;
+    let events = api.scan(&filter).await.map_err(|e| {
+        diag::note(format!("kind-0 scan for {pubkey} failed: {e}"));
+    })?;
     Ok(events.into_iter().next().map(|event| event.content))
 }
 
@@ -1424,7 +1427,8 @@ async fn publish_lud16(
         })?;
 
     // The instance first: it is what the prod payer reads.
-    api.publish_event(&event).await.map_err(|_| {
+    api.publish_event(&event).await.map_err(|e| {
+        diag::note(format!("profile publish to the instance failed: {e}"));
         BridgeError::Profile("The Magic Carpet server didn't save the profile update.")
     })?;
 
@@ -1438,11 +1442,33 @@ async fn publish_lud16(
     client.connect().and_wait(Duration::from_secs(10)).await;
     let sent = client.send_event(&event).await;
     client.disconnect().await;
+    note_relay_send("profile publish", &sent);
     match sent {
         Ok(output) if !output.success.is_empty() => Ok(profile),
         _ => Err(BridgeError::Profile(
             "The Nostr servers didn't accept the profile update.",
         )),
+    }
+}
+
+/// Notes which relays took an event and why the others refused, or the send
+/// error when the client could not send at all.
+fn note_relay_send<E: std::fmt::Display>(what: &str, sent: &Result<SendEventOutput, E>) {
+    match sent {
+        Ok(output) => {
+            let accepted: Vec<&str> = output.success.keys().map(|url| url.as_str()).collect();
+            let refused: Vec<String> = output
+                .failed
+                .iter()
+                .map(|(url, reason)| format!("{url} ({reason})"))
+                .collect();
+            diag::note(format!(
+                "{what}: accepted by [{}], refused by [{}]",
+                accepted.join(", "),
+                refused.join(", ")
+            ));
+        }
+        Err(e) => diag::note(format!("{what}: send failed: {e}")),
     }
 }
 
@@ -3317,7 +3343,10 @@ async fn read_per_relay(
         async move {
             let relay = match client.relay(url.as_str()).await {
                 Ok(Some(relay)) => relay,
-                _ => return (url, Err(())),
+                _ => {
+                    diag::note(format!("{url}: no relay handle to read from"));
+                    return (url, Err(()));
+                }
             };
             // No SDK `.timeout()`: it ends the read with `Ok(empty)`, which
             // looks exactly like an answer. Without it the fetch ends at
@@ -3327,10 +3356,11 @@ async fn read_per_relay(
                 relay.fetch_events(filter).policy(ReqExitPolicy::ExitOnEOSE),
             )
             .await
+            .inspect_err(|_| diag::note(format!("{url}: read timed out")))
             .ok()
             .map(|read| {
                 read.map(|events| events.into_iter().collect())
-                    .map_err(|_| ())
+                    .map_err(|e| diag::note(format!("{url}: read failed: {e}")))
             });
             let answer = relay_answer(fetched, relay.status().is_connected());
             (url, answer)
@@ -3459,14 +3489,16 @@ async fn fetch_brainstorm_key(hex: &str) -> Result<BrainstormKey, String> {
         .user_agent(crate::USER_AGENT)
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|_| {
+        .map_err(|e| {
+            diag::note(format!("brainstorm key client did not build: {}", e.without_url()));
             "Couldn't reach Brainstorm. Check your connection and try again.".to_string()
         })?;
     let response = http
         .get(format!("{}{}/{hex}", brainstorm::base(), trust::BRAINSTORM_SETUP_PATH))
         .send()
         .await
-        .map_err(|_| {
+        .map_err(|e| {
+            diag::note(format!("brainstorm key read failed: {}", e.without_url()));
             "Couldn't reach Brainstorm. Check your connection and try again.".to_string()
         })?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -3475,7 +3507,8 @@ async fn fetch_brainstorm_key(hex: &str) -> Result<BrainstormKey, String> {
     if !response.status().is_success() {
         return Err("Brainstorm returned an error. Try again in a few minutes.".into());
     }
-    let body = response.text().await.map_err(|_| {
+    let body = response.text().await.map_err(|e| {
+        diag::note(format!("brainstorm key body unreadable: {}", e.without_url()));
         "Brainstorm sent an answer the app can't read. Try again later.".to_string()
     })?;
     trust::parse_setup(&body)
@@ -3683,7 +3716,9 @@ async fn read_contacts(client: &Client, pubkey: &str, relays: &[String]) -> trus
 /// it and how many were asked.
 async fn publish_event(client: &Client, urls: &[String], event: &Event) -> (Vec<String>, usize) {
     let asked = urls.len();
-    let accepted = match client.send_event(event).await {
+    let sent = client.send_event(event).await;
+    note_relay_send("community publish", &sent);
+    let accepted = match sent {
         Ok(output) => output
             .success
             .keys()

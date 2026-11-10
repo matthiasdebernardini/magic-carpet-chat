@@ -650,6 +650,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                         .gap(px(14.))
                         .children(main)
                         .children(exit),
-                ),
+                )
+                .child(crate::shell::debug_button(cx)),
         )
 }
