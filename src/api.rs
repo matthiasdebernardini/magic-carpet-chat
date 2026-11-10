@@ -65,8 +65,10 @@ pub struct CreateBounty {
     pub reward_per_item: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rewards_per_npub: Option<u64>,
-    /// Needs owner/admin/allowlist on the server (403 otherwise). The house
-    /// issuer 853baa94… is allowlisted.
+    /// Needs owner/admin/allowlist on the server (403 otherwise). The app
+    /// always sends false: auto-pay is the issuer's own app's job
+    /// ([`crate::autopay`]), and the runtime turns this flag into an
+    /// account-store setting instead.
     #[serde(skip_serializing_if = "is_false")]
     pub auto_pay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +138,14 @@ pub struct Bounty {
     /// (magic-carpet-v2/src/api/bounties.js:310). A number, int or float.
     #[serde(rename = "issuerRank", default)]
     pub issuer_rank: Option<f64>,
+    /// The issuer's own app pays this bounty (an auto-pay setting in this
+    /// app's account store). Never from the server.
+    #[serde(skip)]
+    pub app_auto_pay: bool,
+    /// The minimum rank in this app's auto-pay setting for the bounty, when
+    /// the issuer's setting is stored here. Never from the server.
+    #[serde(skip)]
+    pub app_min_rank: Option<u64>,
 }
 
 fn truthy(value: &Option<serde_json::Value>) -> bool {
@@ -147,7 +157,13 @@ fn truthy(value: &Option<serde_json::Value>) -> bool {
 }
 
 impl Bounty {
+    /// Paid automatically: by the server, or by the issuer's app here.
     pub fn auto_pay_on(&self) -> bool {
+        self.server_auto_pay_on() || self.app_auto_pay
+    }
+
+    /// The server's own auto-payer pays this bounty.
+    pub fn server_auto_pay_on(&self) -> bool {
         truthy(&self.auto_pay)
     }
 
@@ -174,6 +190,26 @@ impl Bounty {
             INSTANCE_MIN_RANK
         }
     }
+
+    /// The bounty's own expiration time has passed.
+    pub fn expired_by(&self, now: u64) -> bool {
+        self.expiration.is_some_and(|at| at < now)
+    }
+
+    /// The rank a claimant needs, whoever pays: the server rule
+    /// ([`Self::effective_min_rank`]) when the server's auto-payer pays.
+    /// Otherwise the server's `auto_pay_min_rank` means nothing (it stores 3
+    /// whenever autoPay is false, magic-carpet-v2/src/db/bounties.js:118):
+    /// the issuer's own app goes by its stored setting ([`Self::app_min_rank`]),
+    /// and everyone else by the instance floor, 2. A claimant between the two
+    /// can claim; the issuer's app then shows "rank too low" and does not pay.
+    pub fn claim_min_rank(&self) -> u64 {
+        if self.server_auto_pay_on() {
+            self.effective_min_rank()
+        } else {
+            INSTANCE_MIN_RANK.max(self.app_min_rank.unwrap_or(INSTANCE_MIN_RANK))
+        }
+    }
 }
 
 /// The eligible list as the viewer can act on it. The server keeps the
@@ -183,7 +219,7 @@ impl Bounty {
 pub fn claimable_by(list: Vec<Bounty>, viewer: &str) -> Vec<Bounty> {
     list.into_iter()
         .filter(|b| b.issuer_pubkey != viewer)
-        .filter(|b| b.issuer_rank.unwrap_or(0.0) >= b.effective_min_rank() as f64)
+        .filter(|b| b.issuer_rank.unwrap_or(0.0) >= b.claim_min_rank() as f64)
         .collect()
 }
 
@@ -225,6 +261,14 @@ pub struct RawEvent {
 }
 
 impl RawEvent {
+    /// A relay event in the API's shape, so relay claims and receipts flow
+    /// through the same types as the server's.
+    pub fn from_event(event: &Event) -> Option<Self> {
+        serde_json::to_value(event)
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
     pub fn tag_value(&self, name: &str) -> Option<&str> {
         self.tags
             .iter()
@@ -293,6 +337,10 @@ pub struct Claim {
     pub payment_amount_sats: Option<u64>,
     #[serde(rename = "autoPayBlockedReason", default)]
     pub auto_pay_blocked_reason: Option<String>,
+    /// Why the claim is not paid, in plain words, worked out by this app
+    /// (rank, Lightning address, wallet, attempt). Never from the server.
+    #[serde(skip)]
+    pub unpaid_reason: Option<String>,
 }
 
 impl Claim {
@@ -307,6 +355,21 @@ impl Claim {
 
     pub fn receipt(&self) -> Option<Receipt> {
         self.zap_receipt.as_ref().and_then(RawEvent::receipt)
+    }
+
+    /// A claim read straight from the relay: no server state yet.
+    pub fn from_event(event: RawEvent) -> Self {
+        Self {
+            event,
+            zap_receipt: None,
+            auto_payment: None,
+            claim_address: None,
+            payment_claim_event_id: None,
+            payment_status: None,
+            payment_amount_sats: None,
+            auto_pay_blocked_reason: None,
+            unpaid_reason: None,
+        }
     }
 }
 
@@ -531,13 +594,13 @@ impl Api {
             .ok_or_else(|| ApiError::Decode("create-bounty response held no bounty".into()))
     }
 
-    /// GET /api/bounties?issuer=…&status=all — every bounty this issuer
-    /// posted, each with its `paymentState` counters. Public, no login.
-    pub async fn list_bounties(&self, issuer: &str) -> Result<Vec<Bounty>, ApiError> {
+    /// GET /api/bounties?status=all — every issuer's bounties (up to 500),
+    /// each with its `paymentState` counters. Public, no login.
+    pub async fn list_all_bounties(&self) -> Result<Vec<Bounty>, ApiError> {
         let response = self
             .http
             .get(format!("{}/api/bounties", self.base))
-            .query(&[("issuer", issuer), ("status", "all")])
+            .query(&[("status", "all"), ("limit", "500")])
             .send()
             .await
             .map_err(|e| ApiError::Http(e.to_string()))?;
@@ -553,22 +616,6 @@ impl Api {
             });
         }
         parse_bounty_list(&text)
-    }
-
-    /// GET /api/bounties/eligible?viewer=… — open bounties whose issuer
-    /// ranks the viewer at 2 or more, each with `issuerRank`. Needs a prior
-    /// `login` as `viewer` on this same `Api`: 401 without a session, 403 when
-    /// the viewer is not the session pubkey
-    /// (magic-carpet-v2/src/api/bounties.js:294-320).
-    pub async fn eligible_bounties(&self, viewer: &str) -> Result<Vec<Bounty>, ApiError> {
-        let response = self
-            .http
-            .get(format!("{}/api/bounties/eligible", self.base))
-            .query(&[("viewer", viewer)])
-            .send()
-            .await
-            .map_err(|e| ApiError::Http(e.to_string()))?;
-        bounty_list(Self::read(response).await?)
     }
 
     pub async fn get_bounty(&self, id: &str) -> Result<BountyDetail, ApiError> {
@@ -845,6 +892,34 @@ mod tests {
         ];
         let ids: Vec<String> = claimable_by(list, "me").into_iter().map(|b| b.id).collect();
         assert_eq!(ids, ["bb-2", "cc-3"]);
+    }
+
+    #[test]
+    fn an_app_paid_bounty_ignores_the_servers_minimum() {
+        let row = |extra, app_min| {
+            let mut bounty = eligible_row("aa", 2.into(), extra);
+            bounty.app_min_rank = app_min;
+            bounty
+        };
+        let min = |extra, app_min| row(extra, app_min).claim_min_rank();
+        // The server stores 3 for every bounty it doesn't pay: meaningless.
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3}), None), 2);
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 5}), None), 2);
+        assert_eq!(min(serde_json::json!({}), None), 2);
+        // The issuer's own app goes by its setting, floored at 2.
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3}), Some(2)), 2);
+        assert_eq!(min(serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3}), Some(4)), 4);
+        assert_eq!(min(serde_json::json!({"auto_pay": 0}), Some(1)), 2);
+        // The server's own auto-pay bounties keep the server rule.
+        assert_eq!(min(serde_json::json!({"auto_pay": 1}), Some(2)), 3);
+        assert_eq!(min(serde_json::json!({"auto_pay": 1, "auto_pay_min_rank": 4}), None), 4);
+        // A claimant at the floor can claim a bounty the server says needs 3.
+        let list = vec![
+            eligible_row("aa", 2.into(), serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3})),
+            eligible_row("bb", 1.into(), serde_json::json!({"auto_pay": 0, "auto_pay_min_rank": 3})),
+        ];
+        let ids: Vec<String> = claimable_by(list, "me").into_iter().map(|b| b.id).collect();
+        assert_eq!(ids, ["aa-2"]);
     }
 
     #[test]

@@ -197,9 +197,9 @@ The map row's kind changes with the verdict, so match the prefix
 |---|---|---|---|
 | `bounties-title` | Heading | Bounties | |
 | `bounties-keys-hint` | Label | the key hint line | |
-| `bounties-new` | Button | + New DList + bounty (⌘N) / + Submit a bounty claim (⌘N) | |
+| `bounties-new` | Button | + New DList + bounty (⌘N) / + Submit a bounty claim (⌘N) | any account issues; the claim label shows on the Eligible tab |
 | `bounties-tabs` | TabList | Bounty lists | |
-| `bounties-tab-house` | Tab | House bounties (N) | count once loaded |
+| `bounties-tab-house` | Tab | House bounties (N) | count once loaded; lists every issuer's open bounties plus the stored accounts' own (the label predates that) |
 | `bounties-tab-eligible` | Tab | Eligible for me to claim (N) | only with an account |
 | `bounties-list` | List | Bounties | |
 | `bounties-loading` | Label | Loading bounties… | |
@@ -215,17 +215,18 @@ The map row's kind changes with the verdict, so match the prefix
 | `bounty-detail-status`, `bounty-detail-paymode`, `bounty-detail-qualify` | Label | the pills | |
 | `bounty-detail-criteria` | Label | criteria | |
 | `bounty-detail-reward`, `bounty-detail-cap` | Label | N sats (/ item) | |
-| `bounty-detail-min-rank` | Label | the rank | |
+| `bounty-detail-min-rank` | Label | the rank | the server's on a bounty the server pays; otherwise the issuer's own setting in the issuer's app, and 2 in any other app (the server's value means nothing there) |
 | `bounty-detail-slots` | Label | x paid · y open | |
 | `bounty-detail-new-on-list` | Button | New bounty on this list | |
 | `bounty-detail-claims-heading` | Heading | Claims | |
 | `claim-list` | List | Claims | |
 | `claim-list-loading` | Label | Loading claims… / Created — syncing with the instance… | |
-| `claim-list-empty` | Label | No claims to show. … | |
+| `claim-list-empty` | Label | No claims yet. | |
 | `<claim>` | Group | item name | one per claim |
 | `<claim>-item`, `<claim>-author` | Label | item name, by <short pubkey> | |
 | `<claim>-submitted`, `<claim>-attempted`, `<claim>-blocked`, `<claim>-receipt` | Label | timeline rows | |
-| `<claim>-payment` | Label | payment state: Auto-pay attempting…, Paid — waiting for the zap receipt, Payment settled, Paid, no receipt (…), Auto-pay failed (…), Payment status: …, No auto-payment row yet | same id whatever the state |
+| `<claim>-payment` | Label | payment state: Auto-pay attempting…, Paid — waiting for the zap receipt, Payment settled, Paid, no receipt (…), Auto-pay failed (…), Payment status: unknown (…), Payment status: …, No auto-payment row yet | same id whatever the state; the issuer's own app's attempts read the same way, and on a bounty the server doesn't pay, every app (the claimant's too) reads Payment settled once a receipt around the issuer's signed request for the reward lands (one naming another bounty on the list doesn't count; one naming no bounty counts on every bounty on its list) |
+| `<claim>-unpaid-reason` | Label | why the claim is not paid: Rank too low: … rank this account N, and the bounty needs M. / No Lightning address in the claimant's profile, … / Wallet empty: … / Payment failed. … / Payment outcome unknown. … / Paying now… / Waiting for the issuer's app to pay it. / Waiting for the next auto-pay check. / No reward slots left on this bounty. / … | only on unpaid claims of bounties the server does not pay itself |
 | `<claim>-submitted-meta`, `-attempted-meta`, `-payment-meta` | Label | HH:MM:SS UTC · <relative> (· N sats) | `-payment-meta` carries the paid amount |
 | `<claim>-receipt-meta` | Label | N sats · Ns after the claim | |
 
@@ -239,7 +240,7 @@ The map row's kind changes with the verdict, so match the prefix
 | `bounty-form-error` | Label | the error | |
 | `bounty-form-status` | Label | the hint, Checking the list… or Publishing… | |
 | `bounty-form-list-label`, `bounty-form-list` | Label | List, the list name | adding to an existing list |
-| `bounty-form-item-singular`, `-item-plural`, `-description`, `-criteria`, `-amount`, `-cap`, `-min-rank` | TextInput | the field's caption | each has a `<field>-label` caption node |
+| `bounty-form-item-singular`, `-item-plural`, `-description`, `-criteria`, `-amount`, `-cap`, `-auto-pay`, `-min-rank` | TextInput | the field's caption | each has a `<field>-label` caption node; `-auto-pay` takes on or off (default on) |
 | `claim-form` | Group | Claim an item on <list> · N sats per item | |
 | `claim-form-title`, `claim-form-cancel`, `claim-form-error`, `claim-form-status` | as above | | |
 | `claim-form-item-name` | TextInput | Item name | with `claim-form-item-name-label` |

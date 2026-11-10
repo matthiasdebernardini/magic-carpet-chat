@@ -10,13 +10,14 @@
 //! anywhere in the app, or a secret embedded in an error chain, cannot leak
 //! the value into a log line.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::autopay::AttemptState;
 use crate::coinos;
 
 const APP_DIR: &str = "magic-carpet-chat";
@@ -102,6 +103,41 @@ pub struct StoredAccount {
     /// even after a restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_list_sent: Option<String>,
+    /// The bounties this account issued with auto-pay on. The server keeps
+    /// auto-pay off for them (it only pays for allowlisted issuers): the
+    /// account's own app pays, so the switch lives here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_pay: Vec<AutoPaySetting>,
+    /// Every payment this account's app started for a claim on its bounties.
+    /// Written before the payment goes out; never removed, so a claim is
+    /// never paid twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pay_attempts: Vec<PayAttempt>,
+}
+
+/// Auto-pay on, for one bounty this account issued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoPaySetting {
+    pub bounty_id: String,
+    pub min_rank: u64,
+}
+
+/// One payment attempt for a claim, keyed by the claim's stable address
+/// (`<claimant>:<d tag>`), so a replaced claim event is still the same claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayAttempt {
+    pub bounty_id: String,
+    pub claim_address: String,
+    pub claim_event_id: String,
+    pub claimant: String,
+    pub sats: u64,
+    pub state: AttemptState,
+    /// Fixed text or the wallet's refusal; never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub started_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 impl StoredAccount {
@@ -191,12 +227,48 @@ fn save(store: &Store) -> Result<(), SecretError> {
 /// add, then its wallet step), so writers take turns.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+/// The same turn-taking across processes: two app instances on one store
+/// must not both record the first payment attempt for a claim. An advisory
+/// lock on `accounts.json.lock`, held until the returned file drops.
+fn process_lock() -> Result<std::fs::File, SecretError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let path = store_path()?.with_extension("json.lock");
+    let fail = |e: &dyn std::fmt::Display| {
+        SecretError::Store(format!("Couldn't lock {}: {e}.", path.display()))
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| fail(&e))?;
+    file.lock().map_err(|e| fail(&e))?;
+    Ok(file)
+}
+
 fn modify<T>(change: impl FnOnce(&mut Store) -> Result<T, SecretError>) -> Result<T, SecretError> {
-    let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut store = load()?;
-    let out = change(&mut store)?;
-    save(&store)?;
-    Ok(out)
+    let locked = || {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file_lock = process_lock()?;
+        let mut store = load()?;
+        let out = change(&mut store)?;
+        save(&store)?;
+        Ok(out)
+    };
+    // The lock can wait on another app instance. On the runtime's worker
+    // threads that wait must not stall every other task, so the worker hands
+    // its queue to a fresh thread for the duration.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(locked)
+        }
+        _ => locked(),
+    }
 }
 
 fn missing(pubkey: &str) -> SecretError {
@@ -228,6 +300,8 @@ pub fn add_account(nsec: &Secret, generated: bool) -> Result<AccountRecord, Secr
                 created_in_app: generated,
                 coinos: None,
                 follow_list_sent: None,
+                auto_pay: Vec::new(),
+                pay_attempts: Vec::new(),
             });
         }
         store.active = Some(pubkey.clone());
@@ -315,6 +389,161 @@ pub fn follow_list_sent(pubkey: &str) -> Result<Option<String>, SecretError> {
         .and_then(|a| a.follow_list_sent))
 }
 
+fn account_mut<'a>(store: &'a mut Store, pubkey: &str) -> Result<&'a mut StoredAccount, SecretError> {
+    store
+        .accounts
+        .iter_mut()
+        .find(|a| a.pubkey == pubkey)
+        .ok_or_else(|| missing(pubkey))
+}
+
+/// Turn the account's own auto-pay on for a bounty it issued. The minimum
+/// rank is stored no lower than the instance floor (2).
+pub fn set_auto_pay(pubkey: &str, bounty_id: &str, min_rank: u64) -> Result<(), SecretError> {
+    modify(|store| {
+        let account = account_mut(store, pubkey)?;
+        account.auto_pay.retain(|s| s.bounty_id != bounty_id);
+        account.auto_pay.push(AutoPaySetting {
+            bounty_id: bounty_id.to_string(),
+            min_rank: min_rank.max(crate::trust::INSTANCE_MIN_RANK),
+        });
+        Ok(())
+    })
+}
+
+/// Every stored account's auto-pay settings, as `(issuer pubkey, setting)`.
+pub fn auto_pay_settings() -> Result<Vec<(String, AutoPaySetting)>, SecretError> {
+    Ok(load()?
+        .accounts
+        .into_iter()
+        .flat_map(|a| {
+            let pubkey = a.pubkey;
+            a.auto_pay.into_iter().map(move |s| (pubkey.clone(), s))
+        })
+        .collect())
+}
+
+/// The account's recorded payment attempts; empty for an unknown account.
+pub fn pay_attempts(pubkey: &str) -> Result<Vec<PayAttempt>, SecretError> {
+    Ok(load()?
+        .accounts
+        .into_iter()
+        .find(|a| a.pubkey == pubkey)
+        .map(|a| a.pay_attempts)
+        .unwrap_or_default())
+}
+
+/// A bounty's limits, checked again under the store lock when an attempt
+/// is recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotLimits {
+    /// How many rewards the bounty pays in all.
+    pub slots: u64,
+    /// How many one claimant may get; `None` is no limit.
+    pub per_npub: Option<u64>,
+    /// `(claim address, claimant)` of every claim a verified receipt already
+    /// pays, whoever paid it.
+    pub paid: Vec<(String, String)>,
+}
+
+/// What [`begin_attempt_within`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Begin {
+    Recorded,
+    /// An attempt for this bounty and claim address already exists.
+    Exists,
+    /// Paid claims and slot-holding attempts already fill the bounty.
+    NoSlots,
+    /// The claimant already holds its most rewards on this bounty.
+    OverLimit,
+}
+
+/// Record a payment attempt before the payment goes out. `Begin::Exists`
+/// when an attempt for the same bounty and claim address already exists,
+/// from this process or another: the caller must not pay. With `limits`,
+/// the cap and the per-npub limit are counted inside the same lock from
+/// what the store holds NOW (every instance's attempts on this bounty that
+/// may have paid) plus the receipt-paid claims, so a plan made from an older
+/// snapshot can never pay past either. Read and write happen under the
+/// store's process lock, so two app instances cannot both win.
+pub fn begin_attempt_within(
+    pubkey: &str,
+    attempt: PayAttempt,
+    limits: Option<&SlotLimits>,
+) -> Result<Begin, SecretError> {
+    modify(|store| {
+        let account = account_mut(store, pubkey)?;
+        let same_bounty = |a: &&PayAttempt| a.bounty_id == attempt.bounty_id;
+        if account
+            .pay_attempts
+            .iter()
+            .filter(same_bounty)
+            .any(|a| a.claim_address == attempt.claim_address)
+        {
+            return Ok(Begin::Exists);
+        }
+        if let Some(limits) = limits {
+            let mut holders: HashMap<&str, &str> = account
+                .pay_attempts
+                .iter()
+                .filter(same_bounty)
+                .filter(|a| a.state.holds_slot())
+                .map(|a| (a.claim_address.as_str(), a.claimant.as_str()))
+                .collect();
+            for (address, claimant) in &limits.paid {
+                holders.insert(address.as_str(), claimant.as_str());
+            }
+            if holders.len() as u64 >= limits.slots {
+                return Ok(Begin::NoSlots);
+            }
+            let mine = holders.values().filter(|c| **c == attempt.claimant).count() as u64;
+            if limits.per_npub.is_some_and(|limit| mine >= limit) {
+                return Ok(Begin::OverLimit);
+            }
+        }
+        account.pay_attempts.push(attempt);
+        Ok(Begin::Recorded)
+    })
+}
+
+/// Take back an attempt that never reached the wallet: recorded, but the
+/// invoice for it could not be had, so no payment request was made and the
+/// claim may be tried again. Only a `sending` attempt can be taken back.
+pub fn abandon_attempt_for(pubkey: &str, bounty_id: &str, claim_address: &str) -> Result<(), SecretError> {
+    modify(|store| {
+        let account = account_mut(store, pubkey)?;
+        account.pay_attempts.retain(|a| {
+            !(a.bounty_id == bounty_id
+                && a.claim_address == claim_address
+                && a.state == AttemptState::Sending)
+        });
+        Ok(())
+    })
+}
+
+/// Record how the attempt on `bounty_id` for `claim_address` ended.
+pub fn finish_attempt_for(
+    pubkey: &str,
+    bounty_id: &str,
+    claim_address: &str,
+    state: AttemptState,
+    reason: Option<String>,
+    at: u64,
+) -> Result<(), SecretError> {
+    modify(|store| {
+        let account = account_mut(store, pubkey)?;
+        let attempt = account
+            .pay_attempts
+            .iter_mut()
+            .find(|a| a.bounty_id == bounty_id && a.claim_address == claim_address)
+            .ok_or_else(|| SecretError::Store("No payment attempt for that claim".into()))?;
+        attempt.state = state;
+        attempt.reason = reason;
+        attempt.updated_at = at;
+        Ok(())
+    })
+}
+
 /// Validate a user-pasted secret: `nsec1…` bech32 or 64 hex characters.
 /// The shape is checked here, before nostr's parser, so the error can be
 /// specific without ever carrying the input.
@@ -399,14 +628,15 @@ pub fn import_from_env() -> Result<Vec<String>, SecretError> {
     Ok(npubs)
 }
 
+/// `MC_STORE_DIR` is process-wide. nextest gives each test its own
+/// process, but `cargo test` (CI) runs them as threads of one, so every
+/// test that points it somewhere, in any module, takes turns on this.
+#[cfg(test)]
+pub(crate) static STORE_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `MC_STORE_DIR` is process-wide. nextest gives each test its own
-    /// process, but `cargo test` (CI) runs them as threads of one, so the
-    /// store tests take turns.
-    static STORE_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn secret_never_prints_its_value() {
@@ -529,6 +759,158 @@ mod tests {
         let mode = std::fs::metadata(store_path().unwrap()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "store file mode");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_payment_attempt_is_recorded_once_and_survives_a_reload() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-attempt-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+
+        let keys = Keys::generate();
+        let record = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true).unwrap();
+        set_auto_pay(&record.pubkey, "b1", 2).unwrap();
+        set_auto_pay(&record.pubkey, "b1", 3).unwrap();
+        assert_eq!(
+            auto_pay_settings().unwrap(),
+            vec![(record.pubkey.clone(), AutoPaySetting { bounty_id: "b1".into(), min_rank: 3 })]
+        );
+
+        let attempt = PayAttempt {
+            bounty_id: "b1".into(),
+            claim_address: "bob:item".into(),
+            claim_event_id: "e1".into(),
+            claimant: "bob".into(),
+            sats: 100,
+            state: AttemptState::Sending,
+            reason: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        assert_eq!(
+            begin_attempt_within(&record.pubkey, attempt.clone(), None).unwrap(),
+            Begin::Recorded
+        );
+        // A replaced claim event is the same address: never a second attempt.
+        let replaced = PayAttempt { claim_event_id: "e2".into(), ..attempt.clone() };
+        assert_eq!(
+            begin_attempt_within(&record.pubkey, replaced, None).unwrap(),
+            Begin::Exists
+        );
+        finish_attempt_for(&record.pubkey, "b1", "bob:item", AttemptState::Unknown, Some("x".into()), 5)
+            .unwrap();
+        let stored = pay_attempts(&record.pubkey).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state, AttemptState::Unknown);
+        assert_eq!(stored[0].claim_event_id, "e1");
+        assert_eq!(stored[0].updated_at, 5);
+        assert!(finish_attempt_for(&record.pubkey, "b1", "nobody:x", AttemptState::Paid, None, 6).is_err());
+        assert!(finish_attempt_for(&record.pubkey, "b2", "bob:item", AttemptState::Paid, None, 6).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn attempt_on(bounty: &str, address: &str, claimant: &str) -> PayAttempt {
+        PayAttempt {
+            bounty_id: bounty.into(),
+            claim_address: address.into(),
+            claim_event_id: format!("e-{address}"),
+            claimant: claimant.into(),
+            sats: 100,
+            state: AttemptState::Sending,
+            reason: None,
+            started_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn recording_an_attempt_rechecks_the_cap_and_the_per_npub_limit() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-cap-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let keys = Keys::generate();
+        let me = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true)
+            .unwrap()
+            .pubkey;
+
+        // Another instance already paid X on a one-slot bounty: Y waits.
+        let one = SlotLimits { slots: 1, per_npub: Some(1), paid: Vec::new() };
+        let begin = |a: PayAttempt, l: &SlotLimits| begin_attempt_within(&me, a, Some(l)).unwrap();
+        assert_eq!(begin(attempt_on("b1", "x:1", "x"), &one), Begin::Recorded);
+        assert_eq!(begin(attempt_on("b1", "y:1", "y"), &one), Begin::NoSlots);
+        // The same claim on another bounty is its own attempt.
+        assert_eq!(begin(attempt_on("b2", "x:1", "x"), &one), Begin::Recorded);
+        assert_eq!(begin(attempt_on("b2", "x:1", "x"), &one), Begin::Exists);
+
+        // Two slots, one per claimant: bob's second claim is refused.
+        let two = SlotLimits { slots: 2, per_npub: Some(1), paid: Vec::new() };
+        assert_eq!(begin(attempt_on("b3", "bob:1", "bob"), &two), Begin::Recorded);
+        assert_eq!(begin(attempt_on("b3", "bob:2", "bob"), &two), Begin::OverLimit);
+        // A failed attempt frees its slot; a receipt-paid claim takes one.
+        finish_attempt_for(&me, "b3", "bob:1", AttemptState::Failed, None, 2).unwrap();
+        let paid = SlotLimits {
+            slots: 2,
+            per_npub: Some(1),
+            paid: vec![("carol:1".into(), "carol".into()), ("dave:1".into(), "dave".into())],
+        };
+        assert_eq!(begin(attempt_on("b3", "erin:1", "erin"), &paid), Begin::NoSlots);
+        assert_eq!(begin(attempt_on("b3", "erin:1", "erin"), &two), Begin::Recorded);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_store_write_waiting_on_the_lock_does_not_stall_the_runtime() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-lock-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let keys = Keys::generate();
+        let me = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true)
+            .unwrap()
+            .pubkey;
+
+        // Another instance holds the store lock for a second.
+        let held = process_lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_000));
+            drop(held);
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let other_task_ms = runtime.block_on(async move {
+            let start = std::time::Instant::now();
+            let write = tokio::spawn(async move { set_active(&me) });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // With one worker, this runs only if the write gave the worker up.
+            let other = tokio::spawn(async move { start.elapsed().as_millis() }).await.unwrap();
+            write.await.unwrap().unwrap();
+            other
+        });
+        release.join().unwrap();
+        assert!(other_task_ms < 500, "the runtime stalled for {other_task_ms} ms");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stored_minimum_rank_is_never_below_the_floor() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-floor-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let keys = Keys::generate();
+        let me = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true)
+            .unwrap()
+            .pubkey;
+        set_auto_pay(&me, "b1", 1).unwrap();
+        set_auto_pay(&me, "b2", 0).unwrap();
+        set_auto_pay(&me, "b3", 4).unwrap();
+        let ranks: Vec<u64> = auto_pay_settings().unwrap().into_iter().map(|(_, s)| s.min_rank).collect();
+        assert_eq!(ranks, [2, 2, 4]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

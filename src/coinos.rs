@@ -298,12 +298,12 @@ async fn lnurl_get(domain: &str, url: String) -> Result<serde_json::Value, Coino
     Ok(body)
 }
 
-/// A BOLT11 invoice for exactly `sats`, from the recipient's own LUD-16
-/// endpoint — any domain, not only coinos (Strike, Primal, …). LUD-06: read
-/// the pay request, check the amount is inside its range, ask the callback.
-/// `Recipient` for everything the recipient's server did wrong; the caller
-/// keeps the sats count and re-checks it against the invoice before paying.
-pub async fn lnurl_invoice(lightning_address: &str, sats: u64) -> Result<String, CoinosError> {
+/// The recipient's LUD-06 pay request, read and its amount range checked
+/// against `sats`. Returns the domain (for messages) with the body.
+async fn pay_request(
+    lightning_address: &str,
+    sats: u64,
+) -> Result<(String, serde_json::Value), CoinosError> {
     let (user, domain) = split_address(lightning_address).ok_or_else(|| {
         CoinosError::Recipient(format!(
             "{} is not a Lightning address (name@domain.com)",
@@ -326,20 +326,70 @@ pub async fn lnurl_invoice(lightning_address: &str, sats: u64) -> Result<String,
             max / 1000
         )));
     }
-    let callback = pay
-        .get("callback")
+    Ok((domain.to_string(), pay))
+}
+
+/// The pay request's callback, which must be https.
+fn callback_of<'a>(domain: &str, pay: &'a serde_json::Value) -> Result<&'a str, CoinosError> {
+    pay.get("callback")
         .and_then(|c| c.as_str())
         .filter(|c| c.starts_with("https://"))
-        .ok_or_else(|| {
-            CoinosError::Recipient(format!("{domain} gave no callback for the invoice"))
-        })?;
-    let invoice = lnurl_get(domain, callback_with_amount(callback, msat)).await?;
+        .ok_or_else(|| CoinosError::Recipient(format!("{domain} gave no callback for the invoice")))
+}
+
+/// The invoice out of a callback answer.
+fn invoice_of(domain: &str, invoice: &serde_json::Value) -> Result<String, CoinosError> {
     invoice
         .get("pr")
         .and_then(|pr| pr.as_str())
         .map(|pr| pr.trim().to_string())
         .filter(|pr| !pr.is_empty())
         .ok_or_else(|| CoinosError::Recipient(format!("{domain} returned no invoice")))
+}
+
+/// A BOLT11 invoice for exactly `sats`, from the recipient's own LUD-16
+/// endpoint — any domain, not only coinos (Strike, Primal, …). LUD-06: read
+/// the pay request, check the amount is inside its range, ask the callback.
+/// `Recipient` for everything the recipient's server did wrong; the caller
+/// keeps the sats count and re-checks it against the invoice before paying.
+pub async fn lnurl_invoice(lightning_address: &str, sats: u64) -> Result<String, CoinosError> {
+    let (domain, pay) = pay_request(lightning_address, sats).await?;
+    let callback = callback_of(&domain, &pay)?;
+    let invoice = lnurl_get(&domain, callback_with_amount(callback, sats.saturating_mul(1000))).await?;
+    invoice_of(&domain, &invoice)
+}
+
+/// NIP-57: the callback with `amount` and the signed zap request as `nostr`,
+/// URL-encoded. `None` when the callback is not a URL.
+fn zap_callback(callback: &str, msat: u64, zap_request_json: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(callback).ok()?;
+    url.query_pairs_mut()
+        .append_pair("amount", &msat.to_string())
+        .append_pair("nostr", zap_request_json);
+    Some(url.to_string())
+}
+
+/// A zap invoice for exactly `sats`: like [`lnurl_invoice`], but the
+/// recipient's LNURL server must say `allowsNostr`, and the callback gets the
+/// signed kind-9734 so the server publishes a receipt once it is paid.
+/// Without zap support there would be no receipt and the claim would never
+/// show as paid, so such an address is refused before any sats move.
+pub async fn lnurl_zap_invoice(
+    lightning_address: &str,
+    sats: u64,
+    zap_request_json: &str,
+) -> Result<String, CoinosError> {
+    let (domain, pay) = pay_request(lightning_address, sats).await?;
+    if pay.get("allowsNostr").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(CoinosError::Recipient(format!(
+            "{domain} doesn't take zaps, so the payment would leave no receipt"
+        )));
+    }
+    let callback = callback_of(&domain, &pay)?;
+    let url = zap_callback(callback, sats.saturating_mul(1000), zap_request_json)
+        .ok_or_else(|| CoinosError::Recipient(format!("{domain} gave no callback for the invoice")))?;
+    let invoice = lnurl_get(&domain, url).await?;
+    invoice_of(&domain, &invoice)
 }
 
 /// `bolt11` parsed, and its amount checked against what was asked for. The
@@ -465,6 +515,25 @@ mod tests {
             callback_with_amount("https://strike.me/pay?user=m", 21_000),
             "https://strike.me/pay?user=m&amount=21000"
         );
+    }
+
+    #[test]
+    fn the_zap_callback_carries_the_request_url_encoded() {
+        let url = zap_callback(
+            "https://coinos.io/api/lnurlp/carpet?x=1",
+            21_000,
+            r#"{"kind":9734,"tags":[["p","aa"]]}"#,
+        )
+        .unwrap();
+        assert!(url.starts_with("https://coinos.io/api/lnurlp/carpet?x=1&amount=21000&nostr="));
+        assert!(!url.contains('{') && !url.contains('"'), "the request is encoded: {url}");
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let nostr = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "nostr")
+            .map(|(_, v)| v.into_owned());
+        assert_eq!(nostr.as_deref(), Some(r#"{"kind":9734,"tags":[["p","aa"]]}"#));
+        assert_eq!(zap_callback("not a url", 1, "{}"), None);
     }
 
     #[test]

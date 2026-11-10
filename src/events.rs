@@ -25,6 +25,9 @@ pub const DLIST_KIND: u16 = 39998;
 pub const CLAIM_KIND: u16 = 39999;
 /// NIP-57 zap receipt. Joins a claim through its `e` tag.
 pub const RECEIPT_KIND: u16 = 9735;
+/// NIP-57 zap request: signed by the payer, carried to the recipient's LNURL
+/// server, embedded in the receipt's `description` tag.
+pub const ZAP_REQUEST_KIND: u16 = 9734;
 
 #[derive(thiserror::Error, Debug)]
 pub enum EventError {
@@ -163,6 +166,44 @@ pub fn claim(keys: &Keys, name: &str, list_coordinate: &str) -> Result<Event, Ev
         .map_err(|e| EventError::Sign(e.to_string()))
 }
 
+/// Signed kind-9734 zap request for paying a claim on one bounty: the shape
+/// magic-carpet-v2/src/lib/zap-node.js `buildZapRequest` signs (content "",
+/// `["p", claimant]`, `["e", claim id]`, `["a", list coordinate]`,
+/// `["amount", msats]`, `["relays", …]`) plus `["bounty", <server bounty
+/// id>]`, so two bounties on one list each pay a claim once and a receipt
+/// for one never counts for the other. The server matches a receipt by its
+/// `e` tag and the request's pubkey only, so the extra tag changes nothing
+/// there; it counts the claim paid when that pubkey is the issuer, so `keys`
+/// must be the issuer's.
+pub fn zap_request(
+    keys: &Keys,
+    claimant_hex: &str,
+    claim_event_id: &str,
+    list_coordinate: &str,
+    bounty_id: &str,
+    sats: u64,
+    relays: &[String],
+) -> Result<Event, EventError> {
+    if sats == 0 {
+        return Err(EventError::Invalid("A zap needs at least 1 sat.".into()));
+    }
+    let msats = sats.saturating_mul(1000).to_string();
+    let relay_tag: Vec<&str> = std::iter::once("relays")
+        .chain(relays.iter().map(String::as_str))
+        .collect();
+    EventBuilder::new(Kind::Custom(ZAP_REQUEST_KIND), "")
+        .tags([
+            tag(["p", claimant_hex])?,
+            tag(["e", claim_event_id])?,
+            tag(["a", list_coordinate])?,
+            tag(["bounty", bounty_id])?,
+            tag(["amount", msats.as_str()])?,
+            tag(relay_tag)?,
+        ])
+        .finalize(keys)
+        .map_err(|e| EventError::Sign(e.to_string()))
+}
+
 /// A kind-9735 receipt, reduced to the facts the app acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
@@ -188,6 +229,77 @@ impl Receipt {
     pub fn pays_claim(&self, claim_event_id: &str) -> bool {
         self.claim_event_ids.iter().any(|id| id == claim_event_id)
     }
+}
+
+/// Whether a relay's kind-9735 pays `claim_event_id` on `payer`'s behalf:
+/// the receipt names the claim, and the zap request inside its
+/// `description` is a valid kind-9734 SIGNED by `payer` that names the claim
+/// too. Stricter than the server, which reads the description's pubkey
+/// without checking its signature: anyone can publish a 9735, so a forged
+/// one could otherwise use up a bounty's slots from the issuer's own view.
+pub fn receipt_pays_claim_for(receipt: &Event, claim_event_id: &str, payer: &str) -> bool {
+    let names = |event: &Event, name: &str, value: &str| {
+        event.tags.iter().any(|t| {
+            let t = t.as_slice();
+            t.first().map(String::as_str) == Some(name) && t.get(1).map(String::as_str) == Some(value)
+        })
+    };
+    if receipt.kind.as_u16() != RECEIPT_KIND || !names(receipt, "e", claim_event_id) {
+        return false;
+    }
+    let Some(description) = receipt.tags.iter().find_map(|t| {
+        let t = t.as_slice();
+        (t.first().map(String::as_str) == Some("description")).then(|| t.get(1)).flatten()
+    }) else {
+        return false;
+    };
+    let Ok(request) = serde_json::from_str::<Event>(description) else {
+        return false;
+    };
+    request.kind.as_u16() == ZAP_REQUEST_KIND
+        && request.pubkey.to_hex() == payer
+        && request.verify().is_ok()
+        && names(&request, "e", claim_event_id)
+}
+
+/// [`receipt_pays_claim_for`], and the zap request asks for exactly the
+/// bounty's reward (`amount`, msats) and, when it names a list (`a`), names
+/// this bounty's. A request naming a bounty (`["bounty", id]`, this app's
+/// zaps) pays only that bounty. One with no bounty tag (a payment by hand
+/// from another client, older zaps) pays the claim on every bounty on its
+/// list: that can only make the app pay too little, never twice.
+pub fn receipt_pays_bounty_claim(
+    receipt: &Event,
+    claim_event_id: &str,
+    payer: &str,
+    list_coordinate: &str,
+    bounty_id: &str,
+    reward_sats: u64,
+) -> bool {
+    if !receipt_pays_claim_for(receipt, claim_event_id, payer) {
+        return false;
+    }
+    let Some(request) = receipt.tags.iter().find_map(|t| {
+        let t = t.as_slice();
+        (t.first().map(String::as_str) == Some("description"))
+            .then(|| t.get(1))
+            .flatten()
+            .and_then(|d| serde_json::from_str::<Event>(d).ok())
+    }) else {
+        return false;
+    };
+    let first = |name: &str| {
+        request.tags.iter().find_map(|t| {
+            let t = t.as_slice();
+            (t.first().map(String::as_str) == Some(name))
+                .then(|| t.get(1).cloned())
+                .flatten()
+        })
+    };
+    let msats = reward_sats.saturating_mul(1000).to_string();
+    first("bounty").is_none_or(|b| b == bounty_id)
+        && first("amount").as_deref() == Some(msats.as_str())
+        && first("a").is_none_or(|a| a == list_coordinate)
 }
 
 /// Parse a live relay event as a receipt. `None` when it is not kind-9735.
@@ -364,6 +476,128 @@ mod tests {
         assert_eq!(receipt.amount_msats, Some(100_000));
         assert_eq!(receipt.amount_sats(), Some(100));
         assert_eq!(receipt.created_at, 1_786_093_481);
+    }
+
+    #[test]
+    fn a_zap_request_matches_the_server_shape() {
+        let issuer = Keys::generate();
+        let claimant = "aa".repeat(32);
+        let relays = vec![
+            "wss://magic-carpet.brainstorm.world/relay".to_string(),
+            "wss://nos.lol".to_string(),
+        ];
+        let event = zap_request(&issuer, &claimant, "e1", COORD, "b1", 100, &relays).unwrap();
+        assert_eq!(event.kind.as_u16(), ZAP_REQUEST_KIND);
+        assert_eq!(event.content, "");
+        assert_eq!(event.pubkey, issuer.public_key(), "signed by the issuer");
+        assert!(event.verify().is_ok());
+        assert_eq!(
+            tags_of(&event),
+            vec![
+                vec!["p".to_string(), claimant],
+                vec!["e".to_string(), "e1".to_string()],
+                vec!["a".to_string(), COORD.to_string()],
+                vec!["bounty".to_string(), "b1".to_string()],
+                vec!["amount".to_string(), "100000".to_string()],
+                vec![
+                    "relays".to_string(),
+                    relays[0].clone(),
+                    relays[1].clone(),
+                ],
+            ]
+        );
+        assert!(zap_request(&issuer, "bb", "e1", COORD, "b1", 0, &relays).is_err());
+    }
+
+    #[test]
+    fn only_a_receipt_around_the_payers_signed_request_pays_the_claim() {
+        let issuer = Keys::generate();
+        let zapper = Keys::generate();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let receipt = |request: &Event, e: &str| -> Event {
+            EventBuilder::new(Kind::Custom(RECEIPT_KIND), "")
+                .tags([
+                    tag(["e", e]).unwrap(),
+                    tag(["description", serde_json::to_string(request).unwrap().as_str()]).unwrap(),
+                ])
+                .finalize(&zapper)
+                .unwrap()
+        };
+        let request = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 21, &relays).unwrap();
+        let payer = issuer.public_key().to_hex();
+        assert!(receipt_pays_claim_for(&receipt(&request, "c1"), "c1", &payer));
+        // Another claim, another payer, or a receipt naming a claim its
+        // request does not: none of them pay.
+        assert!(!receipt_pays_claim_for(&receipt(&request, "c1"), "c2", &payer));
+        assert!(!receipt_pays_claim_for(&receipt(&request, "c2"), "c2", &payer));
+        let stranger = Keys::generate().public_key().to_hex();
+        assert!(!receipt_pays_claim_for(&receipt(&request, "c1"), "c1", &stranger));
+        // A request whose signature does not hold is not the payer's.
+        let mut forged: serde_json::Value = serde_json::to_value(&request).unwrap();
+        forged["content"] = "x".into();
+        let forged: Event = serde_json::from_value(forged).unwrap();
+        assert!(!receipt_pays_claim_for(&receipt(&forged, "c1"), "c1", &payer));
+    }
+
+    #[test]
+    fn a_receipt_pays_a_bounty_claim_only_for_its_reward_and_list() {
+        let issuer = Keys::generate();
+        let zapper = Keys::generate();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let receipt = |request: &Event| -> Event {
+            EventBuilder::new(Kind::Custom(RECEIPT_KIND), "")
+                .tags([
+                    tag(["e", "c1"]).unwrap(),
+                    tag(["description", serde_json::to_string(request).unwrap().as_str()]).unwrap(),
+                ])
+                .finalize(&zapper)
+                .unwrap()
+        };
+        let payer = issuer.public_key().to_hex();
+        let right = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 100, &relays).unwrap();
+        assert!(receipt_pays_bounty_claim(&receipt(&right), "c1", &payer, COORD, "b1", 100));
+        // One sat short, or a zap aimed at another list, pays nothing here.
+        let short = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 99, &relays).unwrap();
+        assert!(!receipt_pays_bounty_claim(&receipt(&short), "c1", &payer, COORD, "b1", 100));
+        let other = zap_request(&issuer, &"aa".repeat(32), "c1", "39998:aa:other", "b1", 100, &relays).unwrap();
+        assert!(!receipt_pays_bounty_claim(&receipt(&other), "c1", &payer, COORD, "b1", 100));
+    }
+
+    #[test]
+    fn a_receipt_pays_only_the_bounty_its_request_names() {
+        let issuer = Keys::generate();
+        let zapper = Keys::generate();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let receipt = |request: &Event| -> Event {
+            EventBuilder::new(Kind::Custom(RECEIPT_KIND), "")
+                .tags([
+                    tag(["e", "c1"]).unwrap(),
+                    tag(["description", serde_json::to_string(request).unwrap().as_str()]).unwrap(),
+                ])
+                .finalize(&zapper)
+                .unwrap()
+        };
+        let payer = issuer.public_key().to_hex();
+        let for_b1 = zap_request(&issuer, &"aa".repeat(32), "c1", COORD, "b1", 100, &relays).unwrap();
+        assert!(receipt_pays_bounty_claim(&receipt(&for_b1), "c1", &payer, COORD, "b1", 100));
+        assert!(!receipt_pays_bounty_claim(&receipt(&for_b1), "c1", &payer, COORD, "b2", 100));
+        // A request with no bounty tag (a payment by hand from another
+        // client) pays the claim on every bounty on its list.
+        let untagged = EventBuilder::new(Kind::Custom(ZAP_REQUEST_KIND), "")
+            .tags([
+                tag(["p", "aa"]).unwrap(),
+                tag(["e", "c1"]).unwrap(),
+                tag(["a", COORD]).unwrap(),
+                tag(["amount", "100000"]).unwrap(),
+            ])
+            .finalize(&issuer)
+            .unwrap();
+        assert!(receipt_pays_claim_for(&receipt(&untagged), "c1", &payer));
+        assert!(receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, COORD, "b1", 100));
+        assert!(receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, COORD, "b2", 100));
+        // Still only for the reward, and only on the list it names.
+        assert!(!receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, COORD, "b1", 99));
+        assert!(!receipt_pays_bounty_claim(&receipt(&untagged), "c1", &payer, "39998:aa:other", "b1", 100));
     }
 
     #[test]
