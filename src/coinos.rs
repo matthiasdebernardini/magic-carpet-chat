@@ -30,6 +30,7 @@ use lightning_invoice::Bolt11Invoice;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use crate::diag;
 use crate::secrets::Secret;
 
 const BASE: &str = "https://coinos.io";
@@ -283,7 +284,11 @@ async fn lnurl_get(domain: &str, url: String) -> Result<serde_json::Value, Coino
         .await
         .map_err(|e| CoinosError::Recipient(format!("{domain} couldn't be reached: {e}")))?;
     let status = resp.status();
-    let body: serde_json::Value = resp.json().await.map_err(|_| {
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        diag::note(format!(
+            "LNURL reply from {domain} (HTTP {status}) did not decode: {}",
+            e.without_url()
+        ));
         CoinosError::Recipient(format!("{domain} answered {status} with no LNURL response"))
     })?;
     if let Some(reason) = lnurl_error(&body) {
@@ -438,6 +443,7 @@ pub async fn pay_invoice(token: &Secret, bolt11: &str, sats: u64) -> Result<(), 
             if e.is_connect() {
                 CoinosError::Http(e.to_string())
             } else {
+                diag::note(format!("coinos payment gave no answer: {}", e.without_url()));
                 CoinosError::OutcomeUnknown
             }
         })?;

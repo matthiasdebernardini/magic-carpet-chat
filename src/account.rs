@@ -423,7 +423,7 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
     let card_id = format!("accounts-card-{}", view.pubkey);
     let name = display_name(view);
     let payout = match view.payout_address() {
-        Some(address) => format!("payouts → {address}"),
+        Some(address) => format!("payouts to {address}"),
         None => "no payout address yet".to_string(),
     };
     h_flex()
@@ -542,7 +542,8 @@ fn account_card(shell: &Shell, ix: usize, view: &AccountView, cx: &mut Context<S
 
 /// The Account screen: the mock's `isAccountDetail` block — back link,
 /// header, tab strip, and the tab's body. Identity & keys and Trust are
-/// built; the other three tabs say "Coming soon."
+/// built, Wallet is the Wallet screen's panel for this account; the other
+/// two tabs say "Coming soon."
 pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let Some(page) = &shell.account_page else {
         return div()
@@ -700,6 +701,9 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                                     }
                                     page.tab = item;
                                 }
+                                // The Wallet tab's balance is polled only
+                                // while that tab shows.
+                                this.sync_balance_poll(cx);
                                 cx.notify();
                             }))
                     }),
@@ -708,6 +712,13 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
         .child(match tab {
             Tab::Identity => render_identity(shell, &pubkey, &npub, cx),
             Tab::Trust => render_trust(shell, &pubkey, cx),
+            Tab::Wallet => {
+                // Any account but the active one gets the panel without
+                // the send form (`wallet::shows_send`).
+                let send = crate::wallet::shows_send(shell.active.as_deref(), &pubkey)
+                    .then_some(&shell.send_inputs);
+                crate::wallet::panel(view, false, send, cx)
+            }
             _ => div()
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_MUTED))
@@ -715,7 +726,6 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
                 .a11y(
                     match tab {
                         Tab::Progress => "account-progress-soon",
-                        Tab::Wallet => "account-wallet-soon",
                         _ => "account-limits-soon",
                     },
                     Role::Label,
@@ -1507,7 +1517,7 @@ fn map_card(
     if let Some(message) = failed_message {
         let checked = match state.checked_at {
             Some(at) => format!(
-                "Last successful check: {} — {}",
+                "Last successful check: {} ({})",
                 timefmt::relative(now, at),
                 timefmt::month_day_year(at)
             ),

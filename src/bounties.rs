@@ -10,23 +10,19 @@
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use gpui_kit::component::{h_flex, input::Input, v_flex};
+use gpui_kit::component::{h_flex, input::{Input, Paste}, v_flex};
 
 use magic_carpet_chat::api::{Bounty, Claim};
+use magic_carpet_chat::bounty_search::coordinate_dtag;
 
 use crate::a11y::Accessible as _;
 use crate::account::Tab;
 use crate::dashboard::{MONO, count_badge};
 use crate::palette::*;
 use crate::shell::{
-    BOUNTY_FIELD_DEFS, BountyTab, F_CRITERIA, Load, RANK_NOTE, Screen, Shell, opens_claim, short_id,
+    BOUNTY_FIELD_DEFS, BountyTab, F_CRITERIA, Load, RANK_NOTE, Screen, Shell, form_locked, opens_claim, short_id,
 };
 use crate::timefmt;
-
-/// The human end of a list coordinate: `39998:<pk>:us-city` → `us-city`.
-fn coordinate_dtag(coordinate: &str) -> &str {
-    coordinate.rsplit(':').next().unwrap_or(coordinate)
-}
 
 fn status_hue(status: &str) -> u32 {
     match status {
@@ -234,6 +230,7 @@ fn bounty_row(
         )
         .children(chip.map(|chip| qualify_pill(format!("{row_id}-qualify"), chip)))
         .on_click(cx.listener(move |this, _, _, cx| {
+            this.record_visit(&id);
             this.select(id.clone());
             cx.notify();
         }))
@@ -362,7 +359,7 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .py(px(12.))
                 .child({
                     let text = format!(
-                        "{} didn't load: {message} Click Retry.",
+                        "{} didn't load: {message}",
                         if eligible { "Eligible bounties" } else { "Bounties" }
                     );
                     div()
@@ -402,17 +399,32 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .child("No bounties yet. ⌘N creates the first one.")
                 .into_any_element(),
         ],
-        Load::Ready(list) => list
-            .iter()
-            .map(|bounty| {
-                bounty_row(
-                    bounty,
-                    shell.selected.as_deref() == Some(bounty.id.as_str()),
-                    qualify_chip(bounty),
-                    cx,
-                )
-            })
-            .collect(),
+        Load::Ready(_) => {
+            let rows = shell.displayed();
+            if rows.is_empty() {
+                let text = format!("No bounties match \"{}\".", shell.query.trim());
+                vec![
+                    div()
+                        .a11y("bounties-no-match", Role::Label, text.clone())
+                        .py(px(20.))
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_DIM))
+                        .child(SharedString::from(text))
+                        .into_any_element(),
+                ]
+            } else {
+                rows.into_iter()
+                    .map(|bounty| {
+                        bounty_row(
+                            bounty,
+                            shell.selected.as_deref() == Some(bounty.id.as_str()),
+                            qualify_chip(bounty),
+                            cx,
+                        )
+                    })
+                    .collect()
+            }
+        }
     };
 
     // The pane scrolls on its own (the screen does not). The tracked handle
@@ -503,7 +515,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
                 .unwrap_or_default();
             let (dot, text) = match row.state.as_str() {
                 "attempting" => (ACCENT, "Auto-pay attempting…".to_string()),
-                "paid" => (AMBER, "Paid — waiting for the zap receipt".to_string()),
+                "paid" => (AMBER, "Paid, waiting for the zap receipt".to_string()),
                 "settled" => (GREEN, "Payment settled".to_string()),
                 "paid_unreceipted" => (AMBER, format!("Paid, no receipt{why}")),
                 "failed" => (RED, format!("Auto-pay failed{why}")),
@@ -665,7 +677,7 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
             let text = if shell.selected_is_optimistic() {
                 // The header above renders the just-submitted values; be
                 // honest that the server has not echoed them back yet.
-                "Created — syncing with the instance…"
+                "Created, syncing with the instance…"
             } else {
                 "Loading claims…"
             };
@@ -808,8 +820,10 @@ fn form_card(
     title: String,
     rows: Vec<AnyElement>,
     error: Option<String>,
-    busy: Option<&'static str>,
-    hint_text: &'static str,
+    // The busy line, or the hint when idle.
+    status: &'static str,
+    // Some(locked): the header gets a "Paste TOML" button, inert when locked.
+    paste: Option<bool>,
     cx: &mut Context<Shell>,
 ) -> AnyElement {
     v_flex()
@@ -835,6 +849,27 @@ fn form_card(
                         .font_weight(FontWeight::BOLD)
                         .child(SharedString::from(title)),
                 )
+                .when_some(paste, |this, locked| {
+                    this.child(
+                        div()
+                            .id("paste-toml")
+                            .a11y(format!("{form_id}-paste"), Role::Button, "Paste TOML")
+                            .px(px(11.))
+                            .py(px(5.))
+                            .rounded(px(7.))
+                            .border_1()
+                            .border_color(rgb(BORDER_3))
+                            .text_size(px(11.5))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("Paste TOML")
+                            .when(locked, |this| this.opacity(0.5))
+                            .when(!locked, |this| {
+                                this.cursor_pointer().on_click(cx.listener(|this, _, window, cx| {
+                                    this.paste_bounty_toml(window, cx)
+                                }))
+                            }),
+                    )
+                })
                 .child(
                     div()
                         .id("cancel-form")
@@ -863,7 +898,7 @@ fn form_card(
         })
         .child(hint(
             format!("{form_id}-status"),
-            busy.unwrap_or(hint_text),
+            status,
         ))
         .into_any_element()
 }
@@ -895,6 +930,35 @@ const BOUNTY_FIELD_IDS: [&str; 8] = [
     "bounty-form-auto-pay",
     "bounty-form-min-rank",
 ];
+
+/// The primary button at the bottom of a form: what Enter in the form does.
+/// Dimmed and inert while `locked`.
+fn submit_button(
+    id: &'static str,
+    label: &'static str,
+    locked: bool,
+    submit: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .a11y(id, Role::Button, label)
+        .self_start()
+        .px(px(16.))
+        .py(px(8.))
+        .rounded(px(9.))
+        .bg(grad(ACCENT, ACCENT_DEEP))
+        .text_color(rgb(BG_RAIL))
+        .text_size(px(12.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(label)
+        .when(locked, |this| this.opacity(0.5))
+        .when(!locked, |this| {
+            this.cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| submit(this, window, cx)))
+        })
+        .into_any_element()
+}
 
 fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
     if let Some(form) = &shell.bounty_form {
@@ -934,13 +998,36 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
                     labeled_input(
                         id,
                         label,
-                        Input::new(field)
-                            .accessibility_id(id)
-                            .aria_label(*label)
+                        // Capture phase runs before the input's own Paste: form
+                        // TOML on the clipboard fills the form instead.
+                        div()
+                            .capture_action(cx.listener(|this, _: &Paste, window, cx| {
+                                let text = cx.read_from_clipboard().and_then(|item| item.text());
+                                if this.paste_over_bounty_field(text.as_deref(), window, cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .child(
+                                Input::new(field)
+                                    .accessibility_id(id)
+                                    .aria_label(*label),
+                            )
                             .into_any_element(),
                     )
                 }),
         );
+        let locked = form_locked(form.submitting, form.checking_list);
+        rows.push(submit_button(
+            "bounty-form-submit",
+            if form.existing_list.is_some() {
+                "Create bounty"
+            } else {
+                "Publish list and create bounty"
+            },
+            locked,
+            |this, window, cx| this.submit_bounty_form(window, cx),
+            cx,
+        ));
         return Some(form_card(
             "bounty-form",
             if form.existing_list.is_some() {
@@ -951,15 +1038,15 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             rows,
             form.error.clone(),
             if form.checking_list.is_some() {
-                Some("Checking the list…")
-            } else {
-                form.submitting.then_some("Publishing…")
-            },
-            if form.existing_list.is_some() {
+                "Checking the list…"
+            } else if form.submitting {
+                "Publishing…"
+            } else if form.existing_list.is_some() {
                 "Enter moves to the next field. Enter on the last field creates the bounty. With auto-pay on, this app pays qualifying claims from your Coinos wallet while it runs. esc cancels."
             } else {
                 "Enter moves to the next field. Enter on the last field publishes the list and creates the bounty. With auto-pay on, this app pays qualifying claims from your Coinos wallet while it runs. esc cancels."
             },
+            Some(form_locked(form.submitting, form.checking_list)),
             cx,
         ));
     }
@@ -1001,14 +1088,25 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
                     .into_any_element(),
             ),
             hint("claim-form-note", format!("{payout}{RANK_NOTE}")).into_any_element(),
+            submit_button(
+                "claim-form-submit",
+                "Submit claim",
+                form.submitting,
+                |this, window, cx| this.submit_claim_form(window, cx),
+                cx,
+            ),
         ];
         return Some(form_card(
             "claim-form",
             format!("Claim an item on {dtag}{reward}"),
             rows,
             form.error.clone(),
-            form.submitting.then_some("Publishing…"),
-            "Enter sends your claim. esc cancels.",
+            if form.submitting {
+                "Publishing…"
+            } else {
+                "Enter sends your claim. esc cancels."
+            },
+            None,
             cx,
         ));
     }

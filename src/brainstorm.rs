@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
+use crate::diag;
 use crate::secrets::Secret;
 
 /// `MC_BRAINSTORM_URL` replaces the base for EVERY Brainstorm call, so a
@@ -294,12 +295,18 @@ fn http() -> Result<reqwest::Client, &'static str> {
         .user_agent(crate::USER_AGENT)
         .timeout(Duration::from_secs(15))
         .build()
-        .map_err(|_| GENERIC)
+        .map_err(|e| {
+            diag::note(format!("brainstorm client did not build: {}", e.without_url()));
+            GENERIC
+        })
 }
 
 /// The response body, kept only long enough to classify — never shown.
 async fn send(request: reqwest::RequestBuilder) -> Result<(reqwest::StatusCode, String), Fail> {
-    let response = request.send().await.map_err(|_| Fail::Text(GENERIC))?;
+    let response = request.send().await.map_err(|e| {
+        diag::note(format!("brainstorm request failed: {}", e.without_url()));
+        Fail::Text(GENERIC)
+    })?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     Ok((status, body))

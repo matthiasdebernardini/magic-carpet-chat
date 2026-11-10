@@ -280,8 +280,8 @@ fn create_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
         ))
         .children(error_line(setup.error.clone()))
         .child(
-            primary_button("setup-create-go", "Create — Enter")
-                .a11y("setup-create-go", Role::Button, "Create — Enter")
+            primary_button("setup-create-go", "Create (Enter)")
+                .a11y("setup-create-go", Role::Button, "Create (Enter)")
                 .on_click(cx.listener(|this, _, _, cx| this.setup_submit_create(cx))),
         )
         .child(back_link(cx))
@@ -558,12 +558,12 @@ fn browse_card(cx: &mut Context<Shell>) -> AnyElement {
     card()
         .child(card_title("setup-title-browse", "Just look around"))
         .child(muted(
-            "Browse bounties without an account. Click the + button in the left bar to add one later.",
+            "Add an account later with the + button in the left bar.",
             TEXT_MUTED,
         ))
         .child(
-            quiet_button("setup-browse", "Continue without an account — esc")
-                .a11y("setup-browse", Role::Button, "Continue without an account — esc")
+            quiet_button("setup-browse", "Continue without an account (esc)")
+                .a11y("setup-browse", Role::Button, "Continue without an account (esc)")
                 .mt(px(2.))
                 .on_click(cx.listener(|this, _, window, cx| this.leave_account_setup(window, cx))),
         )
@@ -573,8 +573,8 @@ fn browse_card(cx: &mut Context<Shell>) -> AnyElement {
 fn cancel_card(cx: &mut Context<Shell>) -> AnyElement {
     card()
         .child(
-            quiet_button("setup-cancel", "Cancel — esc")
-                .a11y("setup-cancel", Role::Button, "Cancel — esc")
+            quiet_button("setup-cancel", "Cancel (esc)")
+                .a11y("setup-cancel", Role::Button, "Cancel (esc)")
                 .on_click(cx.listener(|this, _, window, cx| this.leave_account_setup(window, cx))),
         )
         .into_any_element()
@@ -641,7 +641,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                             div()
                                 .text_size(px(13.))
                                 .text_color(rgb(TEXT_MUTED))
-                                .child("Claim bounties. Get paid in sats, automatically."),
+                                .child("Claim bounties and get paid in sats."),
                         ),
                 )
                 .child(
@@ -650,6 +650,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                         .gap(px(14.))
                         .children(main)
                         .children(exit),
-                ),
+                )
+                .child(crate::shell::debug_button(cx)),
         )
 }

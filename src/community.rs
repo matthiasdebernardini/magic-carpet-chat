@@ -1052,7 +1052,7 @@ pub(crate) fn recalc_block(
     let finished = state.last_finished.map(|finished| {
         let text = match finished {
             Some(at) => format!(
-                "Last run finished {} — {}, {} UTC",
+                "Last run finished {} ({}, {} UTC)",
                 timefmt::relative(timefmt::now_unix(), at),
                 timefmt::month_day_year(at),
                 timefmt::hhmmss_utc(at)

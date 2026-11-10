@@ -54,6 +54,7 @@ set of these ids with macos-harness.
 - **Disabled.** gpui 0.3.4 has no disabled flag. Step buttons say
   `unavailable` in their description; other inert controls keep their node and
   a nearby status line says why (`wallet-send` while "Sending…").
+- **Right-click copies a Label.** Every `Label` copies its text to the clipboard on a right-click and toasts "Copied"; the debug report lists every id, role and label of the last frame under "On screen".
 - **Labels follow the visible text**, including when it changes; the id never
   changes with it. Exceptions are listed in their tables.
 - **Secrets never reach the tree.** The revealed nsec is labelled
@@ -100,6 +101,7 @@ suite on the cua box (`scripts/e2e-cua/atspi.py`, X11 under xfce).
 | `rail-logo` | Button | Dashboard | logo; goes to the Dashboard |
 | `rail-account-<pubkey>` | Tab | account name, or "New account" | one per stored account; `Value: on` for the active one |
 | `rail-add-account` | Button | Add account | the "+"; opens account setup |
+| `copy-debug-info` | Button | Copy debug info | bottom of the rail, above the relay dot; also at the foot of the account screen, where there is no rail. Copies the debug report (⌘⇧C does the same) and toasts "Debug info copied" |
 | `rail-relay` | Label | Relay connected / Relay disconnected | screen shows "relay" and a coloured dot; the label names the colour's meaning |
 | `rail-accounts` | Tab | Accounts | on for the Accounts and account pages |
 | `rail-settings` | Tab | Settings | |
@@ -114,7 +116,8 @@ suite on the cua box (`scripts/e2e-cua/atspi.py`, X11 under xfce).
 | `sidebar-open-title`, `sidebar-promised-title`, `sidebar-paid-title` | Label | OPEN BOUNTIES, PROMISED, PAID SO FAR | |
 | `sidebar-open`, `sidebar-promised`, `sidebar-paid` | Label | the figure | "…" while loading, "—" on failure; the "sats" unit is not in the label |
 | `sidebar-open-note`, `sidebar-promised-note`, `sidebar-paid-note` | Label | the note under the figure | |
-| `top-search` | TextInput | Search | |
+| `top-shortcut` | Label | the keys just pressed and what they do, e.g. `⌘R Refresh` | shown for about 2 s after an app shortcut (cmd-… or esc); overlaid beside `top-auto-pay`, absent otherwise |
+| `top-search` | TextInput | Search | filters and ranks the bounty list (fuzzy); typing off the Bounties screen switches to it; esc clears it |
 | `top-auto-pay` | Label | Auto-pay armed / Auto-pay off | only while a bounty is focused |
 
 Nav and placeholder ids derive from the screen names; renaming a screen
@@ -127,7 +130,7 @@ renames its ids.
 | `placeholder-<screen>-title` | Heading | screen name | Payments, Claimants, Leaderboards, Tags, Settings |
 | `placeholder-<screen>` | Label | Coming soon. | |
 | `wallet-title` | Heading | Wallet: <name> / Wallet | |
-| `wallet-no-account` | Label | No account — press + in the rail to add one. | |
+| `wallet-no-account` | Label | No account. Press + in the rail to add one. | |
 
 ## Account setup
 
@@ -140,7 +143,7 @@ renames its ids.
 | `setup-name-label` | Label | Name (optional) | |
 | `setup-name` | TextInput | Name (optional) | |
 | `setup-wallet-note` | Label | the Coinos note | |
-| `setup-create-go` | Button | Create — Enter | |
+| `setup-create-go` | Button | Create (Enter) | |
 | `setup-title-paste` | Heading | Use your Nostr key | paste card |
 | `setup-key` | TextInput | Secret key | masked; never the key text |
 | `setup-paste-hint` | Label | Enter continues | |
@@ -148,8 +151,8 @@ renames its ids.
 | `setup-back` | Button | ← Back | |
 | `setup-working` | Label | the spinner text | e.g. "Loading the account…" |
 | `setup-title-browse` | Heading | Just look around | |
-| `setup-browse` | Button | Continue without an account — esc | first launch only |
-| `setup-cancel` | Button | Cancel — esc | when adding a further account |
+| `setup-browse` | Button | Continue without an account (esc) | first launch only |
+| `setup-cancel` | Button | Cancel (esc) | when adding a further account |
 | `setup-step-identity-title` | Heading | Your Nostr identity | ready, step 1 |
 | `setup-step-identity-tag` | Label | saved on this computer | |
 | `setup-npub` | Label | short npub | |
@@ -184,7 +187,7 @@ card (`community-*`). `community-dashboard` leaves setup.
 | `dash-activity-list` | List | Recent activity | |
 | `dash-activity-<at>-<hash>` | Group | the event text | `<at>` unix seconds, `<hash>` FNV-1a of the text, `-2`, `-3` for repeats; find rows by label, not by computing the id |
 | `<activity row>-meta` | Label | HH:MM:SS UTC · <relative> | |
-| `dash-activity-empty` | Label | Nothing yet. New claims and payments show up here. | |
+| `dash-activity-empty` | Label | No activity yet. | |
 
 The map row's kind changes with the verdict, so match the prefix
 `dash-attention-<pubkey>-map-`.
@@ -204,6 +207,7 @@ The map row's kind changes with the verdict, so match the prefix
 | `bounties-list` | List | Bounties | |
 | `bounties-loading` | Label | Loading bounties… | |
 | `bounties-empty` | Label | the empty text of the open tab | |
+| `bounties-no-match` | Label | No bounties match "<query>". | the search matches nothing |
 | `bounties-eligible-identity` | Button | the share-your-npub hint | Eligible tab, empty |
 | `bounties-error` | Label | Bounties didn't load: … / Eligible bounties didn't load: … | |
 | `bounties-retry` | Button | Retry (⌘R) | |
@@ -220,12 +224,12 @@ The map row's kind changes with the verdict, so match the prefix
 | `bounty-detail-new-on-list` | Button | New bounty on this list | |
 | `bounty-detail-claims-heading` | Heading | Claims | |
 | `claim-list` | List | Claims | |
-| `claim-list-loading` | Label | Loading claims… / Created — syncing with the instance… | |
+| `claim-list-loading` | Label | Loading claims… / Created, syncing with the instance… | |
 | `claim-list-empty` | Label | No claims yet. | |
 | `<claim>` | Group | item name | one per claim |
 | `<claim>-item`, `<claim>-author` | Label | item name, by <short pubkey> | |
 | `<claim>-submitted`, `<claim>-attempted`, `<claim>-blocked`, `<claim>-receipt` | Label | timeline rows | |
-| `<claim>-payment` | Label | payment state: Auto-pay attempting…, Paid — waiting for the zap receipt, Payment settled, Paid, no receipt (…), Auto-pay failed (…), Payment status: unknown (…), Payment status: …, No auto-payment row yet | same id whatever the state; the issuer's own app's attempts read the same way, and on a bounty the server doesn't pay, every app (the claimant's too) reads Payment settled once a receipt around the issuer's signed request for the reward lands (one naming another bounty on the list doesn't count; one naming no bounty counts on every bounty on its list) |
+| `<claim>-payment` | Label | payment state: Auto-pay attempting…, Paid, waiting for the zap receipt, Payment settled, Paid, no receipt (…), Auto-pay failed (…), Payment status: unknown (…), Payment status: …, No auto-payment row yet | same id whatever the state; the issuer's own app's attempts read the same way, and on a bounty the server doesn't pay, every app (the claimant's too) reads Payment settled once a receipt around the issuer's signed request for the reward lands (one naming another bounty on the list doesn't count; one naming no bounty counts on every bounty on its list) |
 | `<claim>-unpaid-reason` | Label | why the claim is not paid: Rank too low: … rank this account N, and the bounty needs M. / No Lightning address in the claimant's profile, … / Wallet empty: … / Payment failed. … / Payment outcome unknown. … / Paying now… / Waiting for the issuer's app to pay it. / Waiting for the next auto-pay check. / No reward slots left on this bounty. / … | only on unpaid claims of bounties the server does not pay itself |
 | `<claim>-submitted-meta`, `-attempted-meta`, `-payment-meta` | Label | HH:MM:SS UTC · <relative> (· N sats) | `-payment-meta` carries the paid amount |
 | `<claim>-receipt-meta` | Label | N sats · Ns after the claim | |
@@ -237,6 +241,8 @@ The map row's kind changes with the verdict, so match the prefix
 | `bounty-form` | Group | New DList + bounty / New bounty on this list | |
 | `bounty-form-title` | Heading | same | |
 | `bounty-form-cancel` | Button | Cancel (esc) | |
+| `bounty-form-paste` | Button | Paste TOML | fills the fields from clipboard TOML (keys `item_singular`, `item_plural`, `description`, `criteria`, `amount`, `cap`, `auto_pay`, `min_rank`); inert while the form is locked; cmd-V of form TOML in a field fills too |
+| `bounty-form-submit` | Button | Publish list and create bounty, or Create bounty (existing list) | same as Enter on the last field; inert while the form is locked |
 | `bounty-form-error` | Label | the error | |
 | `bounty-form-status` | Label | the hint, Checking the list… or Publishing… | |
 | `bounty-form-list-label`, `bounty-form-list` | Label | List, the list name | adding to an existing list |
@@ -245,16 +251,18 @@ The map row's kind changes with the verdict, so match the prefix
 | `claim-form-title`, `claim-form-cancel`, `claim-form-error`, `claim-form-status` | as above | | |
 | `claim-form-item-name` | TextInput | Item name | with `claim-form-item-name-label` |
 | `claim-form-note` | Label | the payout note | |
+| `claim-form-submit` | Button | Submit claim | same as Enter in the field; dimmed and inert while the claim is being sent |
 
 ## Wallet panel
 
-On the Wallet screen and in the account-setup ready steps (never both).
+On the Wallet screen, the Account page's Wallet tab and the account-setup ready steps (never two at once).
 
 | id | role | label | meaning |
 |---|---|---|---|
 | `wallet-address-label`, `wallet-address` | Label | Lightning address, the address | |
 | `wallet-qr` | Image | Funding QR code | Label "Could not draw the QR code." when it can't be drawn |
 | `wallet-qr-hint` | Label | the scan hint | |
+| `qr-error` | Label | Could not draw the QR code. | bare `qr::view` with no code (the npub QR on the account screens); the wallet's own QR uses `wallet-qr` |
 | `wallet-balance` | Label | Balance: N sats / Balance: … / Received N sats / Waiting for sats… | |
 | `wallet-balance-delta` | Label | +15 was 40 / −30 was 439 | fades out after a change; uses U+2212 |
 | `wallet-send-to` | TextInput | Send to a Lightning address | names the field; placeholder is "name@domain.com" |
@@ -272,7 +280,7 @@ On the Wallet screen and in the account-setup ready steps (never both).
 | `wallet-checking` | Label | Checking your profile… | |
 | `wallet-profile-error` | Label | Couldn't read this profile. … | |
 | `wallet-profile-retry` | Button | Try again | |
-| `wallet-no-address` | Label | No Lightning address yet — … | |
+| `wallet-no-address` | Label | No Lightning address yet: … | |
 | `wallet-create` | Button | Create a Coinos wallet for this account | |
 | `wallet-error` | Label | the panel error | |
 
@@ -314,7 +322,7 @@ empty reply.". There is no send button: Enter sends.
 | `account-switch` | Button | Switch to this account | |
 | `account-tabs` | TabList | Account sections | |
 | `account-tab-identity`, `-trust`, `-progress`, `-wallet`, `-limits` | Tab | Identity & keys, Trust, Progress, Wallet, Limits & defaults | |
-| `account-progress-soon`, `account-wallet-soon`, `account-limits-soon` | Label | Coming soon. | |
+| `account-progress-soon`, `account-limits-soon` | Label | Coming soon. | The Wallet tab shows the Wallet screen's panel (the `wallet-*` ids) for the page's account. |
 | `account-none` | Label | No account selected. | |
 | `account-removed` | Label | This account was removed. | after a remove |
 

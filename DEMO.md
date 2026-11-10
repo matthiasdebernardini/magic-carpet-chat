@@ -62,7 +62,7 @@ money move.
 | 6 | `⌘]` | Switch to the claimant (Matthias). The rail ring moves; the sidebar shows his real npub and kind-0 name. **Trap:** while a text field has focus, `⌘[`/`⌘]` indent instead of switching accounts — submit or cancel the form first (both return focus to the shell), or press `⌘2` to park focus. |
 | 7 | `⌘N` | Claim form for the selected bounty. |
 | 8 | type the item name, `Enter` | Publishes the kind-39999 claim through `POST /api/strfry/publish` (the only door the bounty machinery sees). |
-| 9 | watch | The claim card walks the real state machine live: *Claim submitted → Auto-pay attempting… → Paid — waiting for the zap receipt → Payment settled*, then **"Payment receipt …"** with "N s after the claim". `⌘1` shows the same beats in Recent activity. If the receipt lags, the money has already moved — show the Strike notification, or `↑`/`↓` to the settled rehearsal bounty (`cities-tennessee-rehearsal`) as the receipt exhibit. |
+| 9 | watch | The claim card walks the real state machine live: *Claim submitted → Auto-pay attempting… → Paid, waiting for the zap receipt → Payment settled*, then **"Payment receipt …"** with "N s after the claim". `⌘1` shows the same beats in Recent activity. If the receipt lags, the money has already moved — show the Strike notification, or `↑`/`↓` to the settled rehearsal bounty (`cities-tennessee-rehearsal`) as the receipt exhibit. |
 
 ## Other keys
 

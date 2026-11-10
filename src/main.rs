@@ -9,6 +9,7 @@ use std::sync::Arc;
 use gpui_kit::*;
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::component::Root;
+pub(crate) use magic_carpet_chat::timefmt;
 
 mod a11y;
 mod account;
@@ -17,11 +18,11 @@ mod bounties;
 mod chat;
 mod community;
 mod dashboard;
+mod debug_report;
 mod icons;
 mod palette;
 mod qr;
 mod shell;
-mod timefmt;
 mod trust_state;
 mod wallet;
 

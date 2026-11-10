@@ -158,7 +158,7 @@ pub struct AccountRecord {
 
 /// `MC_STORE_DIR` overrides the directory — the round-trip test writes to a
 /// temp dir, and a rehearsal can run on a throwaway store.
-fn store_dir() -> Result<PathBuf, SecretError> {
+pub fn store_dir() -> Result<PathBuf, SecretError> {
     if let Ok(dir) = std::env::var("MC_STORE_DIR") {
         let dir = dir.trim();
         if !dir.is_empty() {
