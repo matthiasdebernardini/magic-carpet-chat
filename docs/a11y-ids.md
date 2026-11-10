@@ -130,7 +130,7 @@ renames its ids.
 | `placeholder-<screen>-title` | Heading | screen name | Payments, Claimants, Leaderboards, Tags, Settings |
 | `placeholder-<screen>` | Label | Coming soon. | |
 | `wallet-title` | Heading | Wallet: <name> / Wallet | |
-| `wallet-no-account` | Label | No account — press + in the rail to add one. | |
+| `wallet-no-account` | Label | No account. Press + in the rail to add one. | |
 
 ## Account setup
 
@@ -143,7 +143,7 @@ renames its ids.
 | `setup-name-label` | Label | Name (optional) | |
 | `setup-name` | TextInput | Name (optional) | |
 | `setup-wallet-note` | Label | the Coinos note | |
-| `setup-create-go` | Button | Create — Enter | |
+| `setup-create-go` | Button | Create (Enter) | |
 | `setup-title-paste` | Heading | Use your Nostr key | paste card |
 | `setup-key` | TextInput | Secret key | masked; never the key text |
 | `setup-paste-hint` | Label | Enter continues | |
@@ -151,8 +151,8 @@ renames its ids.
 | `setup-back` | Button | ← Back | |
 | `setup-working` | Label | the spinner text | e.g. "Loading the account…" |
 | `setup-title-browse` | Heading | Just look around | |
-| `setup-browse` | Button | Continue without an account — esc | first launch only |
-| `setup-cancel` | Button | Cancel — esc | when adding a further account |
+| `setup-browse` | Button | Continue without an account (esc) | first launch only |
+| `setup-cancel` | Button | Cancel (esc) | when adding a further account |
 | `setup-step-identity-title` | Heading | Your Nostr identity | ready, step 1 |
 | `setup-step-identity-tag` | Label | saved on this computer | |
 | `setup-npub` | Label | short npub | |
@@ -187,7 +187,7 @@ card (`community-*`). `community-dashboard` leaves setup.
 | `dash-activity-list` | List | Recent activity | |
 | `dash-activity-<at>-<hash>` | Group | the event text | `<at>` unix seconds, `<hash>` FNV-1a of the text, `-2`, `-3` for repeats; find rows by label, not by computing the id |
 | `<activity row>-meta` | Label | HH:MM:SS UTC · <relative> | |
-| `dash-activity-empty` | Label | Nothing yet. New claims and payments show up here. | |
+| `dash-activity-empty` | Label | No activity yet. | |
 
 The map row's kind changes with the verdict, so match the prefix
 `dash-attention-<pubkey>-map-`.
@@ -224,12 +224,12 @@ The map row's kind changes with the verdict, so match the prefix
 | `bounty-detail-new-on-list` | Button | New bounty on this list | |
 | `bounty-detail-claims-heading` | Heading | Claims | |
 | `claim-list` | List | Claims | |
-| `claim-list-loading` | Label | Loading claims… / Created — syncing with the instance… | |
+| `claim-list-loading` | Label | Loading claims… / Created, syncing with the instance… | |
 | `claim-list-empty` | Label | No claims yet. | |
 | `<claim>` | Group | item name | one per claim |
 | `<claim>-item`, `<claim>-author` | Label | item name, by <short pubkey> | |
 | `<claim>-submitted`, `<claim>-attempted`, `<claim>-blocked`, `<claim>-receipt` | Label | timeline rows | |
-| `<claim>-payment` | Label | payment state: Auto-pay attempting…, Paid — waiting for the zap receipt, Payment settled, Paid, no receipt (…), Auto-pay failed (…), Payment status: unknown (…), Payment status: …, No auto-payment row yet | same id whatever the state; the issuer's own app's attempts read the same way, and on a bounty the server doesn't pay, every app (the claimant's too) reads Payment settled once a receipt around the issuer's signed request for the reward lands (one naming another bounty on the list doesn't count; one naming no bounty counts on every bounty on its list) |
+| `<claim>-payment` | Label | payment state: Auto-pay attempting…, Paid, waiting for the zap receipt, Payment settled, Paid, no receipt (…), Auto-pay failed (…), Payment status: unknown (…), Payment status: …, No auto-payment row yet | same id whatever the state; the issuer's own app's attempts read the same way, and on a bounty the server doesn't pay, every app (the claimant's too) reads Payment settled once a receipt around the issuer's signed request for the reward lands (one naming another bounty on the list doesn't count; one naming no bounty counts on every bounty on its list) |
 | `<claim>-unpaid-reason` | Label | why the claim is not paid: Rank too low: … rank this account N, and the bounty needs M. / No Lightning address in the claimant's profile, … / Wallet empty: … / Payment failed. … / Payment outcome unknown. … / Paying now… / Waiting for the issuer's app to pay it. / Waiting for the next auto-pay check. / No reward slots left on this bounty. / … | only on unpaid claims of bounties the server does not pay itself |
 | `<claim>-submitted-meta`, `-attempted-meta`, `-payment-meta` | Label | HH:MM:SS UTC · <relative> (· N sats) | `-payment-meta` carries the paid amount |
 | `<claim>-receipt-meta` | Label | N sats · Ns after the claim | |
@@ -280,7 +280,7 @@ On the Wallet screen, the Account page's Wallet tab and the account-setup ready 
 | `wallet-checking` | Label | Checking your profile… | |
 | `wallet-profile-error` | Label | Couldn't read this profile. … | |
 | `wallet-profile-retry` | Button | Try again | |
-| `wallet-no-address` | Label | No Lightning address yet — … | |
+| `wallet-no-address` | Label | No Lightning address yet: … | |
 | `wallet-create` | Button | Create a Coinos wallet for this account | |
 | `wallet-error` | Label | the panel error | |
 

@@ -232,9 +232,9 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
         rows.push(Attention::new(
             "read-only",
             TEXT_DIM,
-            "Read-only — add an account to claim".into(),
-            "Click the + button in the left bar to create an account or paste a \
-                 secret key. Keys stay on this computer."
+            "Read-only: add an account to claim".into(),
+            "Add an account with the + button in the left bar. Keys stay on this \
+                 computer."
                 .into(),
         ));
     }
@@ -270,11 +270,11 @@ fn attention_rows(shell: &Shell) -> Vec<Attention> {
                 ),
                 MapVerdict::Deactivated => (
                     "map-deactivated",
-                    "Your Treasure Map is empty, so other apps can’t find your score provider. Click Fix to republish it.",
+                    "Your Treasure Map is empty, so other apps can’t find your score provider.",
                 ),
                 MapVerdict::NoRankRow => (
                     "map-no-rank-row",
-                    "Your Treasure Map has no rank entry, so apps can’t look up your rank. Click Fix to see what is missing.",
+                    "Your Treasure Map has no rank entry, so apps can’t look up your rank.",
                 ),
             };
             rows.push(
@@ -529,11 +529,11 @@ fn empty_activity() -> AnyElement {
         .border_color(rgb(BORDER))
         .text_size(px(12.5))
         .text_color(rgb(TEXT_DIM))
-        .child("Nothing yet. New claims and payments show up here.")
+        .child("No activity yet.")
         .a11y(
             "dash-activity-empty",
             Role::Label,
-            "Nothing yet. New claims and payments show up here.",
+            "No activity yet.",
         )
         .into_any_element()
 }
