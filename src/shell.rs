@@ -4798,7 +4798,13 @@ mod tests {
             .iter()
             .map(|b| {
                 (
-                    b.keystrokes().iter().map(|k| k.inner().unparse()).collect::<Vec<_>>().join(" "),
+                    // gpui prints the platform modifier under its local name:
+                    // "cmd" on macOS, "super" on Linux. The table says "cmd".
+                    b.keystrokes()
+                        .iter()
+                        .map(|k| k.inner().unparse().replace("super-", "cmd-"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
                     b.action().name().to_string(),
                     b.predicate().map(|p| p.to_string()),
                 )
