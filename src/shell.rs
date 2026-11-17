@@ -2216,7 +2216,15 @@ impl Shell {
                 if self.optimistic.as_ref().is_some_and(|b| b.id == detail.bounty.id) {
                     self.optimistic = None;
                 }
+                // Someone else's claim reaches the app only through the watch,
+                // so a snapshot with a different number of claims is the
+                // ledger's cue: a new claim is a new Payments row.
+                let claims = detail.claims.len();
+                let was = self.details.get(&detail.bounty.id).map(|d| d.claims.len());
                 self.details.insert(detail.bounty.id.clone(), *detail);
+                if was.is_some_and(|was| was != claims) {
+                    self.fetch_ledger();
+                }
             }
             Update::DListPublished { pubkey, coordinate } => {
                 self.push_activity(

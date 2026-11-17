@@ -9,7 +9,8 @@ The mode lives in $E2E_DIR/mode.json and is re-read on every request:
    "setup": "ok"|"404", "delay_secs": 0,
    "run": [steps of a graperank run, one per graperankResult poll],
    "eligible": {"<viewer hex>": [[id, coord, issuerRank, auto_pay_min_rank|null, criteria], ...]},
-   "eligible_delay": {"<viewer hex>": secs}}
+   "eligible_delay": {"<viewer hex>": secs},
+   "bounties": [full bounty objects, served as they are]}
 A run step is "waiting", "calculating", "publishing", "done" or "fail:<CODE>"
 (an `error.code` such as NO_ELIGIBLE_USERS). The default run is waiting ->
 calculating -> publishing -> done; the last step repeats. Each accepted
@@ -18,7 +19,9 @@ GET /api/bounties/eligible needs the sid cookie login-user set: 401 without
 one, 403 when ?viewer= is not the session pubkey, like
 magic-carpet-v2/src/api/bounties.js:294-320. A null auto_pay_min_rank is a
 manual-pay row. GET /api/bounties/<id> answers an id the eligible route
-served with that row, even after the mode drops it.
+served with that row, even after the mode drops it, and the mode's
+"bounties" by id. GET /api/bounties?issuer=<hex> lists that issuer's only,
+like the server's issuer filter.
 Writing the mode file resets the create counter. Every request is appended to
 $E2E_DIR/server.log; the suite reads that log for its request checks.
 
@@ -55,7 +58,7 @@ def mode():
     m = {"create": "ok", "hang_secs": 45, "scan": "ok", "dup_coordinate": "",
          "graperank": "ok", "setup": "ok", "delay_secs": 0,
          "run": ["waiting", "calculating", "publishing", "done"],
-         "eligible": {}, "eligible_delay": {}}
+         "eligible": {}, "eligible_delay": {}, "bounties": []}
     try:
         st = os.stat(MODE)
         if st.st_mtime != state["mtime"]:
@@ -119,8 +122,11 @@ class H(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/api/bounties":
             bs = [bounty("dup00000-0000-0000-0000-000000000000", m["dup_coordinate"])] if m["dup_coordinate"] else []
-            bs += list(state["made"].values())
-            log("GET /api/bounties issuer=%s -> %d bounties" % (q.get("issuer", ["?"])[0][:8], len(bs)))
+            bs += list(state["made"].values()) + list(m.get("bounties") or [])
+            issuer = q.get("issuer", [""])[0]
+            if issuer:
+                bs = [b for b in bs if b.get("issuer_pubkey") == issuer]
+            log("GET /api/bounties issuer=%s -> %d bounties" % (issuer[:8] or "?", len(bs)))
             return self.send(200, {"success": True, "bounties": bs})
         # Before the "/api/bounties/<id>" branch, like the server's route order.
         if u.path == "/api/bounties/eligible":
@@ -131,6 +137,7 @@ class H(BaseHTTPRequestHandler):
             # An id the eligible route served answers with its own coordinate
             # and issuer, even after the mode drops it from the list.
             made = (state["made"].get(bid) or state["eligible_seen"].get(bid)
+                    or next((b for b in m.get("bounties") or [] if b.get("id") == bid), None)
                     or bounty(bid, m["dup_coordinate"] or "39998:00:x"))
             return self.send(200, {"success": True, "bounty": made, "claims": []})
         if u.path == "/api/strfry/scan":
