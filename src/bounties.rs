@@ -1271,7 +1271,7 @@ mod tests {
         );
         assert_eq!(
             tab_label(
-                "Eligible for me to claim",
+                "Eligible",
                 &Load::Ready(vec![row(serde_json::json!({}))])
             ),
             "Eligible (1)"
