@@ -240,6 +240,7 @@ fn payment_row(shell: &Shell, row: &Row, now: u64, cx: &mut Context<Shell>) -> A
     let amount = sats(row.sats);
     let when = timefmt::relative(now, row.at);
     let key = row_key(row);
+    let direction = row.direction;
     h_flex()
         .id(SharedString::from(id.clone()))
         .a11y(id.clone(), Role::Group, row.item.clone())
@@ -319,7 +320,7 @@ fn payment_row(shell: &Shell, row: &Row, now: u64, cx: &mut Context<Shell>) -> A
         )
         .on_click(cx.listener(move |this, _, window, cx| {
             this.payment_selected = Some(key.clone());
-            this.open_payment(key.0.clone(), window, cx);
+            this.open_payment(key.0.clone(), direction, window, cx);
         }))
         .into_any_element()
 }

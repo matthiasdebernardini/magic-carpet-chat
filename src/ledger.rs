@@ -9,7 +9,7 @@
 //! Everything here is pure; the caller reads the clock and the stores.
 
 use crate::api::{Bounty, Claim};
-use crate::autopay::{rank_text, AttemptState, ClaimFacts, Hold};
+use crate::autopay::{self, rank_text, AttemptState, ClaimFacts, Hold, Policy};
 
 /// Which way the sats go, seen from the signed-in account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +115,21 @@ pub fn classify(view: &ClaimView) -> (Status, Option<String>) {
         }
     };
     (Status::Owed, why)
+}
+
+/// `autopay::plan` for the ledger. `decide` stops at a failed attempt before
+/// the cap, the limit and the rank, but a failed attempt holds no slot, so
+/// here it plans as unattempted: a failed claim the rules would no longer
+/// pay reads Not payable, not Owed. Classify with the real facts.
+pub fn plan(policy: &Policy, facts: &[ClaimFacts]) -> Vec<(String, Result<(), Hold>)> {
+    let cleared: Vec<ClaimFacts> = facts
+        .iter()
+        .map(|f| ClaimFacts {
+            attempt: f.attempt.filter(|a| *a != AttemptState::Failed),
+            ..f.clone()
+        })
+        .collect();
+    autopay::plan(policy, &cleared)
 }
 
 /// The status of a claim on a bounty the server's auto-payer pays, from the
@@ -382,6 +397,50 @@ mod tests {
             note: None,
         };
         assert_eq!(classify(&quiet), (Status::Owed, None));
+    }
+
+    #[test]
+    fn a_failed_attempt_is_classified_by_the_plan_decision() {
+        let failed = with(AttemptState::Failed);
+        assert_eq!(run(&failed, Err(Hold::NoSlots), false, false), (Status::NotPayable, why("no reward slots left")));
+        assert_eq!(run(&failed, Ok(()), false, false), (Status::Owed, why("last payment failed")));
+    }
+
+    #[test]
+    fn a_failed_attempt_holds_no_slot_in_the_ledger() {
+        let one_slot = Policy { issuer: "me".into(), auto_pay: true, min_rank: 2, slots: 1, per_npub: Some(1) };
+        let claim = |n: u64, claimant: &str| ClaimFacts {
+            address: format!("{claimant}:item"),
+            event_id: format!("e{n}"),
+            claimant: claimant.into(),
+            created_at: n,
+            ..fact()
+        };
+        let first = ClaimFacts { attempt: Some(AttemptState::Failed), ..claim(1, "bob") };
+        let statuses = |facts: &[ClaimFacts]| -> Vec<(Status, Option<String>)> {
+            let decisions = plan(&one_slot, facts);
+            facts
+                .iter()
+                .map(|f| {
+                    let (_, decision) = decisions.iter().find(|(a, _)| *a == f.address).unwrap();
+                    run(f, *decision, false, false)
+                })
+                .collect()
+        };
+
+        // Before claim 2 is paid: the older claim takes the one slot.
+        let before = [first.clone(), claim(2, "carol")];
+        assert_eq!(
+            statuses(&before),
+            [(Status::Owed, why("last payment failed")), (Status::NotPayable, why("no reward slots left"))]
+        );
+
+        // Claim 2 paid: claim 1 has no slot left.
+        let after = [first, ClaimFacts { paid: true, ..claim(2, "carol") }];
+        assert_eq!(
+            statuses(&after),
+            [(Status::NotPayable, why("no reward slots left")), (Status::Paid, None)]
+        );
     }
 
     #[test]

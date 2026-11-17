@@ -956,6 +956,16 @@ pub(crate) fn claimable_from_tab(tab: BountyTab, status: &str) -> bool {
     tab != BountyTab::Claimed || status == "open"
 }
 
+/// The Bounties tab a Payments row opens on: the ledger list of its
+/// direction, which holds the bounty at any status ("All open" lacks a
+/// closed one).
+fn payment_tab(direction: Direction) -> BountyTab {
+    match direction {
+        Direction::PaidByMe => BountyTab::Issued,
+        Direction::PaidToMe => BountyTab::Claimed,
+    }
+}
+
 /// Which list the Bounties screen shows, in tab-strip order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BountyTab {
@@ -2735,22 +2745,28 @@ impl Shell {
             let bounty = self.payment_selected.as_ref().and_then(|key| {
                 self.ledger_rows_for(self.payments_tab)
                     .find(|r| payments::is_row(r, key))
-                    .map(|r| r.bounty_id.clone())
+                    .map(|r| (r.bounty_id.clone(), r.direction))
             });
-            if let Some(bounty) = bounty {
-                self.open_payment(bounty, window, cx);
+            if let Some((bounty, direction)) = bounty {
+                self.open_payment(bounty, direction, window, cx);
             }
         }
     }
 
-    /// A Payments row opens its bounty's detail pane on the Bounties screen.
-    /// On the House tab: an Eligible reply re-picks a selection its list
-    /// lacks, while a House reply keeps any selection. The watch `select`
-    /// starts fills the pane even for a bounty no list carries (closed, or
-    /// past the list's end).
-    pub(crate) fn open_payment(&mut self, bounty_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.bounty_tab != BountyTab::House {
-            self.set_bounty_tab(BountyTab::House, window, cx);
+    /// A Payments row opens its bounty's detail pane on the Bounties screen,
+    /// on the ledger tab for the row's direction ([`payment_tab`]): that list
+    /// holds the bounty whatever its status, so it shows selected. The tab
+    /// changes before `select`, so its reconcile cannot move the selection.
+    pub(crate) fn open_payment(
+        &mut self,
+        bounty_id: String,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = payment_tab(direction);
+        if self.bounty_tab != tab {
+            self.set_bounty_tab(tab, window, cx);
         }
         self.record_visit(&bounty_id);
         self.select(bounty_id);
@@ -4695,7 +4711,7 @@ impl Render for Shell {
 mod tests {
     use super::{F_AMOUNT, F_AUTO_PAY, F_CAP, F_CRITERIA, F_DESCRIPTION, F_PLURAL, F_RANK, F_SINGULAR};
     use super::{
-        BalanceCheck, RANK_NOTE, RemoveAction, UnknownCreate, bounty_form_refused,
+        BalanceCheck, Direction, RANK_NOTE, RemoveAction, UnknownCreate, bounty_form_refused, payment_tab,
         can_post_on_list, claim_notice,
         click_remove, fold_checks, form_locked, list_has_open_bounty, new_bounty_since_submit,
         next_bounties_read, on_bounty_form_closed, on_list_create_unknown, on_list_created,
@@ -4866,6 +4882,12 @@ mod tests {
         assert!(request_ledger(&mut slot, &mut seq, &mut reads, "b").is_none());
         let (to, _) = sent(ledger_replied(&mut slot, &mut seq, &mut reads, "b", b4));
         assert_eq!(to, "b");
+    }
+
+    #[test]
+    fn a_payment_row_opens_on_its_directions_ledger_tab() {
+        assert_eq!(payment_tab(Direction::PaidByMe), BountyTab::Issued);
+        assert_eq!(payment_tab(Direction::PaidToMe), BountyTab::Claimed);
     }
 
     #[test]

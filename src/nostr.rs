@@ -2248,8 +2248,10 @@ async fn claimant_lud16(api: &Api, pubkey: &str) -> Result<Option<String>, ()> {
 /// read timed out, or the key is invalid), so nothing is known.
 async fn public_kind0(pubkey: &str) -> Result<Option<Event>, ()> {
     let public = PublicKey::parse(pubkey).map_err(|_| ())?;
+    let instance = relay_url();
     let read = async {
         let (client, urls) = community_client(pubkey).await;
+        let urls: Vec<String> = urls.into_iter().filter(|url| !is_instance_relay(url, &instance)).collect();
         let filter = Filter::new().kind(Kind::Metadata).author(public).limit(5);
         let results = read_per_relay(&client, &urls, filter).await;
         client.disconnect().await;
@@ -2258,12 +2260,27 @@ async fn public_kind0(pubkey: &str) -> Result<Option<Event>, ()> {
     let results = tokio::time::timeout(Duration::from_secs(20), read)
         .await
         .map_err(|_| diag::note(format!("public kind-0 read for {pubkey} timed out")))?;
-    let (count, events) = answered(results);
+    let (count, events) = public_answers(results, &instance);
     if count == 0 {
         diag::note(format!("no public relay answered the kind-0 read for {pubkey}"));
         return Err(());
     }
     Ok(newest_kind0(events.into_iter().map(|(_, event)| event), &public))
+}
+
+/// Whether `url` is the instance relay. The public read leaves it out: it
+/// answers when every public relay is down, and its copy is read apart.
+fn is_instance_relay(url: &str, instance: &str) -> bool {
+    trust::normalize_relay(url) == trust::normalize_relay(instance)
+}
+
+/// [`answered`], counting public relays only, so an answer from the
+/// instance relay alone is no public answer.
+fn public_answers(
+    results: Vec<(String, Result<Vec<Event>, ()>)>,
+    instance: &str,
+) -> (usize, Vec<(String, Event)>) {
+    answered(results.into_iter().filter(|(url, _)| !is_instance_relay(url, instance)).collect())
 }
 
 /// The newest kind-0 by `author` whose signature verifies.
@@ -2415,6 +2432,40 @@ fn pays(receipt: &Event, bounty: &Bounty, claim_event_id: &str) -> bool {
         &bounty.id,
         bounty.amount_sats,
     )
+}
+
+/// Whether the receipt the server attached to `claim` on a bounty it pays
+/// can stand. The server matches a receipt by the description's pubkey and
+/// the claim's `e` tag alone, so a forged one, or a payment on another
+/// bounty on the same list, would read as paid. Its own settled row for
+/// this bounty counts (its delegate key is unknown here); otherwise the
+/// receipt must pass [`pays`] with the issuer as payer.
+fn server_receipt_holds(claim: &Claim, bounty: &Bounty) -> bool {
+    let settled_here = claim
+        .auto_payment
+        .as_ref()
+        .is_some_and(|p| p.state == "settled" && p.bounty_id == bounty.id);
+    settled_here
+        || claim
+            .zap_receipt
+            .as_ref()
+            .and_then(raw_to_event)
+            .is_some_and(|receipt| receipt.verify().is_ok() && pays(&receipt, bounty, &claim.event.id))
+}
+
+/// The API's copy of an event as a signed [`Event`]; `None` without a
+/// signature or when any field does not parse.
+fn raw_to_event(raw: &RawEvent) -> Option<Event> {
+    let value = serde_json::json!({
+        "id": raw.id,
+        "pubkey": raw.pubkey,
+        "created_at": raw.created_at?,
+        "kind": raw.kind?,
+        "tags": raw.tags,
+        "content": raw.content,
+        "sig": raw.sig.as_ref()?,
+    });
+    serde_json::from_value(value).ok()
 }
 
 /// One relay claim joined with the server's copy of it, for a bounty the
@@ -3120,7 +3171,7 @@ where
         // plans a manual bounty as if auto-pay were on.
         c.manual = !policy.auto_pay;
         policy.auto_pay = true;
-        c.decisions = autopay::plan(&policy, &c.facts).into_iter().collect();
+        c.decisions = ledger::plan(&policy, &c.facts).into_iter().collect();
     }
 
     // The Lightning-address hint, once per claimant whose payable claim
@@ -3221,6 +3272,11 @@ where
             if !in_ledger(*direction, &claim.event.pubkey, me) {
                 continue;
             }
+            let mut claim = claim.clone();
+            if !server_receipt_holds(&claim, bounty) {
+                claim.zap_receipt = None;
+            }
+            let claim = &claim;
             let (status, why) = ledger::classify_server(claim, expired);
             let claimed_at = claim.event.created_at.unwrap_or(0);
             let paid_at = claim
@@ -5039,6 +5095,60 @@ mod tests {
     }
 
     #[test]
+    fn a_server_paid_bounty_keeps_only_receipts_it_settled_or_the_issuer_signed() {
+        let issuer = Keys::generate();
+        let issuer_hex = issuer.public_key().to_hex();
+        let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": issuer_hex }));
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let id = event.id.to_hex();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let with_receipt = |request: &Event| Claim {
+            zap_receipt: RawEvent::from_event(&receipt_around(request, &id)),
+            payment_status: Some("payable".into()),
+            ..Claim::from_event(RawEvent::from_event(&event).unwrap())
+        };
+        let settled_on = |claim: &Claim, bounty_id: &str| Claim {
+            auto_payment: Some(AutoPaymentRow {
+                id: "p1".into(),
+                claim_event_id: id.clone(),
+                bounty_id: bounty_id.into(),
+                issuer_pubkey: None,
+                claimant_pubkey: None,
+                claim_address: None,
+                amount_sats: Some(100),
+                state: "settled".into(),
+                reason: None,
+                created_at: None,
+                updated_at: None,
+            }),
+            ..claim.clone()
+        };
+
+        // A request the app cannot verify: unsigned, then a stranger's.
+        let unsigned = serde_json::from_value::<Event>(serde_json::json!({
+            "id": "0".repeat(64), "pubkey": issuer_hex, "created_at": 1, "kind": 9734,
+            "tags": [["e", id]], "content": "", "sig": "0".repeat(128),
+        }))
+        .unwrap();
+        let stranger = events::zap_request(&Keys::generate(), &bob.public_key().to_hex(), &id, COORD, "b1", 100, &relays).unwrap();
+        for request in [&unsigned, &stranger] {
+            let claim = with_receipt(request);
+            assert!(!server_receipt_holds(&claim, &bounty));
+            let stripped = Claim { zap_receipt: None, ..claim.clone() };
+            assert_ne!(ledger::classify_server(&stripped, false).0, Status::Paid);
+            // The server's settled row for this bounty is trusted; one for
+            // another bounty is not.
+            assert!(server_receipt_holds(&settled_on(&claim, "b1"), &bounty));
+            assert!(!server_receipt_holds(&settled_on(&claim, "b2"), &bounty));
+        }
+
+        // The issuer's own signed request for this bounty's reward stands.
+        let signed = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, "b1", 100, &relays).unwrap();
+        assert!(server_receipt_holds(&with_receipt(&signed), &bounty));
+    }
+
+    #[test]
     fn facts_count_only_this_bountys_reward_and_attempts() {
         let issuer = Keys::generate();
         let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": issuer.public_key().to_hex() }));
@@ -5903,6 +6013,22 @@ mod tests {
             ("wss://b".into(), relay_answer(Some(Ok(vec![])), false)),
         ]);
         assert_eq!((count, events.len()), (0, 0));
+    }
+
+    #[test]
+    fn the_instance_relay_alone_is_no_public_answer() {
+        let instance = "wss://relay.example.com";
+        let profile = EventBuilder::new(Kind::Metadata, "{}").finalize(&Keys::generate()).unwrap();
+        let only_instance = vec![
+            ("wss://relay.example.com/".to_string(), Ok(vec![profile.clone()])),
+            ("wss://a".to_string(), Err(())),
+        ];
+        assert_eq!(public_answers(only_instance, instance).0, 0);
+        let both = vec![
+            (instance.to_string(), Ok(vec![profile.clone()])),
+            ("wss://a".to_string(), Ok(vec![])),
+        ];
+        assert_eq!(public_answers(both, instance), (1, vec![]));
     }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/bounty-5f44688e.json");

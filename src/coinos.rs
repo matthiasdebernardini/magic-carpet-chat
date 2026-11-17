@@ -480,11 +480,15 @@ fn now() -> Duration {
         .unwrap_or_default()
 }
 
-/// [`invoice_for`], and not expired at `now`. `now` is passed in so the
-/// check is testable against fixed vectors.
+/// An invoice must outlive the pay request by this much: one that expires
+/// mid-send can end in a timeout, and an unknown outcome holds its slot.
+const MIN_INVOICE_LIFETIME: Duration = Duration::from_secs(30);
+
+/// [`invoice_for`], and still valid [`MIN_INVOICE_LIFETIME`] after `now`.
+/// `now` is passed in so the check is testable against fixed vectors.
 fn payable_invoice(bolt11: &str, sats: u64, now: Duration) -> Result<Bolt11Invoice, CoinosError> {
     let invoice = invoice_for(bolt11, sats)?;
-    if invoice.would_expire(now) {
+    if invoice.would_expire(now.saturating_add(MIN_INVOICE_LIFETIME)) {
         return Err(CoinosError::InvoiceExpired);
     }
     Ok(invoice)
@@ -668,6 +672,15 @@ mod tests {
         assert!(payable_invoice(HASHED_BOLT11, 2_000_000, in_time).is_ok());
         assert!(matches!(
             payable_invoice(HASHED_BOLT11, 2_000_000, too_late),
+            Err(CoinosError::InvoiceExpired)
+        ));
+        // The vector expires an hour after signing: 31 s left is enough,
+        // 29 s is inside the margin.
+        let margin_left = signed + Duration::from_secs(3600 - 31);
+        assert!(payable_invoice(HASHED_BOLT11, 2_000_000, margin_left).is_ok());
+        let inside_margin = signed + Duration::from_secs(3600 - 29);
+        assert!(matches!(
+            payable_invoice(HASHED_BOLT11, 2_000_000, inside_margin),
             Err(CoinosError::InvoiceExpired)
         ));
         // The amount is still checked first.
