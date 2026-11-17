@@ -2430,8 +2430,11 @@ async def scenario_z(sc):
     stamp = sc.suite.run_id.replace("-", "")[-10:]
     meta = sc.suite.meta
     meta["float_before_z"] = sc.box.float_sats()
-    if not sc.check(f"float at least {Z_FLOAT} sats (three wallets of {Z_FUND} plus fees)",
-                    (meta["float_before_z"] or 0) >= Z_FLOAT, f"{meta['float_before_z']} sats"):
+    # Reused wallets may already hold their float: z_fund checks the exact
+    # top-ups against the float before any send.
+    floor = 300 if sc.suite.args.reuse_wallets else Z_FLOAT
+    if not sc.check(f"float at least {floor} sats (three wallets of {Z_FUND} plus fees, less what reused wallets hold)",
+                    (meta["float_before_z"] or 0) >= floor, f"{meta['float_before_z']} sats"):
         return
     reuse = None
     if sc.suite.args.reuse_wallets:
@@ -2548,6 +2551,100 @@ async def z_flow(sc, stamp, reuse, people):
         sc.check(f"{issuer}'s wallet down by 100 sats plus at most 10 in fees", None not in (ib0, ib1) and 100 <= ib0 - ib1 <= 110,
                  f"{ib0} -> {ib1}")
     z_final_checks(sc, people, names, bounties, payouts)
+    # Before the wind-down, which never depends on it: an error here is a
+    # failed tail check, not a lost sweep.
+    try:
+        await z_payments_tail(sc, people, names, bounties, payouts)
+    except Exception as e:
+        sc.check("Z tail: ran to the end", False, f"{type(e).__name__}: {e}")
+
+
+Z_NO_RECEIPT = "Paid, no receipt"
+
+
+async def z_tail_statuses(sc, who, rows, reread):
+    """Each row's status. If one reads "Paid, no receipt" (the receipt
+    reaches the instance relay through z-bridge.sh and can lag), `reread`
+    runs once, then the tree is read every 5 s for up to 60 s."""
+    got = {r: sc.tree_name(f"{r}-status") for r in rows}
+    if Z_NO_RECEIPT not in got.values():
+        return got
+    sc.notes.append(f"Z tail: {who} read '{Z_NO_RECEIPT}' first; one more look after a re-read")
+    await reread()
+    end = time.time() + 60
+    while True:
+        got = {r: sc.tree_name(f"{r}-status") for r in rows}
+        if Z_NO_RECEIPT not in got.values() or time.time() > end:
+            return got
+        await asyncio.sleep(5)
+
+
+async def z_payments_tail(sc, people, names, bounties, payouts):
+    """After the six payouts, each app's Payments screen: its issuer's two
+    rows on this run's bounty Paid (and D's claim Not payable in A's), its
+    two received rows Paid, the totals at least 200 each way (reused
+    wallets carry older rows). Rows by id, `payment-row-<bounty>-<claim>`,
+    from z_payouts. Every check is named "Z tail"."""
+    own_ok = all(c["ok"] for c in sc.checks)
+    sc.notes.append("Z tail: Z's own checks before the Payments tail all " + ("passed" if own_ok else "did NOT pass")
+                    + "; a failing 'Z tail' check is the tail's alone")
+    d_claim = (sc.suite.meta.get("z_outsider") or {}).get("claim_event")
+    seen = sc.suite.meta.setdefault("z_tail", {})
+    for who in "ABC":
+        p = people[who]
+        sc.use(p["app"])
+        own = f"rail-account-{p['pub']}"
+        by_me = [f"payment-row-{bounties[who]}-{r['claim_event']}" for r in payouts if r["issuer"] == who]
+        to_me = [f"payment-row-{bounties[r['issuer']]}-{r['claim_event']}" for r in payouts if r["claimant"] == who]
+
+        def reread(tab_id):
+            async def go():
+                if who == "C":
+                    # C's app holds D too: a switch away and back re-reads C's ledger.
+                    await act(sc, "Z tail: C's ledger re-read by switching to D and back",
+                              [("press", f"rail-account-{people['D']['pub']}"), ("wait", 3), ("press", own),
+                               ("press", tab_id), PARK])
+            return go
+
+        await k_show(sc, f"Z tail: {who} paid by me", f"In {who}'s app, open Payments on its 'Paid by me' tab.",
+                     f"Press {who}'s account tab in the left rail, the sidebar's Payments tab, then 'Paid by me'.",
+                     [("press", own), ("press", "nav-payments"), ("wait_id", {"id": "payments-tab-by-me", "secs": 60, "soft": True}),
+                      ("press", "payments-tab-by-me"), ("wait_id", {"id": by_me[0], "secs": 60, "soft": True})],
+                     f"The 'Paid by me' tab shows two rows on {names[who]} reading Paid.",
+                     ("Payments", "Paid by me", names[who], "Paid"), [(r, None) for r in by_me])
+        got = await z_tail_statuses(sc, who, by_me, reread("payments-tab-by-me"))
+        sats = [sc.tree_name(f"{r}-sats") for r in by_me]
+        sc.check(f"Z tail: {who}'s Paid by me: two rows on {names[who]}, each Paid, 100 sats",
+                 len(by_me) == 2 and all(v == "Paid" for v in got.values()) and sats == ["100 sats"] * 2,
+                 f"statuses {list(got.values())}, sats {sats}")
+        total = p_total(sc, "payments-total-paid")
+        sc.check(f"Z tail: {who}'s PAID total is at least 200 sats", (total or 0) >= 200, f"{total} sats")
+        if who == "A" and d_claim:
+            d_row = f"payment-row-{bounties['A']}-{d_claim}"
+            status, why = sc.tree_name(f"{d_row}-status"), sc.tree_name(f"{d_row}-why") or ""
+            sc.check("Z tail: D's claim on A's bounty reads Not payable with a rank reason",
+                     status == "Not payable" and "bounty needs" in why, f"{status!r}, {why!r}")
+        seen[who] = {"promised": sc.tree_name("sidebar-promised"), "paid_so_far": sc.tree_name("sidebar-paid"),
+                     "badge": sc.tree_name("nav-payments-badge") if sc.tree("nav-payments-badge") > 0 else None,
+                     "paid_total": total}
+        await asyncio.sleep(K_SETTLE)
+        await k_show(sc, f"Z tail: {who} paid to me", f"In {who}'s app, open the 'Paid to me' tab.",
+                     "Press the 'Paid to me' tab.",
+                     [("press", "payments-tab-to-me"), ("wait_id", {"id": to_me[0], "secs": 60, "soft": True})],
+                     "The 'Paid to me' tab shows two rows reading Paid, from the other two issuers.",
+                     ("Paid to me", "RECEIVED", "Paid"), [(r, None) for r in to_me])
+        got = await z_tail_statuses(sc, who, to_me, reread("payments-tab-to-me"))
+        sats = [sc.tree_name(f"{r}-sats") for r in to_me]
+        others = [names[w] for w in "ABC" if w != who]
+        sc.check(f"Z tail: {who}'s Paid to me: two rows on {' and '.join(others)}, each Paid, 100 sats",
+                 len(to_me) == 2 and all(v == "Paid" for v in got.values()) and sats == ["100 sats"] * 2,
+                 f"statuses {list(got.values())}, sats {sats}")
+        total = p_total(sc, "payments-total-received")
+        sc.check(f"Z tail: {who}'s RECEIVED total is at least 200 sats", (total or 0) >= 200, f"{total} sats")
+        seen[who]["received_total"] = total
+        sc.notes.append(f"Z tail: {who}'s app: {seen[who]}")
+        await asyncio.sleep(K_SETTLE)
+    sc.suite.write(sc.suite.meta)
 
 
 def z_trust(sc, people):
@@ -2578,6 +2675,14 @@ def z_trust(sc, people):
 async def z_fund(sc, people):
     """Top each issuer's Coinos wallet up to Z_FUND from the agent-wallet,
     then wait for the balance to show. A send is never retried."""
+    # Nothing is sent unless the float covers every top-up plus fees.
+    bals = {who: coinos_balance(people[who]["store"], people[who]["pub"]) for who in "ABC"}
+    if not sc.check("every issuer's Coinos balance reads", all(b is not None for b in bals.values()), str(bals)):
+        return False
+    total = sum(max(0, Z_FUND - b) for b in bals.values())
+    have = sc.box.float_sats()
+    if not sc.check(f"the float covers the top-ups ({total} sats) plus 60 for fees", (have or 0) >= total + 60, f"{have} sats"):
+        return False
     for who in "ABC":
         p = people[who]
         bal = coinos_balance(p["store"], p["pub"])

@@ -264,23 +264,27 @@ class AppDriver(Driver):
                     return None
             cap = self.a11y("exists", "~bounty-row-[0-9a-f-]{36}")["count"] + 1
             cur = title()
-            for i in range(cap + 1):
-                if cur == arg:
-                    await asyncio.sleep(1)
-                    cur = title()
+            # Down the list, then back Up: a list that grew while a row low
+            # in it stayed selected (a refreshed Eligible tab) has this run's
+            # bounty above the selection, where Down alone never gets.
+            for key in ("Down", "Up"):
+                for i in range(cap + 1):
                     if cur == arg:
-                        return f"select_bounty {arg!r} after {i} Down"
-                    continue   # moved on after all: decide again on what it shows now
-                if i == cap:
-                    break
-                await self.x(f"xdotool key --window {wid} Down")
-                prev, end = cur, time.time() + 4
-                while time.time() < end:
-                    await asyncio.sleep(0.3)
-                    cur = title()
-                    if cur != prev:
+                        await asyncio.sleep(1)
+                        cur = title()
+                        if cur == arg:
+                            return f"select_bounty {arg!r} after {i} {key}"
+                        continue   # moved on after all: decide again on what it shows now
+                    if i == cap:
                         break
-            raise RuntimeError(f"select_bounty: {arg!r} not reached in {cap} Down presses (last {cur!r})")
+                    await self.x(f"xdotool key --window {wid} {key}")
+                    prev, end = cur, time.time() + 4
+                    while time.time() < end:
+                        await asyncio.sleep(0.3)
+                        cur = title()
+                        if cur != prev:
+                            break
+            raise RuntimeError(f"select_bounty: {arg!r} not reached in {cap} Down then {cap} Up presses (last {cur!r})")
         if kind in ("press", "click_id", "wait_id", "scroll_to"):
             t = arg if isinstance(arg, dict) else {"id": arg}
             if kind == "wait_id":
@@ -968,7 +972,9 @@ class Suite:
             # Z funds three wallets with 250 each, plus fees (800).
             two = sum(1 for s in ("R", "Y") if s in wanted)
             need = 250 + 204 * (two - 1) + (102 if "P" in wanted else 0) if two else (200 if "P" in wanted else 0)
-            need += 800 if "Z" in wanted else 0
+            # With reused wallets Z tops up only what each wallet lacks, and
+            # z_fund checks the float covers that before it sends anything.
+            need += (300 if self.args.reuse_wallets else 800) if "Z" in wanted else 0
             if bal is None or bal < need:
                 print(f"PREFLIGHT: the auto-pay float is {bal} sats, below {need}. "
                       f"Stopping. fund with ~/mc/fund.sh 500", flush=True)
