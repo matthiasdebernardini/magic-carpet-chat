@@ -206,7 +206,7 @@ The map row's kind changes with the verdict, so match the prefix
 | `bounties-tab-house` | Tab | All open (N) | count once loaded; lists every issuer's open bounties plus the stored accounts' own |
 | `bounties-tab-issued` | Tab | Issued by me (N) | only with an account; the active account's own bounties, any status, from its payments ledger |
 | `bounties-tab-claimed` | Tab | Claimed by me (N) | only with an account; other issuers' bounties the active account has a claim on, from its payments ledger |
-| `bounties-tab-eligible` | Tab | Eligible for me to claim (N) | only with an account |
+| `bounties-tab-eligible` | Tab | Eligible (N) | only with an account |
 | `bounties-list` | List | Bounties | |
 | `bounties-loading` | Label | Loading bounties… | |
 | `bounties-empty` | Label | the empty text of the open tab | Issued by me: You haven't issued a bounty yet.; Claimed by me: You haven't claimed a bounty yet. |

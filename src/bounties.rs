@@ -258,6 +258,7 @@ fn tab(
         .aria_selected(on)
         .px(px(10.))
         .py(px(5.))
+        .flex_1()
         .rounded(px(7.))
         .cursor_pointer()
         .text_size(px(11.5))
@@ -306,20 +307,29 @@ fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let eligible = shell.eligible.as_ref().map(|slot| {
         tab(
             "bounties-tab-eligible",
-            tab_label("Eligible for me to claim", &slot.list),
+            tab_label("Eligible", &slot.list),
             shell.bounty_tab == BountyTab::Eligible,
             BountyTab::Eligible,
             cx,
         )
     });
-    h_flex()
+    // Two tabs to a row, each half the pane, so four make a tidy grid. An odd
+    // last tab keeps its half next to an empty filler.
+    let mut tabs: Vec<AnyElement> = std::iter::once(house)
+        .chain(mine.into_iter().flatten())
+        .chain(eligible)
+        .collect();
+    let mut rows = Vec::new();
+    while !tabs.is_empty() {
+        let row: Vec<AnyElement> = tabs.drain(..tabs.len().min(2)).collect();
+        let filler = (row.len() == 1).then(|| div().flex_1());
+        rows.push(h_flex().gap(px(6.)).children(row).children(filler));
+    }
+    v_flex()
         .a11y("bounties-tabs", Role::TabList, "Bounty lists")
-        .flex_wrap()
         .gap(px(6.))
         .mb(px(8.))
-        .child(house)
-        .children(mine.into_iter().flatten())
-        .children(eligible)
+        .children(rows)
         .into_any_element()
 }
 
@@ -1264,7 +1274,7 @@ mod tests {
                 "Eligible for me to claim",
                 &Load::Ready(vec![row(serde_json::json!({}))])
             ),
-            "Eligible for me to claim (1)"
+            "Eligible (1)"
         );
         assert_eq!(
             tab_label("House bounties", &Load::Failed("x".into())),
