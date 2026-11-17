@@ -20,14 +20,24 @@
 //! `MC_STORE_DIR`, printed at the end: A's `coinos.token` can be the payer
 //! for the next run. The nsecs, the coinos passwords and every token stay in
 //! that file; nothing here prints them.
+//!
+//! `issuer_pays_a_claimant_on_another_lightning_provider` is the second test
+//! here: the app's auto-pay zaps a claimant whose Lightning address is not on
+//! coinos, and the zap receipt that other provider publishes must reach the
+//! instance relay. See its doc comment for the variables it needs. Run one
+//! test at a time with `test(<name>)` in the filter.
 
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
+use magic_carpet_chat::api::CreateBounty;
 use magic_carpet_chat::coinos;
-use magic_carpet_chat::nostr::{Command, ErrorSource, NostrHandle, Update, spawn_runtime};
-use magic_carpet_chat::secrets::Secret;
+use magic_carpet_chat::events;
+use magic_carpet_chat::nostr::{
+    Command, ErrorSource, NostrHandle, Update, public_relays, relay_url, spawn_runtime,
+};
+use magic_carpet_chat::secrets::{self, Secret};
 use nostr_sdk::prelude::*;
 
 /// What A is funded with, and what A sends B.
@@ -409,5 +419,338 @@ async fn two_new_users_open_wallets_and_pay_each_other() {
     println!("  B -> A seen after       {:>7.1} s", b_to_a_seen.as_secs_f64());
     println!("  A username              {}", a.username);
     println!("  B username              {}", b.username);
+    println!("  store                   {}\n", store_dir.display());
+}
+
+/// The reward the external-provider test pays: the smallest amount the
+/// first test moves.
+const EXTERNAL_REWARD_SATS: u64 = RETURN_SATS;
+
+/// An env var the test cannot run without, trimmed. Missing or blank stops
+/// the run before anything is spent.
+fn required_env(name: &str, what: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| panic!("{name} is not set: it must hold {what}. Nothing was spent."))
+}
+
+/// `AddAccount` for a key the test was handed (no wallet opened, not
+/// generated here), resolved to its hex pubkey once the account is stored.
+async fn import_account(handle: &mut NostrHandle, name: &'static str, nsec: &str) -> String {
+    let pubkey = Keys::parse(nsec)
+        .unwrap_or_else(|_| panic!("{name}: the key is not an nsec or hex secret key"))
+        .public_key()
+        .to_hex();
+    handle
+        .commands
+        .unbounded_send(Command::AddAccount {
+            secret: Secret::new(nsec),
+            name: None,
+            open_wallet: false,
+            generated: false,
+        })
+        .unwrap();
+    loop {
+        let update = next(&mut handle.updates, Duration::from_secs(60), "AddAccount").await;
+        fail_on_error(&update);
+        if let Update::AccountAdded { pubkey: p, .. } = update
+            && p == pubkey
+        {
+            return pubkey;
+        }
+    }
+}
+
+/// The signature-checked kind-9735 receipts naming `claim_id` on `relays`.
+/// A relay that does not answer within 10 s counts as holding none.
+async fn receipts_on(relays: &[String], claim_id: EventId) -> Vec<Event> {
+    let client = Client::default();
+    for url in relays {
+        let _ = client.add_relay(url.as_str()).await;
+    }
+    client.connect().and_wait(Duration::from_secs(10)).await;
+    let filter = Filter::new()
+        .kind(Kind::Custom(events::RECEIPT_KIND))
+        .event(claim_id);
+    let receipts = client
+        .fetch_events(filter)
+        .timeout(Duration::from_secs(10))
+        .await
+        .map(|found| found.into_iter().filter(|e| e.verify().is_ok()).collect())
+        .unwrap_or_default();
+    client.disconnect().await;
+    receipts
+}
+
+/// The issuer's own auto-pay zaps a claimant whose Lightning address is on
+/// another provider (not coinos), and the receipt that provider publishes
+/// reaches the instance relay, so the claim reads as paid. Paying a Lightning
+/// address is otherwise only proven with coinos on both ends. It moves
+/// [`EXTERNAL_REWARD_SATS`] real sats, so it is `#[ignore]`. Run it with:
+///
+/// ```sh
+/// mbx nextest run --run-ignored only --no-capture -E 'binary(e2e) and test(issuer_pays_a_claimant_on_another_lightning_provider)'
+/// ```
+///
+/// - `MC_E2E_ISSUER_NSEC`: the issuer's key. Its own trust scores must rank
+///   the claimant at least 2, the auto-pay floor, or the claim is never paid.
+/// - `MC_E2E_PAYER_TOKEN`: the coinos token of the wallet the issuer pays
+///   from; it must hold the reward.
+/// - `MC_E2E_CLAIMANT_NSEC`: the claimant's key. Its kind-0 gets the address
+///   below as its lud16, on the instance and the public relays.
+/// - `MC_E2E_EXTERNAL_LUD16`: the claimant's Lightning address, on any
+///   provider but coinos.io that sends zap receipts.
+/// - `MC_E2E_RECEIPT_WAIT_SECS` (default 300): how long the receipt may take
+///   to reach the instance relay once the payment left.
+///
+/// Both keys land in a throwaway store under `MC_STORE_DIR`, printed at the
+/// end; the attempt record there is what keeps a rerun from paying twice.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn issuer_pays_a_claimant_on_another_lightning_provider() {
+    // Every check that can fail runs before a sat moves.
+    let issuer_nsec = required_env("MC_E2E_ISSUER_NSEC", "the issuer's nsec");
+    let token = required_env("MC_E2E_PAYER_TOKEN", "the coinos token of the issuer's wallet");
+    let claimant_nsec = required_env("MC_E2E_CLAIMANT_NSEC", "the claimant's nsec");
+    let address = required_env(
+        "MC_E2E_EXTERNAL_LUD16",
+        "the claimant's Lightning address on a provider other than coinos.io",
+    );
+    let (_, domain) = coinos::split_address(&address)
+        .unwrap_or_else(|| panic!("MC_E2E_EXTERNAL_LUD16 is not name@domain. Nothing was spent."));
+    assert!(
+        !domain.eq_ignore_ascii_case("coinos.io"),
+        "MC_E2E_EXTERNAL_LUD16 is on coinos.io; this test needs another provider. Nothing was spent."
+    );
+    if let Err(e) = coinos::check_address(&address).await {
+        panic!("MC_E2E_EXTERNAL_LUD16 can't take a zap: {e} Nothing was spent.");
+    }
+    // A plain invoice for the reward proves the server takes that amount;
+    // it is never paid.
+    if let Err(e) = coinos::lnurl_invoice(&address, EXTERNAL_REWARD_SATS).await {
+        panic!("{domain} won't invoice {EXTERNAL_REWARD_SATS} sats: {e} Nothing was spent.");
+    }
+    let token = Secret::new(token);
+    let wallet = coinos::balance(&token)
+        .await
+        .unwrap_or_else(|e| panic!("MC_E2E_PAYER_TOKEN can't read its wallet: {e} Nothing was spent."));
+    assert!(
+        wallet >= EXTERNAL_REWARD_SATS,
+        "the payer wallet holds {wallet} sats, less than the {EXTERNAL_REWARD_SATS} sat reward. Nothing was spent."
+    );
+
+    let store_dir = std::env::temp_dir().join(format!(
+        "mc-e2e-external-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&store_dir).expect("create the throwaway store dir");
+    // SAFETY: set before spawn_runtime, so no thread of ours reads the
+    // environment concurrently; the idle tokio workers do not touch it.
+    unsafe {
+        std::env::set_var("MC_STORE_DIR", &store_dir);
+        std::env::set_var("MC_AUTOPAY_POLL_SECS", "5");
+    }
+
+    let mut handle = spawn_runtime();
+    handle.commands.unbounded_send(Command::Connect).unwrap();
+
+    // Step 1: both keys in the store; the issuer pays from the token's wallet.
+    let issuer = import_account(&mut handle, "issuer", &issuer_nsec).await;
+    let claimant = import_account(&mut handle, "claimant", &claimant_nsec).await;
+    assert_ne!(issuer, claimant, "the issuer and the claimant are the same key");
+    secrets::store_coinos_login(
+        &issuer,
+        &coinos::Login {
+            username: String::new(),
+            password: Secret::new(""),
+            token,
+        },
+    )
+    .expect("store the payer token as the issuer's wallet");
+
+    // Step 2: the claimant's kind-0 names the external address, through the
+    // same command the account screen sends.
+    handle
+        .commands
+        .unbounded_send(Command::SetLightningAddress {
+            pubkey: claimant.clone(),
+            address: address.clone(),
+        })
+        .unwrap();
+    loop {
+        let update = next(&mut handle.updates, Duration::from_secs(90), "SetLightningAddress").await;
+        fail_on_error(&update);
+        match update {
+            Update::LightningAddressSet { pubkey, .. } if pubkey == claimant => break,
+            Update::LightningAddressFailed { pubkey, message } if pubkey == claimant => {
+                panic!("the claimant's lud16 did not publish: {message} Nothing was spent.")
+            }
+            _ => {}
+        }
+    }
+    expect_profile(&mut handle.updates, &claimant, &address, None).await;
+
+    // Step 3: a one-slot auto-pay bounty on a fresh list.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    handle
+        .commands
+        .unbounded_send(Command::PublishDList {
+            pubkey: issuer.clone(),
+            singular: format!("e2e zap item {stamp}"),
+            plural: format!("e2e zap items {stamp}"),
+            description: None,
+        })
+        .unwrap();
+    let list_coordinate = loop {
+        let update = next(&mut handle.updates, Duration::from_secs(60), "PublishDList").await;
+        fail_on_error(&update);
+        if let Update::DListPublished { pubkey, coordinate } = update
+            && pubkey == issuer
+        {
+            break coordinate;
+        }
+    };
+    handle
+        .commands
+        .unbounded_send(Command::CreateBounty {
+            pubkey: issuer.clone(),
+            req: CreateBounty {
+                list_coordinate: list_coordinate.clone(),
+                amount_sats: EXTERNAL_REWARD_SATS,
+                criteria: "End-to-end check: any one item, paid to a Lightning address off coinos."
+                    .into(),
+                bounty_cap_sats: Some(EXTERNAL_REWARD_SATS),
+                reward_per_item: true,
+                max_rewards_per_npub: Some(1),
+                auto_pay: true,
+                auto_pay_min_rank: None,
+            },
+        })
+        .unwrap();
+    let bounty_id = loop {
+        let update = next(&mut handle.updates, Duration::from_secs(60), "CreateBounty").await;
+        fail_on_error(&update);
+        if let Update::BountyCreated { id } = update {
+            break id;
+        }
+    };
+
+    // Step 4: the claimant claims; the issuer's auto-pay picks it up.
+    handle
+        .commands
+        .unbounded_send(Command::PublishClaim {
+            pubkey: claimant.clone(),
+            bounty_id: bounty_id.clone(),
+            name: format!("e2e item {stamp}"),
+            list_coordinate: list_coordinate.clone(),
+        })
+        .unwrap();
+    let claim_id = loop {
+        let update = next(&mut handle.updates, Duration::from_secs(60), "PublishClaim").await;
+        fail_on_error(&update);
+        if let Update::ClaimPublished { bounty_id: b, event_id } = update
+            && b == bounty_id
+        {
+            break event_id;
+        }
+    };
+    let claimed_at = Instant::now();
+
+    // Step 5: the payment. No attempt within the wait means the claim never
+    // qualified (rank, address, wallet), and nothing was spent.
+    let attempt_wait = Duration::from_secs(180);
+    let attempt_deadline = claimed_at + attempt_wait;
+    loop {
+        let left = attempt_deadline.saturating_duration_since(Instant::now());
+        let Some(update) = try_next(&mut handle.updates, left).await else {
+            panic!(
+                "no payment attempt within {attempt_wait:?} of the claim: the claim never \
+                 qualified for auto-pay (the issuer's scores must rank the claimant at least 2, \
+                 the claimant's newest kind-0 must name the address, the wallet must hold the \
+                 reward). Nothing was spent."
+            );
+        };
+        fail_on_error(&update);
+        if let Update::PaymentState {
+            claim_event_id,
+            state,
+            reason,
+            ..
+        } = update
+            && claim_event_id == claim_id
+        {
+            match state.as_str() {
+                "attempting" => {}
+                "paid" => break,
+                "failed" => panic!("coinos refused the payment: {reason:?}"),
+                _ => panic!(
+                    "the payment's outcome is unknown ({reason:?}): check the payer wallet before rerunning"
+                ),
+            }
+        }
+    }
+    let paid_after = claimed_at.elapsed();
+
+    // Step 6: the receipt, judged by the rule the app counts a claim paid by:
+    // the issuer signed the zap request inside it, for this claim, bounty and
+    // reward. Coinos saying "paid" proves nothing here.
+    let receipt_wait = Duration::from_secs(
+        std::env::var("MC_E2E_RECEIPT_WAIT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(300),
+    );
+    let claim_event_id = EventId::from_hex(&claim_id).expect("the claim id is an event id");
+    let instance = [relay_url()];
+    let paid_at = Instant::now();
+    let receipt = loop {
+        let found = receipts_on(&instance, claim_event_id).await;
+        if let Some(receipt) = found.iter().find(|receipt| {
+            events::receipt_pays_bounty_claim(
+                receipt,
+                &claim_id,
+                &issuer,
+                &list_coordinate,
+                &bounty_id,
+                EXTERNAL_REWARD_SATS,
+            )
+        }) {
+            break receipt.clone();
+        }
+        if paid_at.elapsed() >= receipt_wait {
+            let elsewhere = receipts_on(&public_relays(), claim_event_id).await;
+            panic!(
+                "the payment left the issuer's wallet, but no receipt the issuer's zap request is \
+                 inside reached the instance relay within {receipt_wait:?}. This is a finding, not \
+                 a flake: {domain} did not deliver its receipt there. Receipts for the claim on \
+                 the instance relay that fail the rule: {}; on the public relays: {}.",
+                found.len(),
+                elsewhere.len()
+            );
+        }
+        // Drain the runtime's chatter so its failures still end the run.
+        if let Some(update) = try_next(&mut handle.updates, POLL_EVERY).await {
+            fail_on_error(&update);
+        }
+    };
+    let receipt_after = paid_at.elapsed();
+
+    handle.commands.unbounded_send(Command::Shutdown).unwrap();
+    println!("\n  provider                {domain}");
+    println!("  bounty                  {bounty_id}");
+    println!("  claim                   {claim_id}");
+    println!("  receipt                 {}", receipt.id.to_hex());
+    println!("  receipt signer          {}", receipt.pubkey.to_hex());
+    println!("  paid after claim        {:>7.1} s", paid_after.as_secs_f64());
+    println!("  receipt after payment   {:>7.1} s", receipt_after.as_secs_f64());
     println!("  store                   {}\n", store_dir.display());
 }

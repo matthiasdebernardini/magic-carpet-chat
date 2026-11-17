@@ -597,10 +597,21 @@ impl Api {
     /// GET /api/bounties?status=all — every issuer's bounties (up to 500),
     /// each with its `paymentState` counters. Public, no login.
     pub async fn list_all_bounties(&self) -> Result<Vec<Bounty>, ApiError> {
+        self.list_bounties(&[]).await
+    }
+
+    /// GET /api/bounties?status=all&issuer=<hex>: one issuer's bounties (up
+    /// to 500), so the global list's cap never drops an account's own.
+    pub async fn list_bounties_by(&self, issuer: &str) -> Result<Vec<Bounty>, ApiError> {
+        self.list_bounties(&[("issuer", issuer)]).await
+    }
+
+    async fn list_bounties(&self, extra: &[(&str, &str)]) -> Result<Vec<Bounty>, ApiError> {
         let response = self
             .http
             .get(format!("{}/api/bounties", self.base))
             .query(&[("status", "all"), ("limit", "500")])
+            .query(extra)
             .send()
             .await
             .map_err(|e| ApiError::Http(e.to_string()))?;

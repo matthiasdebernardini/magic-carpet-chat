@@ -23,6 +23,7 @@ use magic_carpet_chat::api::{Bounty, BountyDetail, Claim, CreateBounty, claimabl
 use magic_carpet_chat::bounty_search::{self, Snapshot, Visits};
 use magic_carpet_chat::coinos;
 use magic_carpet_chat::events;
+use magic_carpet_chat::ledger::{self, Direction, Ledger, Row};
 use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated};
 use magic_carpet_chat::secrets::{self, Secret};
 
@@ -36,9 +37,13 @@ use crate::debug_report;
 use crate::dashboard::{self, MONO, avatar};
 use crate::icons::icon;
 use crate::palette::*;
+use crate::payments;
 use crate::timefmt;
 use crate::trust_state::TrustState;
-use crate::wallet::{self, PendingSent, SendInputs, SendState, WalletState};
+use crate::wallet::{
+    self, AddressCheck, AddressInput, DebtsView, OwnPage, PendingSent, SendInputs, SendState,
+    WalletState,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
@@ -298,6 +303,18 @@ pub(crate) enum Load<T> {
     Loading,
     Ready(T),
     Failed(String),
+}
+
+/// A borrowed view of a loaded list, so the Bounties tabs can show a list
+/// that lives inside another value (the ledger) without copying it.
+impl<'a, T> From<&'a Load<Vec<T>>> for Load<&'a [T]> {
+    fn from(list: &'a Load<Vec<T>>) -> Self {
+        match list {
+            Load::Loading => Load::Loading,
+            Load::Ready(list) => Load::Ready(list),
+            Load::Failed(message) => Load::Failed(message.clone()),
+        }
+    }
 }
 
 /// What the app knows about one stored account. The runtime announces the
@@ -873,15 +890,15 @@ fn find_bounty<'a>(
 /// or `pending` (the just-created card the list does not carry yet) holds
 /// it, else the list's first row, else none (the list is loading, failed or
 /// empty).
-fn selection_for(
+fn selection_for<'a>(
     selected: Option<&str>,
-    shown: &Load<Vec<Bounty>>,
+    shown: impl Into<Load<&'a [Bounty]>>,
     pending: Option<&str>,
 ) -> Option<String> {
     if let Some(id) = selected.filter(|id| pending == Some(*id)) {
         return Some(id.to_string());
     }
-    let Load::Ready(list) = shown else {
+    let Load::Ready(list) = shown.into() else {
         return None;
     };
     list.iter()
@@ -917,78 +934,91 @@ fn wallet_shown<'a>(
 
 /// ⌘N and the Bounties header button open a claim rather than the bounty
 /// form: always for a claimant, and for the issuer while the Bounties
-/// screen shows its Eligible tab and no bounty form is open. An open one,
-/// new-list or existing-list, is refocused as it is ([`Shell::new_item`]),
-/// never swapped for a claim or for the other mode.
+/// screen shows a list of other issuers' bounties (Claimed by me, Eligible)
+/// and no bounty form is open. An open one, new-list or existing-list, is
+/// refocused as it is ([`Shell::new_item`]), never swapped for a claim or
+/// for the other mode.
 pub(crate) fn opens_claim(
     is_issuer: bool,
     screen: Screen,
     tab: BountyTab,
     bounty_form_open: bool,
 ) -> bool {
-    !is_issuer || (screen == Screen::Bounties && tab == BountyTab::Eligible && !bounty_form_open)
+    !is_issuer
+        || (screen == Screen::Bounties
+            && matches!(tab, BountyTab::Claimed | BountyTab::Eligible)
+            && !bounty_form_open)
 }
 
-/// Which list the Bounties screen shows.
+/// Whether the claim form may open on a bounty with `status` from `tab`.
+/// Claimed by me also lists closed, fulfilled and expired bounties.
+pub(crate) fn claimable_from_tab(tab: BountyTab, status: &str) -> bool {
+    tab != BountyTab::Claimed || status == "open"
+}
+
+/// Which list the Bounties screen shows, in tab-strip order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BountyTab {
-    /// The house issuer's bounties (`FetchBounties`).
+    /// Every issuer's open bounties plus the stored accounts' own
+    /// (`FetchBounties`), labelled "All open".
     House,
+    /// The active account's own bounties, any status (the ledger).
+    Issued,
+    /// Other issuers' bounties the active account has a claim on (the ledger).
+    Claimed,
     /// The active account's eligible list (`FetchEligible`).
     Eligible,
 }
 
-/// The eligible list for one account, with the reads it answers to.
-pub(crate) struct EligibleSlot {
+/// One account's copy of a per-account read (the eligible list, the
+/// payments ledger), with the reads it answers to.
+pub(crate) struct Slot<T> {
     pub pubkey: String,
-    /// The first `FetchEligible` seq sent for this account since it became
-    /// active: a reply from an earlier stint (A → B → A) is older.
+    /// The first seq sent for this account since it became active: a reply
+    /// from an earlier stint (A → B → A) is older.
     since: u64,
     /// The seq of the last reply folded in, so an older reply that lands
-    /// late never overwrites a newer list.
+    /// late never overwrites a newer one.
     applied: u64,
-    pub list: Load<Vec<Bounty>>,
+    pub list: Load<T>,
 }
 
-/// Whether a `FetchEligible` reply belongs in `slot`: the same account, a
-/// read sent since it became active, and newer than the reply already shown.
-fn takes(slot: &EligibleSlot, pubkey: &str, seq: u64) -> bool {
+/// The eligible list for one account.
+pub(crate) type EligibleSlot = Slot<Vec<Bounty>>;
+
+/// The payments ledger for one account.
+pub(crate) type LedgerSlot = Slot<Ledger>;
+
+/// Whether a reply belongs in `slot`: the same account, a read sent since it
+/// became active, and newer than the reply already shown.
+fn takes<T>(slot: &Slot<T>, pubkey: &str, seq: u64) -> bool {
     pubkey == slot.pubkey && seq >= slot.since && seq > slot.applied
 }
 
-/// The next eligible read for `pubkey`. A new account gets a fresh slot
-/// starting at this read; the same account keeps its list on screen.
-fn next_eligible_read(slot: &mut Option<EligibleSlot>, seq: &mut u64, pubkey: &str) -> Command {
+/// The seq of the next read for `pubkey`. A new account gets a fresh slot
+/// starting at this read; the same account keeps its data on screen.
+fn next_read<T>(slot: &mut Option<Slot<T>>, seq: &mut u64, pubkey: &str) -> u64 {
     *seq += 1;
     if slot.as_ref().is_none_or(|s| s.pubkey != pubkey) {
-        *slot = Some(EligibleSlot {
+        *slot = Some(Slot {
             pubkey: pubkey.to_string(),
             since: *seq,
             applied: 0,
             list: Load::Loading,
         });
     }
-    Command::FetchEligible {
-        pubkey: pubkey.to_string(),
-        seq: *seq,
-    }
+    *seq
 }
 
-/// Fold an `Eligible` (Ok) or `EligibleFailed` (Err) reply into `slot`.
-/// The list is filtered to what `pubkey` can claim; a failure keeps a list
-/// already on screen and fails only a first load. False when stale.
-fn land_eligible(
-    slot: Option<&mut EligibleSlot>,
-    pubkey: &str,
-    seq: u64,
-    result: Result<Vec<Bounty>, String>,
-) -> bool {
+/// Fold a reply into `slot`. A failure keeps data already on screen and
+/// fails only a first load. False when stale.
+fn land<T>(slot: Option<&mut Slot<T>>, pubkey: &str, seq: u64, result: Result<T, String>) -> bool {
     let Some(slot) = slot.filter(|s| takes(s, pubkey, seq)) else {
         return false;
     };
     slot.applied = seq;
     match result {
-        Ok(list) => slot.list = Load::Ready(claimable_by(list, pubkey)),
+        Ok(value) => slot.list = Load::Ready(value),
         Err(message) => {
             if !matches!(slot.list, Load::Ready(_)) {
                 slot.list = Load::Failed(message);
@@ -996,6 +1026,80 @@ fn land_eligible(
         }
     }
     true
+}
+
+/// The next eligible read for `pubkey`.
+fn next_eligible_read(slot: &mut Option<EligibleSlot>, seq: &mut u64, pubkey: &str) -> Command {
+    Command::FetchEligible {
+        pubkey: pubkey.to_string(),
+        seq: next_read(slot, seq, pubkey),
+    }
+}
+
+/// Fold an `Eligible` (Ok) or `EligibleFailed` (Err) reply into `slot`,
+/// the list filtered to what `pubkey` can claim. False when stale.
+fn land_eligible(
+    slot: Option<&mut EligibleSlot>,
+    pubkey: &str,
+    seq: u64,
+    result: Result<Vec<Bounty>, String>,
+) -> bool {
+    land(slot, pubkey, seq, result.map(|list| claimable_by(list, pubkey)))
+}
+
+/// The next payments-ledger read for `pubkey`.
+fn next_ledger_read(slot: &mut Option<LedgerSlot>, seq: &mut u64, pubkey: &str) -> Command {
+    Command::FetchLedger {
+        pubkey: pubkey.to_string(),
+        seq: next_read(slot, seq, pubkey),
+    }
+}
+
+/// The ledger read in flight and whether another was asked for meanwhile.
+/// One auto-pay tick emits a payment state per claim; each would otherwise
+/// start a full ledger read of its own.
+#[derive(Default)]
+pub(crate) struct LedgerReads {
+    /// The account and seq of the read in flight.
+    out: Option<(String, u64)>,
+    dirty: bool,
+}
+
+/// A ledger read for `pubkey`, or `None` when one for it is already out:
+/// that read's reply then sends one more. Another account reads at once.
+fn request_ledger(
+    slot: &mut Option<LedgerSlot>,
+    seq: &mut u64,
+    reads: &mut LedgerReads,
+    pubkey: &str,
+) -> Option<Command> {
+    if reads.out.as_ref().is_some_and(|(out, _)| out == pubkey) {
+        reads.dirty = true;
+        return None;
+    }
+    let read = next_ledger_read(slot, seq, pubkey);
+    reads.out = Some((pubkey.to_string(), *seq));
+    reads.dirty = false;
+    Some(read)
+}
+
+/// The reply (success or failure) to read `reply_seq` for `pubkey` landed:
+/// the follow-up read when one was asked for while it was out.
+fn ledger_replied(
+    slot: &mut Option<LedgerSlot>,
+    seq: &mut u64,
+    reads: &mut LedgerReads,
+    pubkey: &str,
+    reply_seq: u64,
+) -> Option<Command> {
+    if reads.out.as_ref().is_none_or(|(out, s)| out != pubkey || *s != reply_seq) {
+        return None;
+    }
+    reads.out = None;
+    if !std::mem::take(&mut reads.dirty) {
+        return None;
+    }
+    request_ledger(slot, seq, reads, pubkey)
 }
 
 /// The claimant's one-field claim form for the selected bounty.
@@ -1025,6 +1129,16 @@ pub struct Shell {
     pub(crate) eligible: Option<EligibleSlot>,
     /// The last `FetchEligible` sequence number sent.
     eligible_seq: u64,
+    /// The active account's payments ledger; `None` in read-only mode.
+    pub(crate) ledger: Option<LedgerSlot>,
+    /// The last `FetchLedger` sequence number sent.
+    ledger_seq: u64,
+    /// The ledger read in flight, so requests that land meanwhile coalesce.
+    ledger_reads: LedgerReads,
+    /// The Payments screen's tab.
+    pub(crate) payments_tab: Direction,
+    /// The highlighted Payments row, by (bounty id, claim event id).
+    pub(crate) payment_selected: Option<payments::RowKey>,
     /// The bounty the detail pane (and the auto-pay pill) is about.
     pub(crate) selected: Option<String>,
     /// Latest full snapshot per watched bounty, straight from the runtime.
@@ -1099,6 +1213,9 @@ pub struct Shell {
     bounties_seq: u64,
     /// The Wallet screen's recipient and amount; cleared on an account switch.
     pub(crate) send_inputs: SendInputs,
+    /// The Wallet screen's payout address field; refilled with the active
+    /// account's `lud16` on a switch.
+    pub(crate) address_input: AddressInput,
     /// Per-account NIP-85 state (Treasure Map, assertions, follows), keyed by
     /// pubkey. Each entry carries the fetch generation it answers to.
     pub(crate) trust: HashMap<String, TrustState>,
@@ -1119,6 +1236,53 @@ pub struct Shell {
     pub(crate) account_page: Option<AccountPage>,
     /// Kept alive so re-activating the window can re-fetch a stale Trust tab.
     _activation: Subscription,
+}
+
+/// What the Payments screen reads.
+impl Shell {
+    fn ledger_ready(&self) -> Option<&Ledger> {
+        match self.ledger.as_ref().map(|slot| &slot.list) {
+            Some(Load::Ready(ledger)) => Some(ledger),
+            _ => None,
+        }
+    }
+
+    /// Every ledger row, both directions, newest first; empty until loaded.
+    pub(crate) fn ledger_rows(&self) -> &[Row] {
+        self.ledger_ready().map_or(&[], |l| l.rows.as_slice())
+    }
+
+    /// The ledger rows one way, newest first.
+    pub(crate) fn ledger_rows_for(&self, direction: Direction) -> impl Iterator<Item = &Row> {
+        self.ledger_rows().iter().filter(move |r| r.direction == direction)
+    }
+
+    /// The active account's own bounties, counted the way the app pays them.
+    pub(crate) fn ledger_issued(&self) -> &[Bounty] {
+        self.ledger_ready().map_or(&[], |l| l.issued.as_slice())
+    }
+
+    /// Other issuers' bounties the active account has a claim on.
+    pub(crate) fn ledger_claimed(&self) -> &[Bounty] {
+        self.ledger_ready().map_or(&[], |l| l.claimed.as_slice())
+    }
+
+    /// The first read for this account is still out. A refresh never counts:
+    /// the previous rows stay until its reply lands.
+    pub(crate) fn ledger_loading(&self) -> bool {
+        matches!(
+            self.ledger.as_ref().map(|slot| &slot.list),
+            Some(Load::Loading)
+        )
+    }
+
+    /// Why the ledger could not be read, when no rows were ever loaded.
+    pub(crate) fn ledger_failed(&self) -> Option<&str> {
+        match self.ledger.as_ref().map(|slot| &slot.list) {
+            Some(Load::Failed(message)) => Some(message),
+            _ => None,
+        }
+    }
 }
 
 impl Shell {
@@ -1170,6 +1334,7 @@ impl Shell {
 
         let setup = AccountSetup::new(true, window, cx);
         let send_inputs = SendInputs::new(window, cx);
+        let address_input = AddressInput::new(window, cx);
 
         // Coming back to the window re-reads the Trust tab on screen — but
         // only when its last read is more than 30 s old.
@@ -1213,6 +1378,11 @@ impl Shell {
             bounty_tab: BountyTab::House,
             eligible: None,
             eligible_seq: 0,
+            ledger: None,
+            ledger_seq: 0,
+            ledger_reads: LedgerReads::default(),
+            payments_tab: Direction::PaidByMe,
+            payment_selected: None,
             selected: None,
             details: HashMap::new(),
             optimistic: None,
@@ -1246,6 +1416,7 @@ impl Shell {
             balance_request: 0,
             bounties_seq: 0,
             send_inputs,
+            address_input,
             trust: HashMap::new(),
             community: HashMap::new(),
             community_generation: 0,
@@ -1314,6 +1485,13 @@ impl Shell {
             self.optimistic.as_ref(),
             id,
         )
+        // A claimed bounty that closed is on neither list, only the ledger.
+        .or_else(|| {
+            self.ledger_issued()
+                .iter()
+                .chain(self.ledger_claimed())
+                .find(|b| b.id == id)
+        })
     }
 
     /// The active account's eligible list, `Loading` when there is none.
@@ -1332,11 +1510,22 @@ impl Shell {
         }
     }
 
+    /// One of the ledger's bounty lists, `Loading` when there is no ledger.
+    pub(crate) fn ledger_list(&self, pick: fn(&Ledger) -> &[Bounty]) -> Load<&[Bounty]> {
+        match self.ledger.as_ref().map(|slot| &slot.list) {
+            Some(Load::Ready(ledger)) => Load::Ready(pick(ledger)),
+            Some(Load::Failed(message)) => Load::Failed(message.clone()),
+            Some(Load::Loading) | None => Load::Loading,
+        }
+    }
+
     /// The list the Bounties screen shows on its current tab.
-    pub(crate) fn shown_list(&self) -> &Load<Vec<Bounty>> {
+    pub(crate) fn shown_list(&self) -> Load<&[Bounty]> {
         match self.bounty_tab {
-            BountyTab::House => &self.bounties,
-            BountyTab::Eligible => self.eligible_list(),
+            BountyTab::House => (&self.bounties).into(),
+            BountyTab::Issued => self.ledger_list(|l| &l.issued),
+            BountyTab::Claimed => self.ledger_list(|l| &l.claimed),
+            BountyTab::Eligible => self.eligible_list().into(),
         }
     }
 
@@ -1427,7 +1616,7 @@ impl Shell {
     }
 
     /// Asks for the active account's eligible list. Read-only mode has none,
-    /// and the Eligible tab goes with it.
+    /// and every per-account tab (Issued, Claimed, Eligible) goes with it.
     fn fetch_eligible(&mut self) {
         let Some(pubkey) = self.active.clone() else {
             self.eligible = None;
@@ -1438,8 +1627,38 @@ impl Shell {
         let _ = self.commands.unbounded_send(read);
     }
 
+    /// Asks for the active account's payments ledger. A re-read keeps the
+    /// rows on screen until the reply lands; read-only mode has none. While
+    /// a read is out this only marks the ledger for one more read.
+    fn fetch_ledger(&mut self) {
+        let Some(pubkey) = self.active.clone() else {
+            self.ledger = None;
+            self.ledger_reads = LedgerReads::default();
+            return;
+        };
+        if let Some(read) =
+            request_ledger(&mut self.ledger, &mut self.ledger_seq, &mut self.ledger_reads, &pubkey)
+        {
+            let _ = self.commands.unbounded_send(read);
+        }
+    }
+
+    /// A ledger reply landed: send the read that was asked for meanwhile.
+    fn ledger_replied(&mut self, pubkey: &str, seq: u64) {
+        if let Some(read) = ledger_replied(
+            &mut self.ledger,
+            &mut self.ledger_seq,
+            &mut self.ledger_reads,
+            pubkey,
+            seq,
+        ) {
+            let _ = self.commands.unbounded_send(read);
+        }
+    }
+
     /// A tab click: the Eligible tab re-reads its list, and the selection
-    /// follows the tab's list.
+    /// follows the tab's list. Issued and Claimed show the ledger as loaded;
+    /// ⌘R re-reads it.
     pub(crate) fn set_bounty_tab(
         &mut self,
         tab: BountyTab,
@@ -1464,7 +1683,7 @@ impl Shell {
     fn reconcile_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pending = match self.bounty_tab {
             BountyTab::House => self.optimistic.as_ref().map(|b| b.id.as_str()),
-            BountyTab::Eligible => None,
+            BountyTab::Issued | BountyTab::Claimed | BountyTab::Eligible => None,
         };
         let mut next = selection_for(self.selected.as_deref(), self.shown_list(), pending);
         // A selection the list does not hold falls back to the first row as
@@ -1612,7 +1831,9 @@ impl Shell {
                 }
                 if self.active != was_active {
                     self.send_inputs.clear(window, cx);
+                    self.prefill_address(window, cx);
                     self.fetch_eligible();
+                    self.fetch_ledger();
                     self.reconcile_selection(window, cx);
                 }
                 let first_load = !self.first_screen_decided;
@@ -1650,6 +1871,16 @@ impl Shell {
                 picture,
                 lud16,
             } => {
+                // The field follows the profile unless the person has typed
+                // something else into it.
+                let typed = self.address_input.value(cx);
+                let untouched = self.active.as_deref() == Some(pubkey.as_str())
+                    && self.view(&pubkey).is_some_and(|view| {
+                        typed.is_empty() || view.lud16.as_deref() == Some(typed.as_str())
+                    });
+                if untouched {
+                    self.address_input.set(lud16.as_deref(), window, cx);
+                }
                 if let Some(view) = self.view_mut(&pubkey) {
                     view.kind0_name = name;
                     view.picture = picture;
@@ -1707,6 +1938,7 @@ impl Shell {
                 if self.active.is_none() {
                     self.active = Some(pubkey.clone());
                     self.fetch_eligible();
+                    self.fetch_ledger();
                 }
                 // The create path continues straight into the wallet: the
                 // view exists now, so its panel can show the spinner.
@@ -1767,6 +1999,22 @@ impl Shell {
                 let who = self.label(&pubkey);
                 self.push_activity(RED, format!("Coinos wallet problem for {who}: {message}"), now);
                 self.finish_setup_wallet(&pubkey);
+            }
+            Update::LightningAddressSet { pubkey, address } => {
+                let who = self.label(&pubkey);
+                self.push_activity(GREEN, format!("Claims to {who} now pay {address}"), now);
+                // `ProfileLoaded` follows with the whole profile; the field
+                // and the warnings read `lud16` before it lands.
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.lud16 = Some(address);
+                    view.wallet.address_check = Some(AddressCheck::Checked);
+                    view.sync_qr();
+                }
+            }
+            Update::LightningAddressFailed { pubkey, message } => {
+                if let Some(view) = self.view_mut(&pubkey) {
+                    view.wallet.address_check = Some(AddressCheck::Failed(message));
+                }
             }
             Update::Balance { pubkey, sats, .. } => {
                 // A number that just flips is easy to miss: a change gets a
@@ -1927,6 +2175,33 @@ impl Shell {
                     }
                 }
             }
+            Update::Ledger {
+                pubkey,
+                seq,
+                ledger,
+            } => {
+                if land(self.ledger.as_mut(), &pubkey, seq, Ok(ledger))
+                    && matches!(self.bounty_tab, BountyTab::Issued | BountyTab::Claimed)
+                {
+                    self.refresh_order();
+                    self.reconcile_selection(window, cx);
+                }
+                self.ledger_replied(&pubkey, seq);
+            }
+            Update::LedgerFailed {
+                pubkey,
+                seq,
+                message,
+            } => {
+                if land(self.ledger.as_mut(), &pubkey, seq, Err(message.clone())) {
+                    self.push_activity(RED, format!("Payments didn't load: {message}"), now);
+                    if matches!(self.bounty_tab, BountyTab::Issued | BountyTab::Claimed) {
+                        self.refresh_order();
+                        self.reconcile_selection(window, cx);
+                    }
+                }
+                self.ledger_replied(&pubkey, seq);
+            }
             Update::BountyDetail(detail) => {
                 if self.optimistic.as_ref().is_some_and(|b| b.id == detail.bounty.id) {
                     self.optimistic = None;
@@ -1974,6 +2249,8 @@ impl Shell {
                 self.scroll_to = Some(id.clone());
                 let _ = self.commands.unbounded_send(Command::WatchBounty { id });
                 self.fetch_bounties();
+                // A new bounty changes what this account has pledged.
+                self.fetch_ledger();
             }
             Update::ClaimPublished {
                 bounty_id,
@@ -2017,6 +2294,7 @@ impl Shell {
                     .unbounded_send(Command::WatchBounty { id: bounty_id });
                 // The claim may have used the account's last slot.
                 self.fetch_eligible();
+                self.fetch_ledger();
             }
             Update::PaymentState {
                 bounty_id,
@@ -2045,6 +2323,8 @@ impl Shell {
                 if let Some(text) = self.paid_notice(&bounty_id, &claim_event_id, &state, ts) {
                     window.push_notification(Notification::info(text), cx);
                 }
+                // The runtime sends this only on a change.
+                self.fetch_ledger();
             }
             Update::ReceiptSeen {
                 bounty_id: _,
@@ -2062,6 +2342,8 @@ impl Shell {
                     // never read as an instant payout.
                     if at > 0 { at } else { now },
                 );
+                // A "Paid, no receipt" row turns "Paid" now, not at ⌘R.
+                self.fetch_ledger();
             }
             Update::Error { source, message } => {
                 sentry::capture_message(&format!("{source:?}: {message}"), sentry::Level::Error);
@@ -2201,10 +2483,12 @@ impl Shell {
             // An open form belongs to the account that opened it.
             self.close_forms(window, cx);
             self.send_inputs.clear(window, cx);
+            self.prefill_address(window, cx);
             let _ = self.commands.unbounded_send(Command::SetActive {
                 pubkey: pubkey.to_string(),
             });
             self.fetch_eligible();
+            self.fetch_ledger();
             self.reconcile_selection(window, cx);
         }
         self.sync_balance_poll(cx);
@@ -2441,11 +2725,36 @@ impl Shell {
         self.go(Screen::Dashboard, window, cx);
     }
 
-    /// The global Enter binding: only the account screen's Start listens.
+    /// The global Enter binding: the account screen's Start, and the
+    /// Payments screen's highlighted row.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.screen == Screen::AccountSetup && self.setup.ready.is_some() {
             self.leave_account_setup(window, cx);
         }
+        if self.screen == Screen::Payments {
+            let bounty = self.payment_selected.as_ref().and_then(|key| {
+                self.ledger_rows_for(self.payments_tab)
+                    .find(|r| payments::is_row(r, key))
+                    .map(|r| r.bounty_id.clone())
+            });
+            if let Some(bounty) = bounty {
+                self.open_payment(bounty, window, cx);
+            }
+        }
+    }
+
+    /// A Payments row opens its bounty's detail pane on the Bounties screen.
+    /// On the House tab: an Eligible reply re-picks a selection its list
+    /// lacks, while a House reply keeps any selection. The watch `select`
+    /// starts fills the pane even for a bounty no list carries (closed, or
+    /// past the list's end).
+    pub(crate) fn open_payment(&mut self, bounty_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bounty_tab != BountyTab::House {
+            self.set_bounty_tab(BountyTab::House, window, cx);
+        }
+        self.record_visit(&bounty_id);
+        self.select(bounty_id);
+        self.go(Screen::Bounties, window, cx);
     }
 
     /// The search field has focus and text, so escape clears it.
@@ -2498,6 +2807,52 @@ impl Shell {
             .commands
             .unbounded_send(Command::CreateCoinosWallet { pubkey });
         cx.notify();
+    }
+
+    /// "Save" on the payout address, and Enter in its field: the runtime
+    /// checks the address and writes it into the active account's profile.
+    /// Inert while a check runs or when the text is the current address.
+    pub(crate) fn save_address(&mut self, cx: &mut Context<Self>) {
+        let Some(pubkey) = self.active.clone() else {
+            return;
+        };
+        let address = self.address_input.value(cx);
+        let Some(view) = self.view_mut(&pubkey) else {
+            return;
+        };
+        let check = view.wallet.address_check.as_ref();
+        if !wallet::can_save_address(&address, view.lud16.as_deref(), check) {
+            return;
+        }
+        view.wallet.address_check = Some(AddressCheck::Checking);
+        let _ = self
+            .commands
+            .unbounded_send(Command::SetLightningAddress { pubkey, address });
+        cx.notify();
+    }
+
+    /// The payout field shows the active account's address as the relays
+    /// have it, or nothing.
+    fn prefill_address(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let lud16 = self.active_view().and_then(|view| view.lud16.clone());
+        self.address_input.set(lud16.as_deref(), window, cx);
+    }
+
+    /// What the active account's own wallet page adds to the panel.
+    pub(crate) fn own_wallet(&self) -> OwnPage<'_> {
+        let debts = if self.ledger_failed().is_some() {
+            DebtsView::Failed
+        } else if self.ledger_loading() {
+            DebtsView::Loading
+        } else {
+            let me = self.active.as_deref().unwrap_or_default();
+            DebtsView::Ready(ledger::debts(self.ledger_issued(), self.ledger_rows(), me))
+        };
+        OwnPage {
+            send: &self.send_inputs,
+            address: &self.address_input,
+            debts,
+        }
     }
 
     /// "Send" on the Wallet screen or the Account page's Wallet tab, and
@@ -2739,6 +3094,7 @@ impl Shell {
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.fetch_bounties();
         self.fetch_eligible();
+        self.fetch_ledger();
         let _ = self.commands.unbounded_send(Command::LoadAccounts);
         // LoadAccounts re-reads every kind-0; a failed one is pending again.
         for (_, view) in &mut self.views {
@@ -2766,6 +3122,13 @@ impl Shell {
         // was opened on; otherwise "Claim selected" lies once you arrow away.
         if let Some(bounty) = self.selected_bounty() {
             let (id, coordinate) = (bounty.id.clone(), bounty.list_coordinate.clone());
+            // Arrowing onto a bounty that takes no new claims closes an idle
+            // form rather than aiming it at that bounty.
+            if !claimable_from_tab(self.bounty_tab, bounty.effective_status())
+                && self.claim_form.as_ref().is_some_and(|f| !f.submitting)
+            {
+                self.claim_form = None;
+            }
             // A form mid-publish keeps its target so the reply (and a
             // retry) lands on the bounty it was sent to.
             if let Some(form) = self.claim_form.as_mut().filter(|f| !f.submitting) {
@@ -2777,6 +3140,14 @@ impl Shell {
     }
 
     fn select_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.screen == Screen::Payments {
+            let rows: Vec<&Row> = self.ledger_rows_for(self.payments_tab).collect();
+            if let Some(next) = payments::step(&rows, self.payment_selected.as_ref(), step) {
+                self.payment_selected = Some(next);
+                cx.notify();
+            }
+            return;
+        }
         if self.screen != Screen::Bounties {
             return;
         }
@@ -2832,8 +3203,9 @@ impl Shell {
                 cx.notify();
                 return;
             }
-            // The bounty form belongs to the House tab: leaving Eligible
-            // showing would offer a claim over a half-typed bounty.
+            // The bounty form belongs to the House tab, where the new
+            // bounty lands: leaving Claimed or Eligible showing would offer
+            // a claim over a half-typed bounty.
             if self.bounty_tab != BountyTab::House {
                 self.set_bounty_tab(BountyTab::House, window, cx);
             }
@@ -3228,7 +3600,16 @@ impl Shell {
     fn open_claim_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The claim needs the list coordinate, so a bounty must be selected;
         // without one nothing changes.
-        if self.selected_bounty().is_none() {
+        let Some(status) = self.selected_bounty().map(|b| b.effective_status().to_string()) else {
+            return;
+        };
+        if !claimable_from_tab(self.bounty_tab, &status) {
+            self.push_activity(
+                AMBER,
+                format!("That bounty is {status}, so it takes no new claims."),
+                timefmt::now_unix(),
+            );
+            cx.notify();
             return;
         }
         // The issuer's bounty form gives way to a claim (Eligible tab), but
@@ -3608,52 +3989,42 @@ impl Shell {
         let remove_armed = active.is_some() && self.confirm_remove == active;
         let sats_left = active.as_deref().and_then(|p| self.remove_warning(p));
 
-        // The three cards are the issuer's live bounty economics; before the
-        // list loads (or when it failed) they say so instead of guessing.
-        //
-        // The money-out card counts SETTLED (receipted) payouts only: the
-        // list endpoint's paymentState is the one dataset loaded for every
-        // bounty, and its paidRewardCount excludes paid_unreceipted rows —
-        // sats can leave the wallet before any receipt lands. Per-claim
-        // autoPayment rows exist only for watched bounties, so summing them
-        // would silently undercount. The label says exactly what is counted,
-        // so the sidebar can never contradict a claim card.
-        let (open_value, committed, settled, note): (
-            SharedString,
-            SharedString,
-            SharedString,
-            Option<SharedString>,
-        ) = match &self.bounties {
+        // OPEN BOUNTIES counts the listed bounties; before the list loads
+        // (or when it failed) the card says so instead of guessing.
+        let (open_value, note): (SharedString, Option<SharedString>) = match &self.bounties {
             Load::Ready(list) => {
-                let open: Vec<&Bounty> = list
+                let open = list
                     .iter()
                     .filter(|b| b.effective_status() == "open")
-                    .collect();
-                let committed: u64 = open
-                    .iter()
-                    .filter_map(|b| b.payment_state.as_ref())
-                    .map(|s| s.open_reward_slots * s.reward_amount_sats)
-                    .sum();
-                let settled: u64 = list
-                    .iter()
-                    .filter_map(|b| b.payment_state.as_ref())
-                    .map(|s| s.paid_reward_count * s.reward_amount_sats)
-                    .sum();
+                    .count();
                 (
-                    open.len().to_string().into(),
-                    timefmt::fmt_sats(committed).into(),
-                    timefmt::fmt_sats(settled).into(),
+                    open.to_string().into(),
                     Some(format!("{} bounties total", list.len()).into()),
                 )
             }
-            Load::Loading => ("…".into(), "…".into(), "…".into(), Some("loading".into())),
-            Load::Failed(_) => (
-                "—".into(),
-                "—".into(),
-                "—".into(),
-                Some("can't load list".into()),
-            ),
+            Load::Loading => ("…".into(), Some("loading".into())),
+            Load::Failed(_) => ("—".into(), Some("can't load list".into())),
         };
+        // PROMISED and PAID SO FAR are the active account's own, from the
+        // ledger the Payments totals and the Wallet debts read, so the three
+        // never disagree. With no account, or a ledger that is not in, they
+        // show a placeholder, never another account's numbers.
+        let (committed, settled): (SharedString, SharedString) =
+            match self.ledger.as_ref().map(|slot| (slot.pubkey.as_str(), &slot.list)) {
+                Some((me, Load::Ready(_))) => (
+                    timefmt::fmt_sats(ledger::pledged(
+                        self.ledger_issued(),
+                        self.ledger_rows(),
+                        me,
+                    ))
+                    .into(),
+                    timefmt::fmt_sats(ledger::totals(self.ledger_rows(), Direction::PaidByMe).paid)
+                        .into(),
+                ),
+                Some((_, Load::Loading)) => ("…".into(), "…".into()),
+                Some((_, Load::Failed(_))) | None => ("—".into(), "—".into()),
+            };
+        let unsettled = ledger::unsettled_count(self.ledger_rows());
 
         v_flex()
             .id("sidebar")
@@ -3815,6 +4186,9 @@ impl Shell {
                     }
                     _ => None,
                 };
+                // Claims this account still has to pay: amber, they want action.
+                let owed = (screen == Screen::Payments && unsettled > 0)
+                    .then(|| SharedString::from(unsettled.to_string()));
                 h_flex()
                     .id(SharedString::from(screen.label()))
                     .a11y(
@@ -3824,6 +4198,7 @@ impl Shell {
                     )
                     .aria_selected(on)
                     .when_some(badge.clone(), |this, badge| this.aria_description(badge))
+                    .when_some(owed.clone(), |this, owed| this.aria_description(owed))
                     .gap(px(10.))
                     .items_center()
                     .px(px(11.))
@@ -3839,6 +4214,22 @@ impl Shell {
                     .child(div().flex_1().min_w(px(0.)).child(screen.label()))
                     .when_some(badge, |this, badge| {
                         this.child(dashboard::count_badge(badge))
+                    })
+                    .when_some(owed, |this, owed| {
+                        this.child(
+                            div()
+                                .a11y("nav-payments-badge", Role::Label, owed.clone())
+                                .px(px(7.))
+                                .py(px(1.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(rgb(AMBER_DIM))
+                                .font_family(MONO)
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(AMBER))
+                                .child(owed),
+                        )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| this.go(screen, window, cx)))
             }))
@@ -3859,7 +4250,7 @@ impl Shell {
                 Some("sats"),
                 AMBER,
                 AMBER_DIM,
-                Some("in open bounties".into()),
+                Some("in your open bounties".into()),
             ))
             .child(Self::stat_card(
                 "sidebar-paid",
@@ -3868,7 +4259,7 @@ impl Shell {
                 Some("sats"),
                 GREEN,
                 GREEN_DIM,
-                Some("auto-paid, receipt seen".into()),
+                Some("paid by this account".into()),
             ))
     }
 
@@ -4037,6 +4428,22 @@ impl Shell {
                 .pb(px(20.))
                 .child(bounties::render(self, cx))
                 .into_any_element(),
+            Screen::Payments => div()
+                .id("payments")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(900.))
+                        .mx_auto()
+                        .px(px(28.))
+                        .pt(px(26.))
+                        .pb(px(60.))
+                        .child(payments::render(self, cx)),
+                )
+                .into_any_element(),
             Screen::Chat => v_flex()
                 .flex_1()
                 .min_h(px(0.))
@@ -4053,7 +4460,7 @@ impl Shell {
                     None => "Wallet".to_string(),
                 };
                 let panel = match self.active_view() {
-                    Some(view) => wallet::panel(view, false, Some(&self.send_inputs), cx),
+                    Some(view) => wallet::panel(view, false, Some(self.own_wallet()), cx),
                     // dashboard::muted, with a node.
                     None => div()
                         .a11y(
@@ -4298,6 +4705,8 @@ mod tests {
         BountyTab, EligibleSlot, Load, Screen, find_bounty, house_reply_pick, land_eligible,
         next_eligible_read, opens_claim, selection_for, takes,
     };
+    use super::{LedgerReads, LedgerSlot, claimable_from_tab, land, ledger_replied, next_ledger_read, request_ledger};
+    use magic_carpet_chat::ledger::Ledger;
     use magic_carpet_chat::api::Bounty;
     use std::collections::{HashMap, HashSet};
 
@@ -4391,6 +4800,86 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_or_other_account_ledger_reply_is_dropped() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let sent = |command: Command| match command {
+            Command::FetchLedger { pubkey, seq } => (pubkey, seq),
+            _ => panic!("not a ledger read"),
+        };
+        let ledger = |id: &str| Ledger {
+            issued: vec![eligible_row(id, "a")],
+            ..Ledger::default()
+        };
+        let shown = |slot: &Option<LedgerSlot>| match &slot.as_ref()?.list {
+            Load::Ready(l) => Some(l.issued[0].id.clone()),
+            _ => None,
+        };
+
+        let (_, a1) = sent(next_ledger_read(&mut slot, &mut seq, "a"));
+        let (_, b2) = sent(next_ledger_read(&mut slot, &mut seq, "b"));
+        let (_, a3) = sent(next_ledger_read(&mut slot, &mut seq, "a"));
+        assert!(!land(slot.as_mut(), "b", b2, Ok(ledger("b's"))), "another account's");
+        assert!(!land(slot.as_mut(), "a", a1, Ok(ledger("first stint"))), "an earlier stint's");
+        assert!(matches!(&slot, Some(LedgerSlot { list: Load::Loading, .. })));
+        assert!(land(slot.as_mut(), "a", a3, Ok(ledger("one"))));
+
+        // A refresh keeps the rows on screen until its reply lands; an older
+        // reply after a newer one is dropped, and a failure keeps the rows.
+        let (_, a4) = sent(next_ledger_read(&mut slot, &mut seq, "a"));
+        assert_eq!(shown(&slot).as_deref(), Some("one"), "no loading flash");
+        let (_, a5) = sent(next_ledger_read(&mut slot, &mut seq, "a"));
+        assert!(land(slot.as_mut(), "a", a5, Ok(ledger("newest"))));
+        assert!(!land(slot.as_mut(), "a", a4, Ok(ledger("older"))));
+        assert_eq!(shown(&slot).as_deref(), Some("newest"));
+        let (_, a6) = sent(next_ledger_read(&mut slot, &mut seq, "a"));
+        assert!(land(slot.as_mut(), "a", a6, Err("down".into())));
+        assert_eq!(shown(&slot).as_deref(), Some("newest"));
+    }
+
+    #[test]
+    fn ledger_requests_while_a_read_is_out_coalesce_into_one_more() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let mut reads = LedgerReads::default();
+        let sent = |command: Option<Command>| match command {
+            Some(Command::FetchLedger { pubkey, seq }) => (pubkey, seq),
+            _ => panic!("no ledger read sent"),
+        };
+
+        // Three requests in a row (an auto-pay tick, ⌘R): one read.
+        let (_, a1) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "a"));
+        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "a").is_none());
+        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "a").is_none());
+        // Its reply sends exactly one more, and that one's reply none.
+        let (to, a2) = sent(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a1));
+        assert_eq!((to.as_str(), a2), ("a", 2));
+        assert!(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a2).is_none());
+        // The previous rows stay on screen during the follow-up read.
+        assert!(land(slot.as_mut(), "a", a2, Ok(Ledger::default())));
+        let (_, a3) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "a"));
+        assert!(matches!(&slot, Some(LedgerSlot { list: Load::Ready(_), .. })));
+
+        // An account switch mid-read reads for the new account at once; the
+        // old account's reply sends nothing.
+        let (to, b4) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "b"));
+        assert_eq!((to.as_str(), b4), ("b", 4));
+        assert!(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a3).is_none());
+        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "b").is_none());
+        let (to, _) = sent(ledger_replied(&mut slot, &mut seq, &mut reads, "b", b4));
+        assert_eq!(to, "b");
+    }
+
+    #[test]
+    fn claimed_by_me_opens_a_claim_only_on_an_open_bounty() {
+        assert!(claimable_from_tab(BountyTab::Claimed, "open"));
+        for status in ["closed", "fulfilled", "expired"] {
+            assert!(!claimable_from_tab(BountyTab::Claimed, status), "{status}");
+        }
+        // The other tabs are unchanged.
+        assert!(claimable_from_tab(BountyTab::Eligible, "closed"));
+        assert!(claimable_from_tab(BountyTab::House, "closed"));
+    }
+
+    #[test]
     fn the_selection_stays_on_a_row_the_shown_list_holds() {
         let list = Load::Ready(vec![eligible_row("a", "x"), eligible_row("b", "x")]);
         // Held: kept. Gone or none: the first row.
@@ -4460,6 +4949,37 @@ mod tests {
         assert!(opens_claim(false, Bounties, BountyTab::House, false));
         assert!(opens_claim(false, Bounties, BountyTab::Eligible, false));
         assert!(opens_claim(false, Dashboard, BountyTab::House, false));
+    }
+
+    #[test]
+    fn the_issuer_claims_from_claimed_by_me_but_not_from_issued_by_me() {
+        use Screen::{Bounties, Dashboard};
+        // Claimed by me lists other issuers' bounties, like Eligible.
+        assert!(opens_claim(true, Bounties, BountyTab::Claimed, false));
+        assert!(!opens_claim(true, Bounties, BountyTab::Claimed, true));
+        assert!(!opens_claim(true, Dashboard, BountyTab::Claimed, false));
+        // Issued by me lists the account's own: ⌘N is the bounty form.
+        assert!(!opens_claim(true, Bounties, BountyTab::Issued, false));
+        assert!(opens_claim(false, Bounties, BountyTab::Issued, false));
+        assert!(opens_claim(false, Bounties, BountyTab::Claimed, false));
+    }
+
+    #[test]
+    fn a_house_reply_never_picks_on_the_ledger_tabs() {
+        let list = [eligible_row("h", "x")];
+        assert_eq!(house_reply_pick(BountyTab::Issued, None, &list), None);
+        assert_eq!(house_reply_pick(BountyTab::Claimed, None, &list), None);
+    }
+
+    #[test]
+    fn a_borrowed_list_selects_like_an_owned_one() {
+        let owned = Load::Ready(vec![eligible_row("a", "x"), eligible_row("b", "x")]);
+        let borrowed: Load<&[Bounty]> = (&owned).into();
+        assert_eq!(selection_for(Some("b"), borrowed, None).as_deref(), Some("b"));
+        let down = Load::<Vec<Bounty>>::Failed("down".into());
+        let failed: Load<&[Bounty]> = (&down).into();
+        assert!(matches!(failed, Load::Failed(ref m) if m == "down"));
+        assert_eq!(selection_for(Some("b"), failed, None), None);
     }
 
     #[test]

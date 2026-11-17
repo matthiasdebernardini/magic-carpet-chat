@@ -21,6 +21,7 @@ mod dashboard;
 mod debug_report;
 mod icons;
 mod palette;
+mod payments;
 mod qr;
 mod shell;
 mod trust_state;

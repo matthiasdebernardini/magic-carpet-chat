@@ -238,8 +238,8 @@ fn bounty_row(
 }
 
 /// "{label} ({n})", the count only once the list is in.
-fn tab_label(label: &str, list: &Load<Vec<Bounty>>) -> String {
-    match list {
+fn tab_label<'a>(label: &str, list: impl Into<Load<&'a [Bounty]>>) -> String {
+    match list.into() {
         Load::Ready(list) => format!("{label} ({})", list.len()),
         _ => label.to_string(),
     }
@@ -275,16 +275,34 @@ fn tab(
         .into_any_element()
 }
 
-/// The tab strip over the list. The Eligible tab needs an account to be
-/// eligible as, so read-only mode shows the house list alone.
+/// The tab strip over the list. Issued, Claimed and Eligible need an
+/// account to be read for, so read-only mode shows the house list alone.
 fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let house = tab(
         "bounties-tab-house",
-        tab_label("House bounties", &shell.bounties),
+        tab_label("All open", &shell.bounties),
         shell.bounty_tab == BountyTab::House,
         BountyTab::House,
         cx,
     );
+    let mine = shell.ledger.as_ref().map(|_| {
+        [
+            tab(
+                "bounties-tab-issued",
+                tab_label("Issued by me", shell.ledger_list(|l| &l.issued)),
+                shell.bounty_tab == BountyTab::Issued,
+                BountyTab::Issued,
+                cx,
+            ),
+            tab(
+                "bounties-tab-claimed",
+                tab_label("Claimed by me", shell.ledger_list(|l| &l.claimed)),
+                shell.bounty_tab == BountyTab::Claimed,
+                BountyTab::Claimed,
+                cx,
+            ),
+        ]
+    });
     let eligible = shell.eligible.as_ref().map(|slot| {
         tab(
             "bounties-tab-eligible",
@@ -300,6 +318,7 @@ fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         .gap(px(6.))
         .mb(px(8.))
         .child(house)
+        .children(mine.into_iter().flatten())
         .children(eligible)
         .into_any_element()
 }
@@ -360,7 +379,12 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .child({
                     let text = format!(
                         "{} didn't load: {message}",
-                        if eligible { "Eligible bounties" } else { "Bounties" }
+                        match shell.bounty_tab {
+                            BountyTab::House => "Bounties",
+                            BountyTab::Issued => "Your bounties",
+                            BountyTab::Claimed => "Your claims",
+                            BountyTab::Eligible => "Eligible bounties",
+                        }
                     );
                     div()
                         .a11y("bounties-error", Role::Label, text.clone())
@@ -386,19 +410,22 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 )
                 .into_any_element(),
         ],
-        Load::Ready(list) if list.is_empty() => vec![
-            div()
-                .a11y(
-                    "bounties-empty",
-                    Role::Label,
-                    "No bounties yet. ⌘N creates the first one.",
-                )
-                .py(px(20.))
-                .text_size(px(12.5))
-                .text_color(rgb(TEXT_DIM))
-                .child("No bounties yet. ⌘N creates the first one.")
-                .into_any_element(),
-        ],
+        Load::Ready([]) => {
+            let text = match shell.bounty_tab {
+                BountyTab::Issued => "You haven't issued a bounty yet.",
+                BountyTab::Claimed => "You haven't claimed a bounty yet.",
+                BountyTab::House | BountyTab::Eligible => "No bounties yet. ⌘N creates the first one.",
+            };
+            vec![
+                div()
+                    .a11y("bounties-empty", Role::Label, text)
+                    .py(px(20.))
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_DIM))
+                    .child(text)
+                    .into_any_element(),
+            ]
+        }
         Load::Ready(_) => {
             let rows = shell.displayed();
             if rows.is_empty() {
@@ -1242,6 +1269,23 @@ mod tests {
         assert_eq!(
             tab_label("House bounties", &Load::Failed("x".into())),
             "House bounties"
+        );
+    }
+
+    #[test]
+    fn a_ledger_tab_counts_its_borrowed_list_once_loaded() {
+        let issued = [row(serde_json::json!({}))];
+        assert_eq!(
+            tab_label("Issued by me", Load::Ready(&issued[..])),
+            "Issued by me (1)"
+        );
+        assert_eq!(
+            tab_label("Claimed by me", Load::<&[Bounty]>::Loading),
+            "Claimed by me"
+        );
+        assert_eq!(
+            tab_label("Claimed by me", Load::<&[Bounty]>::Failed("x".into())),
+            "Claimed by me"
         );
     }
 }

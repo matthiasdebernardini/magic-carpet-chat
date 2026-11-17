@@ -714,10 +714,10 @@ pub(crate) fn render_account(shell: &Shell, cx: &mut Context<Shell>) -> AnyEleme
             Tab::Trust => render_trust(shell, &pubkey, cx),
             Tab::Wallet => {
                 // Any account but the active one gets the panel without
-                // the send form (`wallet::shows_send`).
-                let send = crate::wallet::shows_send(shell.active.as_deref(), &pubkey)
-                    .then_some(&shell.send_inputs);
-                crate::wallet::panel(view, false, send, cx)
+                // the send form, payout field and debts (`wallet::shows_send`).
+                let own = crate::wallet::shows_send(shell.active.as_deref(), &pubkey)
+                    .then(|| shell.own_wallet());
+                crate::wallet::panel(view, false, own, cx)
             }
             _ => div()
                 .text_size(px(12.5))

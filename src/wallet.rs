@@ -13,6 +13,10 @@
 //! inputs belong to the shell (one pair, cleared on an account switch); the
 //! outcome lives on the account's [`WalletState`], where `Sent` and
 //! `SendFailed` land by pubkey.
+//!
+//! On the active account's own page it adds two cards: where claims pay the
+//! account (its own Lightning address, checked and written by
+//! `Command::SetLightningAddress`) and what it still owes on its bounties.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +31,7 @@ use gpui_kit::*;
 use qrcode::QrCode;
 
 use magic_carpet_chat::coinos::lnurl_pay;
+use magic_carpet_chat::ledger::Debts;
 use magic_carpet_chat::nostr::{self, WalletCreated};
 
 use crate::a11y::Accessible as _;
@@ -52,6 +57,8 @@ pub struct WalletState {
     pub balance: Option<u64>,
     /// The last send from this wallet, as the status line reports it.
     pub send: Option<SendState>,
+    /// The last "Save" of the payout address, as its status line reports it.
+    pub address_check: Option<AddressCheck>,
     /// A `Sent` whose fresh `Balance` has not arrived yet; that `Balance`
     /// turns it into the one toast per send.
     pub pending_sent: Option<PendingSent>,
@@ -132,6 +139,70 @@ pub enum SendState {
     Sent { to: String, sats: u64 },
     /// Fixed text from the runtime or the input check.
     Failed(String),
+}
+
+/// One payout address save, from the click to the runtime's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressCheck {
+    Checking,
+    Checked,
+    /// Fixed text from the runtime.
+    Failed(String),
+}
+
+/// The payout address field. One for the whole shell, like [`SendInputs`]:
+/// it shows the active account's address and is refilled on a switch.
+pub struct AddressInput {
+    pub input: Entity<InputState>,
+    _sub: Subscription,
+}
+
+impl AddressInput {
+    /// Enter saves, like the button; every edit re-renders, because Save
+    /// is inert while the text equals the current address.
+    pub fn new(window: &mut Window, cx: &mut Context<Shell>) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("name@domain.com"));
+        let sub = cx.subscribe_in(&input, window, |this: &mut Shell, _, event, _, cx| {
+            match event {
+                InputEvent::PressEnter { .. } => this.save_address(cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            }
+        });
+        Self { input, _sub: sub }
+    }
+
+    pub fn value(&self, cx: &App) -> String {
+        self.input.read(cx).value().trim().to_string()
+    }
+
+    pub fn set(&self, value: Option<&str>, window: &mut Window, cx: &mut Context<Shell>) {
+        let value = value.unwrap_or_default().to_string();
+        self.input.update(cx, |state, cx| state.set_value(value, window, cx));
+    }
+}
+
+/// The debts card's numbers, or why there are none yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebtsView {
+    Loading,
+    Failed,
+    Ready(Debts),
+}
+
+/// What only the active account's own page shows ([`shows_send`]): the send
+/// form, the payout address field and the debts card.
+pub struct OwnPage<'a> {
+    pub send: &'a SendInputs,
+    pub address: &'a AddressInput,
+    pub debts: DebtsView,
+}
+
+/// Save is inert while a check runs and when the text is the address the
+/// profile already has.
+pub fn can_save_address(typed: &str, current: Option<&str>, check: Option<&AddressCheck>) -> bool {
+    check != Some(&AddressCheck::Checking)
+        && !current.is_some_and(|current| current.eq_ignore_ascii_case(typed.trim()))
 }
 
 /// The Send block's two inputs. One pair for the whole shell: the block
@@ -334,10 +405,157 @@ fn send_block(state: &WalletState, inputs: &SendInputs, cx: &mut Context<Shell>)
         .into_any_element()
 }
 
+fn section_title(text: &'static str) -> Div {
+    div()
+        .text_size(px(10.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(TEXT_DIM))
+        .child(text)
+}
+
+fn own_card() -> Div {
+    v_flex()
+        .gap(px(8.))
+        .items_start()
+        .w_full()
+        .mt(px(6.))
+        .px(px(14.))
+        .py(px(12.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(rgb(BORDER_2))
+}
+
+/// The account's own Lightning address: the field, Save, and how the last
+/// save went. Prefilled by the shell with the profile's `lud16`.
+fn address_card(view: &AccountView, input: &AddressInput, cx: &mut Context<Shell>) -> AnyElement {
+    let check = view.wallet.address_check.as_ref();
+    let enabled = can_save_address(&input.value(cx), view.lud16.as_deref(), check);
+    let status = match check {
+        None => None,
+        Some(AddressCheck::Checking) => Some(
+            h_flex()
+                .gap(px(8.))
+                .items_center()
+                .child(Spinner::new().small().color(rgb(TEXT_MUTED).into()))
+                .child(line("wallet-payout-status", "Checking…", TEXT_MUTED))
+                .into_any_element(),
+        ),
+        Some(AddressCheck::Checked) => Some(
+            line(
+                "wallet-payout-status",
+                "Checked: this address accepts payments and sends receipts.",
+                GREEN,
+            )
+            .into_any_element(),
+        ),
+        Some(AddressCheck::Failed(message)) => {
+            Some(line("wallet-payout-error", message.clone(), RED).into_any_element())
+        }
+    };
+    own_card()
+        .child(section_title("WHERE CLAIMS PAY YOU"))
+        .child(
+            h_flex()
+                .gap(px(8.))
+                .items_center()
+                .child(
+                    div().w(px(260.)).text_size(px(12.5)).child(
+                        Input::new(&input.input)
+                            .accessibility_id("wallet-payout-address")
+                            .aria_label("Your Lightning address for claim payouts"),
+                    ),
+                )
+                .child(
+                    button("wallet-payout-save", "Save", true)
+                        .when(!enabled, |this| this.opacity(0.5))
+                        .when(enabled, |this| {
+                            this.on_click(cx.listener(|this, _, _, cx| this.save_address(cx)))
+                        }),
+                ),
+        )
+        .when_some(status, |this, status| this.child(status))
+        .into_any_element()
+}
+
+/// One debts line: label, an optional sub-label under it, the value right.
+fn debt_row(
+    id: &'static str,
+    label: &'static str,
+    sub: Option<&'static str>,
+    value: String,
+    strong: bool,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .gap(px(16.))
+        .items_start()
+        .child(
+            v_flex()
+                .flex_1()
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(if strong { TEXT } else { TEXT_MUTED }))
+                        .when(strong, |this| this.font_weight(FontWeight::SEMIBOLD))
+                        .child(label),
+                )
+                .when_some(sub, |this, sub| {
+                    this.child(div().text_size(px(11.)).text_color(rgb(TEXT_DIM)).child(sub))
+                }),
+        )
+        .child(
+            div()
+                .font_family(MONO)
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT))
+                .when(strong, |this| this.font_weight(FontWeight::SEMIBOLD))
+                .child(value.clone())
+                .a11y(id, Role::Label, format!("{label}: {value}")),
+        )
+}
+
+/// What the account still owes on its bounties. A loading ledger shows "…",
+/// not zeros: zero is a real answer once the ledger is in.
+fn debts_card(debts: DebtsView) -> AnyElement {
+    let card = own_card().child(section_title("DEBTS"));
+    let debts = match debts {
+        DebtsView::Ready(debts) => Some(debts),
+        DebtsView::Loading => None,
+        DebtsView::Failed => {
+            return card
+                .child(line("wallet-debts-error", "Couldn't load your debts.", AMBER))
+                .into_any_element();
+        }
+    };
+    let sats = |pick: fn(&Debts) -> u64| match &debts {
+        Some(debts) => format!("{} sats", timefmt::fmt_sats(pick(debts))),
+        None => "…".to_string(),
+    };
+    card.child(debt_row(
+        "wallet-debts-pledged",
+        "Pledged outstanding",
+        Some("open bounties, claimed to their fullest"),
+        sats(|d| d.pledged_outstanding),
+        false,
+    ))
+    .child(debt_row(
+        "wallet-debts-owed",
+        "Owed but unpaid",
+        Some("claims waiting on payment"),
+        sats(|d| d.owed_unpaid),
+        false,
+    ))
+    .child(div().w_full().h(px(1.)).bg(rgb(LINE)))
+    .child(debt_row("wallet-debts-total", "Total debts", None, sats(Debts::total), true))
+    .into_any_element()
+}
+
 /// The panel for `view`: `view.lud16` is the profile as the relays have it,
-/// `view.wallet` the stored or just-opened Coinos wallet, if any. `send` is
-/// the send form's input pair, passed by the Wallet screen and by the Account
-/// page's Wallet tab when its account is the active one ([`shows_send`]).
+/// `view.wallet` the stored or just-opened Coinos wallet, if any. `own` is
+/// the send form, the payout address field and the debts, passed by the
+/// Wallet screen and by the Account page's Wallet tab when its account is
+/// the active one ([`shows_send`]).
 /// The account setup screen passes `None`, because a wallet that is waiting
 /// for its first sats has nothing to send.
 /// The Account page's Wallet tab shows the send form only for the active
@@ -350,9 +568,10 @@ pub fn shows_send(active: Option<&str>, page_pubkey: &str) -> bool {
 pub fn panel(
     view: &AccountView,
     first_funding: bool,
-    send: Option<&SendInputs>,
+    own: Option<OwnPage<'_>>,
     cx: &mut Context<Shell>,
 ) -> AnyElement {
+    let send = own.as_ref().map(|own| own.send);
     let pubkey = view.pubkey.clone();
     let state = &view.wallet;
     let created = state.created.as_ref();
@@ -400,8 +619,8 @@ pub fn panel(
                 this.child(send_block(state, inputs, cx))
             })
             .when_some(created, |this, created| {
-                // The relays carry someone else's address: it is never
-                // overwritten, so payouts go there and a retry cannot help.
+                // The profile names another address, set by the person or
+                // elsewhere: payouts go there and a retry cannot help.
                 let other = view
                     .lud16
                     .clone()
@@ -442,8 +661,8 @@ pub fn panel(
                 .when_some(other.clone(), |this, other| {
                     this.child(line(
                         "wallet-other-address",
-                        format!("Your profile pays {other}, not this wallet. This app does not replace it."),
-                        AMBER,
+                        format!("Claims pay {other}, not this Coinos wallet."),
+                        TEXT_MUTED,
                     ))
                 })
                 .when_some(
@@ -507,8 +726,19 @@ pub fn panel(
             )
     };
 
+    // Unknown profile, the house key, or a signup under way: no field, as
+    // with "Create a Coinos wallet".
+    let address_settable = !state.submitting
+        && !nostr::is_issuer(&pubkey)
+        && view.profile == ProfileRead::Read;
     body.when_some(state.error.clone(), |this, error| {
         this.child(line("wallet-error", error, RED))
+    })
+    .when_some(own, |this, own| {
+        this.when(address_settable, |this| {
+            this.child(address_card(view, own.address, cx))
+        })
+        .child(debts_card(own.debts))
     })
     .into_any_element()
 }
@@ -538,6 +768,22 @@ mod tests {
         assert!(shows_send(Some("a"), "a"));
         assert!(!shows_send(Some("a"), "b"));
         assert!(!shows_send(None, "a"));
+    }
+
+    #[test]
+    fn save_waits_for_a_new_address_and_for_the_running_check() {
+        use super::{AddressCheck, can_save_address};
+        let current = Some("ada@example.com");
+        assert!(can_save_address("bob@example.com", current, None));
+        assert!(!can_save_address("Ada@Example.com ", current, None), "the same address");
+        assert!(!can_save_address(
+            "bob@example.com",
+            current,
+            Some(&AddressCheck::Checking)
+        ));
+        let failed = AddressCheck::Failed("no".into());
+        assert!(can_save_address("bob@example.com", current, Some(&failed)));
+        assert!(can_save_address("ada@example.com", None, Some(&AddressCheck::Checked)));
     }
 
     #[test]

@@ -25,10 +25,12 @@
 
 use std::str::FromStr as _;
 use std::sync::LazyLock;
+use std::time::{Duration, SystemTime};
 
-use lightning_invoice::Bolt11Invoice;
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::diag;
 use crate::secrets::Secret;
@@ -66,6 +68,13 @@ pub enum CoinosError {
     /// let the person decide.
     #[error("Payment status unknown. Check your balance before sending again.")]
     OutcomeUnknown,
+    /// Refused before any payment request leaves, so no sats moved.
+    #[error("The recipient's wallet sent an invoice that already expired.")]
+    InvoiceExpired,
+    /// A zap invoice whose description hash is not the signed zap request:
+    /// paying it could never produce the receipt that proves the payment.
+    #[error("The recipient's wallet sent an invoice that is not tied to this payment.")]
+    InvoiceNotBound,
 }
 
 impl CoinosError {
@@ -364,6 +373,55 @@ pub async fn lnurl_invoice(lightning_address: &str, sats: u64) -> Result<String,
     invoice_of(&domain, &invoice)
 }
 
+/// NIP-57: a pay request that says `allowsNostr` and names the key its zap
+/// receipts are signed with. Bounties only ever pay such a server, because
+/// the receipt is the one proof a payment happened.
+fn sends_receipts(pay: &serde_json::Value) -> bool {
+    pay.get("allowsNostr").and_then(|v| v.as_bool()) == Some(true)
+        && pay
+            .get("nostrPubkey")
+            .and_then(|v| v.as_str())
+            .is_some_and(|key| !key.trim().is_empty())
+}
+
+/// Why a Lightning address cannot take bounty payouts. Fixed wording: the
+/// address is the person's own input and is never echoed.
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum AddressCheckError {
+    #[error("That is not a Lightning address. It looks like name@domain.com.")]
+    BadFormat,
+    #[error("The wallet's server did not answer for this address. Check the spelling and try again.")]
+    NoAnswer,
+    #[error("This wallet does not send payment receipts, so bounties here cannot pay it.")]
+    NoReceipts,
+}
+
+/// What a fetched pay request says about taking bounty payouts: one that
+/// [`lnurl_zap_invoice`] would go on to ask for an invoice.
+fn payout_ready(pay: &serde_json::Value) -> Result<(), AddressCheckError> {
+    if pay.get("tag").and_then(|t| t.as_str()) != Some("payRequest")
+        || callback_of("", pay).is_err()
+    {
+        return Err(AddressCheckError::NoAnswer);
+    }
+    if !sends_receipts(pay) {
+        return Err(AddressCheckError::NoReceipts);
+    }
+    Ok(())
+}
+
+/// Before an address goes on a profile: it parses, its LUD-16 endpoint
+/// answers with a pay request, and that server sends zap receipts. Without
+/// receipts every bounty would refuse to pay it.
+pub async fn check_address(lightning_address: &str) -> Result<(), AddressCheckError> {
+    let (user, domain) =
+        split_address(lightning_address).ok_or(AddressCheckError::BadFormat)?;
+    let pay = lnurl_get(domain, lnurlp_url(user, domain))
+        .await
+        .map_err(|_| AddressCheckError::NoAnswer)?;
+    payout_ready(&pay)
+}
+
 /// NIP-57: the callback with `amount` and the signed zap request as `nostr`,
 /// URL-encoded. `None` when the callback is not a URL.
 fn zap_callback(callback: &str, msat: u64, zap_request_json: &str) -> Option<String> {
@@ -385,7 +443,7 @@ pub async fn lnurl_zap_invoice(
     zap_request_json: &str,
 ) -> Result<String, CoinosError> {
     let (domain, pay) = pay_request(lightning_address, sats).await?;
-    if pay.get("allowsNostr").and_then(|v| v.as_bool()) != Some(true) {
+    if !sends_receipts(&pay) {
         return Err(CoinosError::Recipient(format!(
             "{domain} doesn't take zaps, so the payment would leave no receipt"
         )));
@@ -394,7 +452,42 @@ pub async fn lnurl_zap_invoice(
     let url = zap_callback(callback, sats.saturating_mul(1000), zap_request_json)
         .ok_or_else(|| CoinosError::Recipient(format!("{domain} gave no callback for the invoice")))?;
     let invoice = lnurl_get(&domain, url).await?;
-    invoice_of(&domain, &invoice)
+    let bolt11 = invoice_of(&domain, &invoice)?;
+    let parsed = payable_invoice(&bolt11, sats, now())?;
+    bound_to(&parsed, zap_request_json)?;
+    Ok(bolt11)
+}
+
+/// NIP-57 appendix B: a zap invoice's description hash is the SHA-256 of the
+/// zap request exactly as sent in `nostr=`. Anything else (a plain
+/// description, another hash) means the server will not publish a receipt.
+fn bound_to(invoice: &Bolt11Invoice, zap_request_json: &str) -> Result<(), CoinosError> {
+    match invoice.description() {
+        Bolt11InvoiceDescriptionRef::Hash(hash)
+            if AsRef::<[u8]>::as_ref(&hash.0) == Sha256::digest(zap_request_json.as_bytes()).as_slice() =>
+        {
+            Ok(())
+        }
+        _ => Err(CoinosError::InvoiceNotBound),
+    }
+}
+
+/// Time since the Unix epoch. A clock before 1970 reads as zero, which
+/// expires nothing; coinos still refuses an invoice that really expired.
+fn now() -> Duration {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+/// [`invoice_for`], and not expired at `now`. `now` is passed in so the
+/// check is testable against fixed vectors.
+fn payable_invoice(bolt11: &str, sats: u64, now: Duration) -> Result<Bolt11Invoice, CoinosError> {
+    let invoice = invoice_for(bolt11, sats)?;
+    if invoice.would_expire(now) {
+        return Err(CoinosError::InvoiceExpired);
+    }
+    Ok(invoice)
 }
 
 /// `bolt11` parsed, and its amount checked against what was asked for. The
@@ -426,12 +519,13 @@ const REFUSAL_TEXT_CAP: usize = 200;
 const PAYMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Pay `bolt11` from the wallet `token` opens, after checking the invoice
-/// asks for exactly `sats`. `Ok` once coinos accepted the payment; a 401 is
-/// the token, any other refusal is coinos's own text ("Insufficient funds").
+/// asks for exactly `sats` and has not expired. `Ok` once coinos accepted
+/// the payment; a 401 is the token, any other refusal is coinos's own text
+/// ("Insufficient funds").
 /// `Http` means the request never reached coinos; once it has, no answer is
 /// [`CoinosError::OutcomeUnknown`], never a plain failure.
 pub async fn pay_invoice(token: &Secret, bolt11: &str, sats: u64) -> Result<(), CoinosError> {
-    let invoice = invoice_for(bolt11, sats)?;
+    let invoice = payable_invoice(bolt11, sats, now())?;
     let resp = CLIENT
         .post(format!("{BASE}/api/payments"))
         .bearer_auth(token.expose())
@@ -560,6 +654,46 @@ mod tests {
         ));
     }
 
+    /// BOLT 11's "chocolate cake" vector: 2 000 000 sats, signed 2017-06-01
+    /// with the default one-hour expiry, description hash of this text.
+    const HASHED_BOLT11: &str = "lnbc20m1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqs9qrsgq7ea976txfraylvgzuxs8kgcw23ezlrszfnh8r6qtfpr6cxga50aj6txm9rxrydzd06dfeawfk6swupvz4erwnyutnjq7x39ymw6j38gp7ynn44";
+    const HASHED_TEXT: &str = "One piece of chocolate cake, one icecream cone, one pickle, one slice of swiss cheese, one slice of salami, one lollypop, one piece of cherry pie, one sausage, one cupcake, and one slice of watermelon";
+    const COFFEE_BOLT11: &str = "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q5sqqqqqqqqqqqqqqqpqsq67gye39hfg3zd8rgc80k32tvy9xk2xunwm5lzexnvpx6fd77en8qaq424dxgt56cag2dpt359k3ssyhetktkpqh24jqnjyw6uqd08sgptq44qu";
+
+    #[test]
+    fn an_expired_invoice_is_not_paid() {
+        let signed = Duration::from_secs(1_496_314_658);
+        let in_time = signed + Duration::from_secs(60);
+        let too_late = signed + Duration::from_secs(3601);
+        assert!(payable_invoice(HASHED_BOLT11, 2_000_000, in_time).is_ok());
+        assert!(matches!(
+            payable_invoice(HASHED_BOLT11, 2_000_000, too_late),
+            Err(CoinosError::InvoiceExpired)
+        ));
+        // The amount is still checked first.
+        assert!(matches!(
+            payable_invoice(HASHED_BOLT11, 21, in_time),
+            Err(CoinosError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn a_zap_invoice_must_hash_the_zap_request() {
+        let hashed = invoice_for(HASHED_BOLT11, 2_000_000).expect("vector parses");
+        assert!(bound_to(&hashed, HASHED_TEXT).is_ok());
+        // One byte different from what was sent: another request's invoice.
+        assert!(matches!(
+            bound_to(&hashed, &format!("{HASHED_TEXT} ")),
+            Err(CoinosError::InvoiceNotBound)
+        ));
+        // A plain description binds nothing, even if it reads like the request.
+        let plain = invoice_for(COFFEE_BOLT11, 2_500_000).expect("vector parses");
+        assert!(matches!(
+            bound_to(&plain, "coffee beans"),
+            Err(CoinosError::InvoiceNotBound)
+        ));
+    }
+
     #[test]
     fn a_payment_5xx_is_outcome_unknown_and_a_4xx_is_a_refusal() {
         use reqwest::StatusCode;
@@ -636,5 +770,47 @@ mod tests {
         assert!(!Login::fresh().has_token(), "a login saved before register has no token yet");
         // Every field is required: a partial entry is unreadable, not half a login.
         assert!(serde_json::from_str::<Login>(r#"{"username":"x","password":"y"}"#).is_err());
+    }
+
+    #[test]
+    fn a_payout_address_must_send_zap_receipts() {
+        let pay = |extra: serde_json::Value| {
+            let mut pay = serde_json::json!({
+                "tag": "payRequest",
+                "callback": "https://example.com/lnurlp/ada/callback",
+                "minSendable": 1000,
+                "maxSendable": 100_000_000,
+            });
+            if let (Some(pay), Some(extra)) = (pay.as_object_mut(), extra.as_object()) {
+                pay.extend(extra.clone());
+            }
+            pay
+        };
+        let key = "aa".repeat(32);
+        assert_eq!(
+            payout_ready(&pay(serde_json::json!({"allowsNostr": true, "nostrPubkey": key}))),
+            Ok(())
+        );
+        for no_receipts in [
+            serde_json::json!({}),
+            serde_json::json!({"allowsNostr": false, "nostrPubkey": key}),
+            serde_json::json!({"allowsNostr": "true", "nostrPubkey": key}),
+            serde_json::json!({"allowsNostr": true}),
+            serde_json::json!({"allowsNostr": true, "nostrPubkey": " "}),
+        ] {
+            assert_eq!(
+                payout_ready(&pay(no_receipts.clone())),
+                Err(AddressCheckError::NoReceipts),
+                "{no_receipts}"
+            );
+        }
+        // Not a pay request, or one with nowhere to ask for an invoice.
+        let zaps = serde_json::json!({"allowsNostr": true, "nostrPubkey": key});
+        let mut withdraw = pay(zaps.clone());
+        withdraw["tag"] = "withdrawRequest".into();
+        assert_eq!(payout_ready(&withdraw), Err(AddressCheckError::NoAnswer));
+        let mut plain_http = pay(zaps);
+        plain_http["callback"] = "http://example.com/cb".into();
+        assert_eq!(payout_ready(&plain_http), Err(AddressCheckError::NoAnswer));
     }
 }

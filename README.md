@@ -84,6 +84,21 @@ MC_E2E_PAYER_TOKEN=$(jq -r '.accounts[0].coinos.token' ~/Library/Application\ Su
 Without it the test prints A's address and waits for a phone wallet
 (`MC_E2E_ZAP_WAIT_SECS`, default 600).
 
+The second ignored test checks that the issuer's auto-pay can pay a claimant
+whose Lightning address is not on coinos, and that the zap receipt from that
+provider reaches the instance relay. It spends 10 real sats and needs
+`MC_E2E_ISSUER_NSEC` (whose trust scores rank the claimant at least 2),
+`MC_E2E_PAYER_TOKEN` (the issuer's funded coinos wallet),
+`MC_E2E_CLAIMANT_NSEC` and `MC_E2E_EXTERNAL_LUD16` (the claimant's address on
+a provider that sends zap receipts):
+
+```sh
+mbx nextest run --run-ignored only --no-capture -E 'binary(e2e) and test(issuer_pays_a_claimant_on_another_lightning_provider)'
+```
+
+Run one test at a time: `-E 'binary(e2e)'` alone runs both, and the second
+stops before spending anything when its variables are missing.
+
 ## What is here
 
 Two halves. `src/lib.rs` is the protocol layer, free of gpui so it runs on its

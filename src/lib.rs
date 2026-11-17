@@ -17,6 +17,7 @@ pub mod brainstorm;
 pub mod coinos;
 pub mod diag;
 pub mod events;
+pub mod ledger;
 pub mod nostr;
 pub mod secrets;
 pub mod timefmt;
