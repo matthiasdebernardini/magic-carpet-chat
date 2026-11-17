@@ -14,7 +14,7 @@ use futures::channel::mpsc;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::component::{
-    Root, TitleBar, WindowExt as _, h_flex, notification::Notification,
+    TitleBar, WindowExt as _, h_flex, notification::Notification,
     input::{Input, InputEvent, InputState, MoveDown, MoveUp},
     v_flex,
 };
@@ -4209,7 +4209,7 @@ fn parse_sats(value: &str) -> Option<u64> {
 }
 
 impl Render for Shell {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The root of the window's views: everything labelled this frame is
         // recorded after this, the chat pane included.
         crate::a11y::begin_frame();
@@ -4281,8 +4281,6 @@ impl Render for Shell {
                 ),
             )
             .child(body)
-            // Toasts live in Root; the view has to draw the layer.
-            .children(Root::render_notification_layer(window, cx))
     }
 }
 
@@ -4798,11 +4796,11 @@ mod tests {
             .iter()
             .map(|b| {
                 (
-                    // gpui prints the platform modifier under its local name:
-                    // "cmd" on macOS, "super" on Linux. The table says "cmd".
+                    // The table says "cmd", so the platform modifier is
+                    // printed in its Mac spelling on every host.
                     b.keystrokes()
                         .iter()
-                        .map(|k| k.inner().unparse().replace("super-", "cmd-"))
+                        .map(|k| k.inner().unparse(gpui_kit::OperatingSystem::Mac))
                         .collect::<Vec<_>>()
                         .join(" "),
                     b.action().name().to_string(),

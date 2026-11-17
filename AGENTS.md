@@ -1,6 +1,6 @@
 # magic-carpet-chat — notes for coding agents
 
-Desktop client for a Magic Carpet Nostr bounty instance: one window on gpui-kit 0.6.0. The full map is `docs/SYSTEM.md` (generated) and `docs/atlas.html`. `CLAUDE.md` imports this file. Edit this one.
+Desktop client for a Magic Carpet Nostr bounty instance: one window on gpui-kit 0.9.1. The full map is `docs/SYSTEM.md` (generated) and `docs/atlas.html`. `CLAUDE.md` imports this file. Edit this one.
 
 ## This repo is PUBLIC
 

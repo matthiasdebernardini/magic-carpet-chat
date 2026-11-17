@@ -14,7 +14,7 @@ Magic Carpet Chat is a macOS desktop app, one window on gpui-kit, for a Nostr bo
 |---|---|---|
 | Executor | Nostr, instance and Coinos work runs on a dedicated tokio thread; the window awaits only two futures channels. gpui's executor is not tokio and a tokio future polled there aborts the process. The Chat pane is the one exception: it polls its SSE body on gpui's executor, which is why only ReqwestClient::user_agent may be used. | src/nostr.rs:3-6, src/main.rs:73-80, src/chat.rs:150-152 |
 | TLS | rustls's ring provider is installed before any client exists, because gpui-kit and reqwest pull ring and aws-lc-rs both and rustls refuses to guess. | src/nostr.rs:264-269 |
-| UI stack | One crates.io dependency, gpui-kit 0.6.0, plus the reqwest client it does not re-export. Cargo refusing two gpui-pre versions is the safety net. | Cargo.toml:8-13 |
+| UI stack | One crates.io dependency, gpui-kit 0.9.1, plus the reqwest client it does not re-export. Cargo refusing two gpui-pre versions is the safety net. | Cargo.toml:8-13 |
 | Publish door | DLists and claims leave through POST /api/strfry/publish, never a relay socket; an event sent to public relays never reaches the bounty machinery. The kind-0 profile update goes through the door first and then to three public relays. | src/api.rs:523-526, src/nostr.rs:665-684 |
 | Receipt truth | A kind-9735 pushed by the relay only triggers an early poll. A receipt is a fact only when the server returns it in claims[].zapReceipt, because only the server knows the delegate key. | src/nostr.rs:1062-1068 |
 | Profile write | The kind-0 is merged field by field and only lud16 changes. A profile rebuilt from nothing would wipe the name and picture on every relay that accepts it. | src/nostr.rs:613-622 |
@@ -608,11 +608,11 @@ No cost model to plan. The chat pane bills the owner's Anthropic key per turn an
 
 #### PK · Plumbing and packaging
 
-**In one line.** gpui-kit 0.6.0, the palette from the design mock, eleven copied SVG icons, UTC time formatting, and an unsigned .app bundle.
+**In one line.** gpui-kit 0.9.1, the palette from the design mock, eleven copied SVG icons, UTC time formatting, and an unsigned .app bundle.
 
 **What it does.** The whole UI is one crates.io dependency plus the HTTP client it does not re-export. Every colour is a hex value copied from the mock; only gpui-component's own controls are repainted through the theme. Times print in UTC. make-app.sh wraps the release binary and writes a READ ME FIRST for Gatekeeper.
 
-**How it's built.** `Cargo.toml`: gpui-kit 0.6.0, gpui-pre-reqwest-client 0.3.4, nostr-sdk 0.45, tokio, reqwest with rustls, keyring 4, lightning-invoice, bech32, qrcode without default features, sha2, unicode-normalization. `palette::apply` overwrites fifteen theme colours and two radii after `Theme::change(Dark)`. `icons::Assets` serves `icons/mc/name.svg` from an include_bytes table and falls through to gpui-kit's lucide set. `timefmt`: HH:MM:SS UTC, relative ages, thousands-grouped sats. `scripts/make-app.sh`: bundle id world.MagicCarpet.magic-carpet-chat, macOS 12 minimum, unsigned; both dist/ and dist-live/ hold a bundle. Thirty-nine unit tests across seven modules; the worker has only tsc.
+**How it's built.** `Cargo.toml`: gpui-kit 0.9.1, gpui-pre-reqwest-client 0.3.12, nostr-sdk 0.45, tokio, reqwest with rustls, keyring 4, lightning-invoice, bech32, qrcode without default features, sha2, unicode-normalization. `palette::apply` overwrites fifteen theme colours and two radii after `Theme::change(Dark)`. `icons::Assets` serves `icons/mc/name.svg` from an include_bytes table and falls through to gpui-kit's lucide set. `timefmt`: HH:MM:SS UTC, relative ages, thousands-grouped sats. `scripts/make-app.sh`: bundle id world.MagicCarpet.magic-carpet-chat, macOS 12 minimum, unsigned; both dist/ and dist-live/ hold a bundle. Thirty-nine unit tests across seven modules; the worker has only tsc.
 
 **Steps in execution.**
 

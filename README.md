@@ -30,7 +30,7 @@ The Chat pane reads an Anthropic key from `~/.config/anthropic/key` or
 
 ## Dependencies
 
-The UI stack is one crates.io dependency, `gpui-kit` 0.6.0. It bundles gpui
+The UI stack is one crates.io dependency, `gpui-kit` 0.9.1. It bundles gpui
 (published as the `gpui-pre-*` crates), the platform layer, gpui-base,
 gpui-component and the icon assets at matching versions. The only other UI
 crate is `gpui-pre-reqwest-client`, the HTTP client gpui-kit does not
