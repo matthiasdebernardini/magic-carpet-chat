@@ -341,6 +341,10 @@ pub struct Claim {
     /// (rank, Lightning address, wallet, attempt). Never from the server.
     #[serde(skip)]
     pub unpaid_reason: Option<String>,
+    /// The claim's address when its issuer, stored here, may pay it by hand
+    /// now (a manual bounty whose rules pay it). Worked out by this app.
+    #[serde(skip)]
+    pub hand_pay: Option<String>,
 }
 
 impl Claim {
@@ -369,6 +373,7 @@ impl Claim {
             payment_amount_sats: None,
             auto_pay_blocked_reason: None,
             unpaid_reason: None,
+            hand_pay: None,
         }
     }
 }

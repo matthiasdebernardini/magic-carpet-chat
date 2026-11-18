@@ -11,6 +11,7 @@
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::component::{h_flex, input::{Input, Paste}, v_flex};
+use nostr_sdk::prelude::{PublicKey, ToBech32 as _};
 
 use magic_carpet_chat::api::{Bounty, Claim};
 use magic_carpet_chat::bounty_search::coordinate_dtag;
@@ -21,6 +22,7 @@ use crate::dashboard::{MONO, count_badge};
 use crate::palette::*;
 use crate::shell::{
     BOUNTY_FIELD_DEFS, BountyTab, F_CRITERIA, Load, RANK_NOTE, Screen, Shell, form_locked, opens_claim, short_id,
+    short_npub,
 };
 use crate::timefmt;
 
@@ -482,8 +484,123 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
 
 // ----------------------------------------------------------------- detail
 
-fn claim_card(claim: &Claim) -> AnyElement {
+/// The hand-pay button on a claim card ([`Shell::pay_control`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayControl {
+    /// Not the issuer's to pay by hand here, or not payable now.
+    None,
+    Ready,
+    /// The first click landed; the next one pays.
+    Armed,
+    /// `PayClaim` went out; the snapshot has not caught up yet.
+    Sending,
+}
+
+/// Under an armed "Pay": the app cannot see a payment made another way.
+const PAY_NOTE: &str =
+    "The app only knows payments made with this button. If you already paid this claim another way, don't pay again.";
+
+/// The hand-pay row of a claim card: the button (or its sending line),
+/// then the last refusal.
+fn pay_rows(
+    cid: &str,
+    bounty: &Bounty,
+    claim: &Claim,
+    pay: PayControl,
+    refusal: Option<String>,
+    cx: &mut Context<Shell>,
+) -> Vec<AnyElement> {
+    let sats = timefmt::fmt_sats(bounty.amount_sats);
+    let to = PublicKey::from_hex(&claim.event.pubkey)
+        .ok()
+        .and_then(|key| key.to_bech32().ok())
+        .map(|npub| short_npub(&npub))
+        .unwrap_or_else(|| short_id(&claim.event.pubkey));
+    let mut rows = Vec::new();
+    match (pay, claim.hand_pay.clone()) {
+        (PayControl::Sending, _) => {
+            let text = "Sending payment…";
+            rows.push(
+                div()
+                    .a11y(format!("{cid}-pay-sending"), Role::Label, text)
+                    .mt(px(6.))
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(text)
+                    .into_any_element(),
+            );
+        }
+        (PayControl::Ready | PayControl::Armed, Some(address)) => {
+            let armed = pay == PayControl::Armed;
+            let label = if armed {
+                format!("Click again to pay {sats} sats to {to}")
+            } else {
+                format!("Pay {sats} sats")
+            };
+            let bounty_id = bounty.id.clone();
+            let event_id = claim.event.id.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("{cid}-pay")))
+                    .a11y(format!("{cid}-pay"), Role::Button, label.clone())
+                    .self_start()
+                    .mt(px(6.))
+                    .px(px(12.))
+                    .py(px(5.))
+                    .rounded(px(7.))
+                    .border_1()
+                    .border_color(rgb(if armed { AMBER } else { BORDER_3 }))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(if armed { AMBER } else { ACCENT_LIGHT }))
+                    .child(SharedString::from(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pay_claim(bounty_id.clone(), address.clone(), event_id.clone(), cx)
+                    }))
+                    .into_any_element(),
+            );
+            if armed {
+                // The app sees only its own payments: one made in the Wallet,
+                // in Coinos or on another machine still reads unpaid here.
+                let note = PAY_NOTE;
+                rows.push(
+                    div()
+                        .a11y(format!("{cid}-pay-note"), Role::Label, note)
+                        .mt(px(4.))
+                        .text_size(px(12.))
+                        .text_color(rgb(AMBER))
+                        .child(note)
+                        .into_any_element(),
+                );
+            }
+        }
+        _ => {}
+    }
+    if let Some(message) = refusal {
+        rows.push(
+            div()
+                .a11y(format!("{cid}-pay-refused"), Role::Label, message.clone())
+                .mt(px(4.))
+                .text_size(px(12.))
+                .text_color(rgb(RED))
+                .child(SharedString::from(message))
+                .into_any_element(),
+        );
+    }
+    rows
+}
+
+fn claim_card(
+    bounty: &Bounty,
+    claim: &Claim,
+    pay: PayControl,
+    refusal: Option<String>,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
     let cid = format!("claim-{}", claim.event.id);
+    // A manual bounty's attempts are the issuer's clicks, not auto-pay's.
+    let manual = !bounty.auto_pay_on();
     let now = timefmt::now_unix();
     let claim_ts = claim.event.created_at.unwrap_or(0);
     let mut rows: Vec<AnyElement> = vec![timeline_row(
@@ -521,7 +638,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
                     rows.push(timeline_row(
                         format!("{cid}-attempted"),
                         ACCENT,
-                        "Auto-pay attempted".into(),
+                        if manual { "Payment attempted" } else { "Auto-pay attempted" }.into(),
                         Some(format!(
                             "{} UTC · {}",
                             timefmt::hhmmss_utc(started),
@@ -551,10 +668,12 @@ fn claim_card(claim: &Claim) -> AnyElement {
                 .map(|r| format!(" ({r})"))
                 .unwrap_or_default();
             let (dot, text) = match row.state.as_str() {
+                "attempting" if manual => (ACCENT, "Paying…".to_string()),
                 "attempting" => (ACCENT, "Auto-pay attempting…".to_string()),
                 "paid" => (AMBER, "Paid, waiting for the zap receipt".to_string()),
                 "settled" => (GREEN, "Payment settled".to_string()),
                 "paid_unreceipted" => (AMBER, format!("Paid, no receipt{why}")),
+                "failed" if manual => (RED, format!("Payment failed{why}")),
                 "failed" => (RED, format!("Auto-pay failed{why}")),
                 other => (TEXT_MUTED, format!("Payment status: {other}{why}")),
             };
@@ -589,6 +708,8 @@ fn claim_card(claim: &Claim) -> AnyElement {
             Some(format!("{amount}{secs} s after the claim")),
         ));
     }
+
+    rows.extend(pay_rows(&cid, bounty, claim, pay, refusal, cx));
 
     let item = claim.item_name().to_string();
     let by = format!("by {}", short_id(&claim.event.pubkey));
@@ -741,7 +862,15 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .child("No claims yet.")
                 .into_any_element(),
         ],
-        Some(detail) => detail.claims.iter().map(claim_card).collect(),
+        Some(detail) => detail
+            .claims
+            .iter()
+            .map(|claim| {
+                let pay = shell.pay_control(bounty, claim);
+                let refusal = shell.pay_refusal(&bounty.id, claim);
+                claim_card(bounty, claim, pay, refusal, cx)
+            })
+            .collect(),
     };
     let claim_count = detail.map(|d| d.claims.len()).unwrap_or(0);
 

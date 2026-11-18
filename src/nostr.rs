@@ -246,6 +246,15 @@ pub enum Command {
         to: String,
         sats: u64,
     },
+    /// Pay one claim by hand on `pubkey`'s own manual bounty (no auto-pay
+    /// setting here, not paid by the server), through the auto-pay path: the
+    /// attempt is recorded before anything is sent, so a second click never
+    /// pays twice. Emits `PaymentState`s as it goes, or `PayClaimRefused`.
+    PayClaim {
+        pubkey: String,
+        bounty_id: String,
+        claim_address: String,
+    },
     /// Follow one bounty: receipts by `#e` on the relay, plus the API's
     /// payment state machine while a claim is pending. Idempotent — a bounty
     /// already being watched is left alone. At most one bounty is watched at
@@ -485,6 +494,12 @@ pub enum Update {
         pubkey: String,
         message: String,
         may_have_paid: bool,
+    },
+    /// A `PayClaim` that sent nothing, and why, in fixed wording.
+    PayClaimRefused {
+        bounty_id: String,
+        claim_address: String,
+        message: String,
     },
     /// One finished piece of a `FetchTrust` — five of these arrive per fetch,
     /// each the moment its read completes rather than all at the end.
@@ -901,6 +916,20 @@ async fn run(
                 let failures = balance_failures.clone();
                 let updates = updates.clone();
                 tokio::spawn(send_sats(pubkey, to, sats, failures, updates));
+            }
+            Command::PayClaim {
+                pubkey,
+                bounty_id,
+                claim_address,
+            } => {
+                tokio::spawn(pay_claim_by_hand(
+                    client.clone(),
+                    ctx.clone(),
+                    pubkey,
+                    bounty_id,
+                    claim_address,
+                    updates.clone(),
+                ));
             }
             Command::PublishDList {
                 pubkey,
@@ -2796,12 +2825,14 @@ fn attempt_row(
     }
 }
 
-/// The `(issuer, claimant)` pairs a decision needs a rank for: unpaid,
-/// unattempted claims by anyone but the issuer.
+/// The `(issuer, claimant)` pairs a decision needs a rank for: unpaid
+/// claims by anyone but the issuer, unattempted or failed ([`owed_plan`]
+/// plans a failed one as unattempted, and a hand payment may retry it).
 fn rank_pairs(issuer: &str, facts: &[ClaimFacts]) -> Vec<(String, String)> {
     facts
         .iter()
-        .filter(|f| f.claimant != issuer && !f.paid && f.attempt.is_none())
+        .filter(|f| f.claimant != issuer && !f.paid)
+        .filter(|f| f.attempt.is_none_or(|a| a == AttemptState::Failed))
         .map(|f| (issuer.to_string(), f.claimant.clone()))
         .collect()
 }
@@ -2918,11 +2949,42 @@ where
     let policy = app_policy(&detail.bounty, setting.as_ref(), issuer_here);
     let decisions: HashMap<String, Result<(), Hold>> =
         autopay::plan(&policy, &facts).into_iter().collect();
+    // A manual bounty's claims all read "auto-pay off" in `decisions`; the
+    // ones the rules would hold back say which rule instead.
+    let owed = (!policy.auto_pay).then(|| owed_plan(&policy, &facts));
+    // The ledger's rule too: a closed bounty pays nothing more.
+    let closed = !app_may_be_open(&detail.bounty, now);
     for claim in &mut claims {
         let Some(fact) = facts.iter().find(|f| f.event_id == claim.event.id) else {
             continue;
         };
+        claim.hand_pay = hand_pay_check(&issuer, &detail.bounty, &policy, &facts, &fact.address, now)
+            .is_ok()
+            .then(|| fact.address.clone());
+        let held_by_rule = owed
+            .as_ref()
+            .and_then(|owed| owed.get(&fact.address))
+            .and_then(|decision| match decision {
+                Err(hold @ (Hold::NoSlots | Hold::OverLimit | Hold::RankTooLow { .. })) => Some(*hold),
+                _ => None,
+            });
         claim.unpaid_reason = match decisions.get(&fact.address) {
+            Some(Err(Hold::AutoPayOff | Hold::Attempted(AttemptState::Failed))) if held_by_rule.is_some() => {
+                held_by_rule.and_then(|hold| hold.describe())
+            }
+            Some(Err(Hold::AutoPayOff) | Ok(())) if closed => Some(HAND_CLOSED.to_string()),
+            Some(Err(Hold::Attempted(AttemptState::Failed))) if closed && !policy.auto_pay => {
+                Some(HAND_CLOSED.to_string())
+            }
+            Some(Err(Hold::Attempted(AttemptState::Failed))) if claim.hand_pay.is_some() => {
+                let why = attempts
+                    .iter()
+                    .find(|a| a.bounty_id == detail.bounty.id && a.claim_address == fact.address)
+                    .and_then(|a| a.reason.as_deref())
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
+                Some(format!("The last payment failed{why}. No sats moved, so it can be paid again."))
+            }
             Some(Err(Hold::Attempted(AttemptState::Sending)))
                 if claim.auto_payment.as_ref().is_some_and(|r| r.state == "attempting") =>
             {
@@ -3165,13 +3227,9 @@ where
             continue;
         }
         set_ranks(&bounty.issuer_pubkey, &mut c.facts, &ranks);
-        let mut policy = app_policy(bounty, setting_of(store, bounty), c.issuer_here);
-        // `decide` stops at "auto-pay off" before the cap, the per-account
-        // limit and the rank; Not payable comes before Owed, so the ledger
-        // plans a manual bounty as if auto-pay were on.
+        let policy = app_policy(bounty, setting_of(store, bounty), c.issuer_here);
         c.manual = !policy.auto_pay;
-        policy.auto_pay = true;
-        c.decisions = ledger::plan(&policy, &c.facts).into_iter().collect();
+        c.decisions = owed_plan(&policy, &c.facts);
     }
 
     // The Lightning-address hint, once per claimant whose payable claim
@@ -3223,7 +3281,9 @@ where
                 fact,
                 decision,
                 attempt_fresh: attempt.is_some_and(|a| attempt_fresh(a, now)),
-                bounty_expired: ended(bounty, now),
+                // The card's rule (`annotate_with`): a closed bounty is over
+                // too, not only an expired one.
+                bounty_expired: !app_may_be_open(bounty, now),
                 note: note.as_deref(),
             });
             let paid_at = receipts
@@ -3395,12 +3455,8 @@ async fn autopay_tick(client: &Client, ctx: &AutoPayCtx, updates: &mpsc::Unbound
             let Some(ix) = facts.iter().position(|f| f.address == address) else {
                 break;
             };
-            let paid: Vec<(String, String)> = facts
-                .iter()
-                .filter(|f| f.paid)
-                .map(|f| (f.address.clone(), f.claimant.clone()))
-                .collect();
-            match pay_claim(ctx, &api, &bounty, &facts[ix], paid, updates).await {
+            let paid = paid_pairs(&facts);
+            match pay_claim(ctx, &api, &bounty, &facts[ix], paid, secrets::Existing::Refuse, updates).await {
                 PayOutcome::Decided(state) => facts[ix].attempt = Some(state),
                 PayOutcome::Retry => {
                     facts.remove(ix);
@@ -3411,6 +3467,16 @@ async fn autopay_tick(client: &Client, ctx: &AutoPayCtx, updates: &mpsc::Unbound
             }
         }
     }
+}
+
+/// `(address, claimant)` of every claim a verified receipt pays: the store's
+/// slot recheck counts them with its own attempts.
+fn paid_pairs(facts: &[ClaimFacts]) -> Vec<(String, String)> {
+    facts
+        .iter()
+        .filter(|f| f.paid)
+        .map(|f| (f.address.clone(), f.claimant.clone()))
+        .collect()
 }
 
 /// What one [`pay_claim`] came to.
@@ -3430,11 +3496,13 @@ enum PayOutcome {
 /// leaks nothing. `invoice` signs the request and fetches the bolt11; when
 /// it fails, no payment request was made, so the attempt is taken back and
 /// the claim tried again next tick. `Ok` carries the invoice to pay.
+/// `existing` is what the store does with an earlier attempt on the claim.
 async fn record_then_invoice<F, Fut>(
     ctx: &AutoPayCtx,
     issuer: &str,
     attempt: secrets::PayAttempt,
     limits: &secrets::SlotLimits,
+    existing: secrets::Existing,
     invoice: F,
 ) -> Result<String, PayOutcome>
 where
@@ -3442,7 +3510,7 @@ where
     Fut: std::future::Future<Output = Result<String, String>>,
 {
     let (bounty_id, address) = (attempt.bounty_id.clone(), attempt.claim_address.clone());
-    match secrets::begin_attempt_within(issuer, attempt, Some(limits)) {
+    match secrets::begin_attempt_within(issuer, attempt, Some(limits), existing) {
         Ok(secrets::Begin::Recorded) => {}
         Ok(secrets::Begin::Exists) => return Err(PayOutcome::Decided(AttemptState::Sending)),
         Ok(secrets::Begin::NoSlots) => {
@@ -3475,12 +3543,15 @@ where
 /// Then [`record_then_invoice`]: the attempt is recorded under the store's
 /// limit recheck, and only then is the zap request signed and the invoice
 /// fetched. Then the payment goes out, and its end state is recorded.
+/// `existing`: auto-pay passes [`secrets::Existing::Refuse`] (it never
+/// retries); a payment by hand may replace a failed attempt.
 async fn pay_claim(
     ctx: &AutoPayCtx,
     api: &Api,
     bounty: &Bounty,
     claim: &ClaimFacts,
     paid: Vec<(String, String)>,
+    existing: secrets::Existing,
     updates: &mpsc::UnboundedSender<Update>,
 ) -> PayOutcome {
     let issuer = &bounty.issuer_pubkey;
@@ -3495,7 +3566,7 @@ async fn pay_claim(
             return PayOutcome::Retry;
         }
         Err(()) => {
-            ctx.note(&claim.address, "Couldn't read the claimant's profile. Trying again shortly.");
+            ctx.note(&claim.address, PROFILE_UNREAD);
             return PayOutcome::Retry;
         }
     };
@@ -3559,7 +3630,7 @@ async fn pay_claim(
             .await
             .map_err(|e| e.to_string())
     };
-    let bolt11 = match record_then_invoice(ctx, issuer, attempt, &limits, invoice).await {
+    let bolt11 = match record_then_invoice(ctx, issuer, attempt, &limits, existing, invoice).await {
         Ok(bolt11) => bolt11,
         Err(outcome) => return outcome,
     };
@@ -3599,6 +3670,180 @@ async fn pay_claim(
         reason,
     );
     PayOutcome::Decided(state)
+}
+
+// ─── Paying one claim by hand ──────────────────────────────────────────────
+// A bounty with no auto-pay setting here, whose issuer is stored here, is
+// paid by hand: the issuer picks a claim the rules allow and it goes through
+// `pay_claim`, the same path the auto-pay loop takes.
+
+const PROFILE_UNREAD: &str = "Couldn't read the claimant's profile. Trying again shortly.";
+const HAND_PROFILE_UNREAD: &str = "Couldn't read the claimant's profile. Try again.";
+const HAND_NOT_ISSUER: &str = "Only the issuer can pay this claim.";
+const HAND_AUTOMATIC: &str = "This bounty pays automatically.";
+const HAND_CLOSED: &str = "This bounty is closed or has expired.";
+const HAND_NO_CLAIM: &str = "This claim is no longer on the relay.";
+const HAND_TAKEN: &str = "This claim was already paid or is being paid.";
+const HAND_OWN: &str = "The issuer's own claim is not paid.";
+const HAND_NO_SLOTS: &str = "No reward slots left on this bounty.";
+const HAND_OVER_LIMIT: &str = "This account already has the most rewards one account can get here.";
+const HAND_RANK: &str = "The claimant's rank is below this bounty's minimum.";
+const HAND_UNREAD_BOUNTY: &str = "Couldn't read the bounty. Try again.";
+const HAND_NOT_STARTED: &str = "The payment didn't start. Try again.";
+
+/// The plan an app-paid bounty's claims are owed by: as if auto-pay were on.
+/// `decide` stops at "auto-pay off" before the cap, the per-account limit
+/// and the rank, so a manual bounty is planned with it on; failed attempts
+/// plan as unattempted ([`ledger::plan`]). The ledger's "Owed, manual pay"
+/// rows and [`hand_pay_check`] both read this, so they never disagree.
+fn owed_plan(policy: &Policy, facts: &[ClaimFacts]) -> HashMap<String, Result<(), Hold>> {
+    let policy = Policy {
+        auto_pay: true,
+        ..policy.clone()
+    };
+    ledger::plan(&policy, facts).into_iter().collect()
+}
+
+/// Whether `payer` may pay the claim at `address` by hand now: it is the
+/// issuer, the bounty is manual (`app_policy` turns auto-pay on for an
+/// issuer not stored here, whose own app may be paying), open, the claim
+/// has no receipt and no attempt but a failed one (no sats moved, and a
+/// person asks again), and [`owed_plan`] pays it.
+fn hand_pay_check(
+    payer: &str,
+    bounty: &Bounty,
+    policy: &Policy,
+    facts: &[ClaimFacts],
+    address: &str,
+    now: u64,
+) -> Result<(), &'static str> {
+    if bounty.issuer_pubkey != payer {
+        return Err(HAND_NOT_ISSUER);
+    }
+    if bounty.server_auto_pay_on() || policy.auto_pay {
+        return Err(HAND_AUTOMATIC);
+    }
+    if !app_may_be_open(bounty, now) {
+        return Err(HAND_CLOSED);
+    }
+    let Some(fact) = facts.iter().find(|f| f.address == address) else {
+        return Err(HAND_NO_CLAIM);
+    };
+    match (fact.paid, fact.attempt) {
+        (false, None | Some(AttemptState::Failed)) => {}
+        _ => return Err(HAND_TAKEN),
+    }
+    match owed_plan(policy, facts).get(address) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(Hold::OwnClaim)) => Err(HAND_OWN),
+        Some(Err(Hold::NoSlots)) => Err(HAND_NO_SLOTS),
+        Some(Err(Hold::OverLimit)) => Err(HAND_OVER_LIMIT),
+        Some(Err(Hold::RankTooLow { .. })) => Err(HAND_RANK),
+        _ => Err(HAND_TAKEN),
+    }
+}
+
+/// [`Command::PayClaim`]: read the bounty, then [`hand_pay_with`] through
+/// [`annotate`] and [`pay_claim`]. A refusal is one `PayClaimRefused`.
+async fn pay_claim_by_hand(
+    client: Client,
+    ctx: AutoPayCtx,
+    pubkey: String,
+    bounty_id: String,
+    claim_address: String,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let result = match Api::new() {
+        Err(_) => Err(HAND_UNREAD_BOUNTY.to_string()),
+        Ok(api) => match api.get_bounty(&bounty_id).await {
+            Err(_) => Err(HAND_UNREAD_BOUNTY.to_string()),
+            Ok(detail) => {
+                let (ctx, client, api, sink) = (&ctx, &client, &api, &updates);
+                hand_pay_with(
+                    ctx,
+                    &pubkey,
+                    &claim_address,
+                    detail,
+                    |detail| annotate(ctx, client, detail),
+                    |bounty, fact, paid| async move {
+                        pay_claim(ctx, api, &bounty, &fact, paid, secrets::Existing::ReplaceFailed, sink).await
+                    },
+                )
+                .await
+            }
+        },
+    };
+    if let Err(message) = result {
+        let _ = updates.unbounded_send(Update::PayClaimRefused {
+            bounty_id,
+            claim_address,
+            message,
+        });
+    }
+}
+
+/// [`pay_claim_by_hand`] past the bounty read, with the fact gathering and
+/// the payment passed in, so its gates run offline. `Ok` once `pay` sent
+/// the payment (its `PaymentState`s say how it went).
+async fn hand_pay_with<A, AFut, P, PFut>(
+    ctx: &AutoPayCtx,
+    payer: &str,
+    address: &str,
+    detail: BountyDetail,
+    annotate: A,
+    pay: P,
+) -> Result<(), String>
+where
+    A: FnOnce(BountyDetail) -> AFut,
+    AFut: std::future::Future<Output = Annotated>,
+    P: FnOnce(Bounty, ClaimFacts, Vec<(String, String)>) -> PFut,
+    PFut: std::future::Future<Output = PayOutcome>,
+{
+    let store = secrets::load().map_err(|e| e.to_string())?;
+    if detail.bounty.issuer_pubkey != payer || !store.accounts.iter().any(|a| a.pubkey == payer) {
+        return Err(HAND_NOT_ISSUER.to_string());
+    }
+    if detail.bounty.server_auto_pay_on() {
+        return Err(HAND_AUTOMATIC.to_string());
+    }
+    let annotated = annotate(detail).await;
+    let Some(policy) = annotated.policy else {
+        return Err(LEDGER_RELAY_UNREAD.to_string());
+    };
+    let bounty = annotated.detail.bounty;
+    hand_pay_check(payer, &bounty, &policy, &annotated.facts, address, now_unix())?;
+    let paid = paid_pairs(&annotated.facts);
+    let Some(fact) = annotated.facts.into_iter().find(|f| f.address == address) else {
+        return Err(HAND_NO_CLAIM.to_string());
+    };
+    // A note left from an earlier try would read as this one's answer.
+    ctx.clear_note(address);
+    let outcome = pay(bounty, fact, paid).await;
+    hand_pay_answer(ctx, address, outcome)
+}
+
+/// What a hand payment's [`PayOutcome`] tells the issuer. `pay_claim`
+/// leaves a note whenever it stops before sending (and the auto-pay loop
+/// retries next tick); a manual bounty has no next tick, so the note is
+/// said once, here, and dropped.
+fn hand_pay_answer(ctx: &AutoPayCtx, address: &str, outcome: PayOutcome) -> Result<(), String> {
+    let note = ctx.note_for(address);
+    ctx.clear_note(address);
+    match outcome {
+        // `Begin::Exists`: another click, or another instance, recorded an
+        // attempt first. `pay_claim` never finishes one as sending.
+        PayOutcome::Decided(AttemptState::Sending) => Err(HAND_TAKEN.to_string()),
+        // Sent: the PaymentStates carry the rest.
+        PayOutcome::Decided(AttemptState::Paid | AttemptState::Unknown) => Ok(()),
+        // The store's per-account recheck leaves a note; a refused payment
+        // does not (its PaymentState says "failed").
+        PayOutcome::Decided(AttemptState::Failed) => note.map_or(Ok(()), Err),
+        PayOutcome::Retry | PayOutcome::Full => Err(match note {
+            Some(note) if note == PROFILE_UNREAD => HAND_PROFILE_UNREAD.to_string(),
+            Some(note) => note,
+            None => HAND_NOT_STARTED.to_string(),
+        }),
+    }
 }
 
 /// Poll the relay's real status so the UI dot is honest, not hopeful.
@@ -5263,20 +5508,20 @@ mod tests {
             // Another instance already took the one slot.
             let x = sending("b1", "x:1", "x");
             assert!(matches!(
-                secrets::begin_attempt_within(&me, x, Some(&one)),
+                secrets::begin_attempt_within(&me, x, Some(&one), secrets::Existing::Refuse),
                 Ok(secrets::Begin::Recorded)
             ));
-            let full = record_then_invoice(&ctx, &me, sending("b1", "y:1", "y"), &one, invoice(Ok("lnbc".into()))).await;
+            let full = record_then_invoice(&ctx, &me, sending("b1", "y:1", "y"), &one, secrets::Existing::Refuse, invoice(Ok("lnbc".into()))).await;
             assert_eq!(full, Err(PayOutcome::Full));
             assert_eq!(signed.load(Ordering::SeqCst), 0, "no zap request after a refusal");
 
             // An invoice that can't be had takes the attempt back.
-            let failed = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, invoice(Err("no zaps".into()))).await;
+            let failed = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, secrets::Existing::Refuse, invoice(Err("no zaps".into()))).await;
             assert_eq!(failed, Err(PayOutcome::Retry));
             assert!(secrets::pay_attempts(&me).unwrap().iter().all(|a| a.bounty_id != "b2"));
             assert_eq!(ctx.note_for("y:1").as_deref(), Some("no zaps"));
 
-            let paid = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, invoice(Ok("lnbc".into()))).await;
+            let paid = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, secrets::Existing::Refuse, invoice(Ok("lnbc".into()))).await;
             assert_eq!(paid, Ok("lnbc".to_string()));
             assert_eq!(signed.load(Ordering::SeqCst), 2);
         });
@@ -5957,6 +6202,385 @@ mod tests {
             ]
         );
         assert_eq!(ledger::totals(&ledger.rows, Direction::PaidByMe).owed, 100);
+    }
+
+    #[test]
+    fn a_closed_manual_bounty_owes_nothing_in_the_ledger_and_on_its_card() {
+        let me = Keys::generate().public_key().to_hex();
+        let list = format!("39998:{me}:bagels");
+        let bob = Keys::generate();
+        let ctx = AutoPayCtx::default();
+        ctx.cache
+            .try_lock()
+            .unwrap()
+            .ranks
+            .insert((me.clone(), bob.public_key().to_hex()), (now_unix(), Some(5.0)));
+        let row_on = |status: &str| {
+            let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": me, "list_coordinate": list, "status": status }));
+            let reads = LedgerReads { issued: vec![bounty], all: Vec::new(), mine: Vec::new() };
+            let claims = vec![claim_at(&bob, "x", &[&list], 200)];
+            let ledger =
+                ledger_of(&ctx, &store_with(&me, &[]), &me, reads, Some((claims, Vec::new())), Vec::new()).unwrap();
+            let row = row_for(&ledger, "b1", &bob.public_key().to_hex()).clone();
+            (row.status, row.why)
+        };
+        // Closed but not expired: ended, as its card says.
+        assert_eq!(row_on("closed"), (Status::Expired, Some("bounty ended unpaid".to_string())));
+        // Fulfilled by the server's count means nothing here: still owed.
+        assert_eq!(row_on("fulfilled"), (Status::Owed, Some("manual pay".to_string())));
+        assert_eq!(row_on("open"), (Status::Owed, Some("manual pay".to_string())));
+        // A paid claim stays paid however the bounty ended.
+        let paid = ClaimFacts { paid: true, ..hand_fact("bob", 1, 5.0) };
+        let view = ClaimView {
+            fact: &paid,
+            decision: &Err(Hold::Paid),
+            attempt_fresh: false,
+            bounty_expired: true,
+            note: None,
+        };
+        assert_eq!(ledger::classify(&view), (Status::Paid, None));
+    }
+
+    #[test]
+    fn a_closed_manual_bounty_card_says_closed_and_has_no_button() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("hand-pay-closed");
+        let bob = Keys::generate();
+        let events = vec![claim_at(&bob, "everything", &[COORD], 200)];
+        let ctx = AutoPayCtx::default();
+        ctx.cache
+            .try_lock()
+            .unwrap()
+            .ranks
+            .insert((issuer.clone(), bob.public_key().to_hex()), (now_unix(), Some(5.0)));
+        let mut detail = manual_detail(&issuer);
+        detail.bounty.status = Some("closed".into());
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let claims = runtime.block_on(async {
+            annotate_with(&ctx, detail, move |_, _| async move { Some((events, Vec::new())) })
+                .await
+                .detail
+                .claims
+        });
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].hand_pay, None);
+        assert_eq!(claims[0].unpaid_reason.as_deref(), Some(HAND_CLOSED));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_hand_payment_keeps_its_slot_and_can_be_paid_again() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("hand-pay-failed");
+        let (bob, carol) = (Keys::generate(), Keys::generate());
+        let events = vec![
+            claim_at(&bob, "everything", &[COORD], 200),
+            claim_at(&carol, "sesame", &[COORD], 210),
+        ];
+        let bob_address = format!("{}:everything", bob.public_key().to_hex());
+        let failed = secrets::PayAttempt {
+            claim_event_id: events[0].id.to_hex(),
+            ..sending("b1", &bob_address, &bob.public_key().to_hex())
+        };
+        assert_eq!(
+            secrets::begin_attempt_within(&issuer, failed, None, secrets::Existing::Refuse).unwrap(),
+            secrets::Begin::Recorded
+        );
+        secrets::finish_attempt_for(&issuer, "b1", &bob_address, AttemptState::Failed, Some("refused".into()), 2)
+            .unwrap();
+        let ctx = AutoPayCtx::default();
+        {
+            let mut cache = ctx.cache.try_lock().unwrap();
+            for keys in [&bob, &carol] {
+                cache.ranks.insert((issuer.clone(), keys.public_key().to_hex()), (now_unix(), Some(5.0)));
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let claims = runtime.block_on(async {
+            annotate_with(&ctx, manual_detail(&issuer), move |_, _| async move { Some((events, Vec::new())) })
+                .await
+                .detail
+                .claims
+        });
+        let by = |keys: &Keys| claims.iter().find(|c| c.event.pubkey == keys.public_key().to_hex()).unwrap();
+        assert_eq!(by(&bob).hand_pay.as_deref(), Some(bob_address.as_str()));
+        assert_eq!(
+            by(&bob).unpaid_reason.as_deref(),
+            Some("The last payment failed (refused). No sats moved, so it can be paid again.")
+        );
+        assert_eq!(by(&carol).hand_pay, None, "bob's failed claim keeps the one slot");
+        assert_eq!(by(&carol).unpaid_reason, Hold::NoSlots.describe());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unpaid, unattempted claim fact by `claimant`, ranked `rank`.
+    fn hand_fact(claimant: &str, n: u64, rank: f64) -> ClaimFacts {
+        ClaimFacts {
+            address: format!("{claimant}:{n}"),
+            event_id: format!("e{n}"),
+            claimant: claimant.into(),
+            created_at: 200 + n,
+            paid: false,
+            attempt: None,
+            rank: Some(rank),
+        }
+    }
+
+    #[test]
+    fn a_claim_is_payable_by_hand_only_where_the_manual_plan_owes_it() {
+        let manual = bounty_row(serde_json::json!({}));
+        let policy = app_policy(&manual, None, true);
+        assert!(!policy.auto_pay, "no setting, issuer here: manual");
+        let check = |bounty: &Bounty, policy: &Policy, facts: &[ClaimFacts], address: &str| {
+            hand_pay_check("aa", bounty, policy, facts, address, now_unix())
+        };
+        let bob = hand_fact("bob", 1, 5.0);
+        assert_eq!(check(&manual, &policy, std::slice::from_ref(&bob), "bob:1"), Ok(()));
+
+        // Auto-pay here, the server's auto-payer, or an issuer not stored here.
+        let auto = app_policy(&manual, None, false);
+        assert_eq!(check(&manual, &auto, std::slice::from_ref(&bob), "bob:1"), Err(HAND_AUTOMATIC));
+        let server = bounty_row(serde_json::json!({ "auto_pay": 1 }));
+        assert_eq!(check(&server, &policy, std::slice::from_ref(&bob), "bob:1"), Err(HAND_AUTOMATIC));
+        assert_eq!(
+            hand_pay_check("cc", &manual, &policy, std::slice::from_ref(&bob), "bob:1", now_unix()),
+            Err(HAND_NOT_ISSUER)
+        );
+        let expired = bounty_row(serde_json::json!({ "expiration": 999 }));
+        assert_eq!(check(&expired, &policy, std::slice::from_ref(&bob), "bob:1"), Err(HAND_CLOSED));
+        assert_eq!(check(&manual, &policy, std::slice::from_ref(&bob), "nobody:1"), Err(HAND_NO_CLAIM));
+
+        // The one slot: an older owed claim takes it, and a paid one fills it.
+        let carol = hand_fact("carol", 2, 5.0);
+        let both = [bob.clone(), carol.clone()];
+        assert_eq!(check(&manual, &policy, &both, "carol:2"), Err(HAND_NO_SLOTS));
+        let paid = [ClaimFacts { paid: true, ..hand_fact("dave", 0, 5.0) }, bob.clone()];
+        assert_eq!(check(&manual, &policy, &paid, "bob:1"), Err(HAND_NO_SLOTS));
+        assert_eq!(check(&manual, &policy, &paid, "dave:0"), Err(HAND_TAKEN));
+
+        // Per item, one reward per account: bob's second claim is over it.
+        let per_item = bounty_row(serde_json::json!({
+            "bounty_cap_sats": 300, "reward_per_item": 1, "max_rewards_per_npub": 1,
+        }));
+        let per_item_policy = app_policy(&per_item, None, true);
+        let twice = [
+            ClaimFacts { paid: true, ..bob.clone() },
+            hand_fact("bob", 3, 5.0),
+        ];
+        assert_eq!(check(&per_item, &per_item_policy, &twice, "bob:3"), Err(HAND_OVER_LIMIT));
+
+        let low = hand_fact("erin", 4, 1.0);
+        assert_eq!(check(&manual, &policy, std::slice::from_ref(&low), "erin:4"), Err(HAND_RANK));
+        let own = hand_fact("aa", 5, 9.0);
+        assert_eq!(check(&manual, &policy, std::slice::from_ref(&own), "aa:5"), Err(HAND_OWN));
+
+        for state in [AttemptState::Sending, AttemptState::Paid, AttemptState::Unknown] {
+            let tried = ClaimFacts { attempt: Some(state), ..bob.clone() };
+            assert_eq!(check(&manual, &policy, std::slice::from_ref(&tried), "bob:1"), Err(HAND_TAKEN), "{state:?}");
+        }
+        // A failed attempt moved no sats: it may be paid again by hand, and
+        // it keeps its place, so the newer claim has no slot.
+        let failed = ClaimFacts { attempt: Some(AttemptState::Failed), ..bob.clone() };
+        let after_failure = [failed, carol.clone()];
+        assert_eq!(check(&manual, &policy, &after_failure, "bob:1"), Ok(()));
+        assert_eq!(check(&manual, &policy, &after_failure, "carol:2"), Err(HAND_NO_SLOTS));
+    }
+
+    #[test]
+    fn a_hand_payment_that_stops_before_sending_says_why_once() {
+        let ctx = AutoPayCtx::default();
+        let answer = |outcome, note: Option<&str>| {
+            if let Some(note) = note {
+                ctx.note("bob:1", note);
+            }
+            let answer = hand_pay_answer(&ctx, "bob:1", outcome);
+            assert_eq!(ctx.note_for("bob:1"), None, "said once, not left for a next tick");
+            answer
+        };
+        assert_eq!(answer(PayOutcome::Retry, Some(PROFILE_UNREAD)), Err(HAND_PROFILE_UNREAD.to_string()));
+        let empty = "Wallet empty: the issuer's Coinos wallet holds 5 sats, and the reward is 100.";
+        assert_eq!(answer(PayOutcome::Retry, Some(empty)), Err(empty.to_string()));
+        assert_eq!(answer(PayOutcome::Retry, None), Err(HAND_NOT_STARTED.to_string()));
+        assert_eq!(answer(PayOutcome::Full, Some(HAND_NO_SLOTS)), Err(HAND_NO_SLOTS.to_string()));
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Sending), None), Err(HAND_TAKEN.to_string()));
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Failed), Some(HAND_OVER_LIMIT)), Err(HAND_OVER_LIMIT.to_string()));
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Failed), None), Ok(()), "its PaymentState says failed");
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Paid), None), Ok(()));
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Unknown), None), Ok(()));
+    }
+
+    /// A manual bounty `b1` of `issuer` on [`COORD`], from the server.
+    fn manual_detail(issuer: &str) -> BountyDetail {
+        parse_detail(
+            &serde_json::json!({
+                "success": true,
+                "bounty": { "id": "b1", "issuer_pubkey": issuer, "list_coordinate": COORD,
+                    "amount_sats": 100, "status": "open", "created_at": 100, "auto_pay": 0 },
+                "claims": [],
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_the_claims_the_manual_plan_owes_get_a_pay_button() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("hand-pay-cards");
+        let me = secrets::keys(&issuer).unwrap().unwrap();
+        let (bob, carol, dave) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let events = vec![
+            claim_at(&bob, "everything", &[COORD], 200),
+            claim_at(&carol, "sesame", &[COORD], 210),
+            // Older than bob's, so its rank, not the slot, holds it back.
+            claim_at(&dave, "plain", &[COORD], 150),
+            claim_at(&me, "mine", &[COORD], 230),
+        ];
+        let ctx = AutoPayCtx::default();
+        {
+            let mut cache = ctx.cache.try_lock().unwrap();
+            for (keys, rank) in [(&bob, 5.0), (&carol, 5.0), (&dave, 1.0)] {
+                cache.ranks.insert((issuer.clone(), keys.public_key().to_hex()), (now_unix(), Some(rank)));
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let cards = || {
+            runtime.block_on(async {
+                let events = events.clone();
+                annotate_with(&ctx, manual_detail(&issuer), move |_, _| async move { Some((events, Vec::new())) })
+                    .await
+                    .detail
+                    .claims
+            })
+        };
+        let by = |claims: &[Claim], keys: &Keys| {
+            claims.iter().find(|c| c.event.pubkey == keys.public_key().to_hex()).cloned().unwrap()
+        };
+
+        let claims = cards();
+        let bob_card = by(&claims, &bob);
+        assert_eq!(bob_card.hand_pay, Some(format!("{}:everything", bob.public_key().to_hex())));
+        assert_eq!(bob_card.unpaid_reason, Hold::AutoPayOff.describe());
+        let carol_card = by(&claims, &carol);
+        assert_eq!(carol_card.hand_pay, None, "bob's older claim takes the one slot");
+        assert_eq!(carol_card.unpaid_reason, Hold::NoSlots.describe());
+        let dave_card = by(&claims, &dave);
+        assert_eq!(dave_card.hand_pay, None);
+        assert_eq!(dave_card.unpaid_reason, Hold::RankTooLow { rank: Some(1.0), min: 2 }.describe());
+        let own = by(&claims, &me);
+        assert_eq!((own.hand_pay, own.unpaid_reason), (None, Hold::OwnClaim.describe()));
+
+        // With auto-pay on, the app pays it: no card is paid by hand. (The
+        // Lightning-address hint is cached, so nothing is read.)
+        ctx.cache.try_lock().unwrap().lud16.insert(bob.public_key().to_hex(), (now_unix(), true));
+        secrets::set_auto_pay(&issuer, "b1", 2).unwrap();
+        assert!(cards().iter().all(|c| c.hand_pay.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_hand_payments_for_one_claim_record_one_attempt_and_one_invoice() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("hand-pay-twice");
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let address = format!("{}:everything", bob.public_key().to_hex());
+        let ctx = AutoPayCtx::default();
+        ctx.cache
+            .try_lock()
+            .unwrap()
+            .ranks
+            .insert((issuer.clone(), bob.public_key().to_hex()), (now_unix(), Some(5.0)));
+        let (pays, invoices) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+        // `pay_claim` past its network reads: record, then invoice, then the
+        // payment's end state.
+        let pay = |bounty: Bounty, fact: ClaimFacts, paid: Vec<(String, String)>| {
+            let (ctx, issuer, pays, invoices) = (&ctx, issuer.clone(), &pays, &invoices);
+            async move {
+                pays.fetch_add(1, Ordering::SeqCst);
+                let (slots, per_npub) = autopay::slots_and_limit(&bounty);
+                let limits = secrets::SlotLimits { slots, per_npub, paid };
+                let attempt = secrets::PayAttempt {
+                    claim_event_id: fact.event_id.clone(),
+                    ..sending(&bounty.id, &fact.address, &fact.claimant)
+                };
+                let invoice = || async {
+                    invoices.fetch_add(1, Ordering::SeqCst);
+                    Ok("lnbc".to_string())
+                };
+                match record_then_invoice(ctx, &issuer, attempt, &limits, secrets::Existing::ReplaceFailed, invoice)
+                    .await
+                {
+                    Ok(_) => {
+                        secrets::finish_attempt_for(&issuer, &bounty.id, &fact.address, AttemptState::Paid, None, 2)
+                            .unwrap();
+                        PayOutcome::Decided(AttemptState::Paid)
+                    }
+                    Err(outcome) => outcome,
+                }
+            }
+        };
+        let annotate = || {
+            let (ctx, event) = (&ctx, event.clone());
+            move |detail| async move {
+                annotate_with(ctx, detail, move |_, _| async move { Some((vec![event], Vec::new())) }).await
+            }
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            // The facts as read before the first click recorded its attempt:
+            // two clicks that pass the check at the same moment.
+            let early = annotate()(manual_detail(&issuer)).await;
+            let click = || hand_pay_with(&ctx, &issuer, &address, manual_detail(&issuer), annotate(), pay);
+            assert_eq!(click().await, Ok(()));
+            assert_eq!((pays.load(Ordering::SeqCst), invoices.load(Ordering::SeqCst)), (1, 1));
+            // The second click sees the attempt and stops before paying.
+            assert_eq!(click().await, Err(HAND_TAKEN.to_string()));
+            assert_eq!(pays.load(Ordering::SeqCst), 1);
+            // Racing past the check, the store's record refuses it before
+            // any zap request is signed.
+            let raced =
+                hand_pay_with(&ctx, &issuer, &address, manual_detail(&issuer), |_| async move { early }, pay).await;
+            assert_eq!(raced, Err(HAND_TAKEN.to_string()));
+            assert_eq!((pays.load(Ordering::SeqCst), invoices.load(Ordering::SeqCst)), (2, 1));
+            // Another account stored here is not the issuer.
+            let other = secrets::add_account(&Secret::new(Keys::generate().secret_key().to_bech32().unwrap()), true)
+                .unwrap()
+                .pubkey;
+            let refused = hand_pay_with(&ctx, &other, &address, manual_detail(&issuer), annotate(), pay).await;
+            assert_eq!(refused, Err(HAND_NOT_ISSUER.to_string()));
+        });
+        let attempts = secrets::pay_attempts(&issuer).unwrap();
+        assert_eq!(attempts.len(), 1, "one attempt: {attempts:?}");
+        assert_eq!(attempts[0].state, AttemptState::Paid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hand_pay_command_and_its_refusal_carry_no_secret() {
+        let command = Command::PayClaim {
+            pubkey: "aa".repeat(32),
+            bounty_id: "b1".into(),
+            claim_address: "bb:everything".into(),
+        };
+        assert_eq!(
+            format!("{command:?}"),
+            format!(
+                "PayClaim {{ pubkey: \"{}\", bounty_id: \"b1\", claim_address: \"bb:everything\" }}",
+                "aa".repeat(32)
+            )
+        );
+        let update = Update::PayClaimRefused {
+            bounty_id: "b1".into(),
+            claim_address: "bb:everything".into(),
+            message: HAND_TAKEN.into(),
+        };
+        assert_eq!(
+            format!("{update:?}"),
+            format!(
+                "PayClaimRefused {{ bounty_id: \"b1\", claim_address: \"bb:everything\", message: \"{HAND_TAKEN}\" }}"
+            )
+        );
     }
 
     #[test]

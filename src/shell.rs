@@ -174,6 +174,11 @@ shortcuts![
 
 /// How long the shortcut pill stays after the last shortcut.
 const SHORTCUT_SHOWN_FOR: Duration = Duration::from_secs(2);
+/// How long an armed "Pay" waits for its second click.
+const PAY_ARMED_FOR: Duration = Duration::from_secs(10);
+/// gpui sends one click per mouse-up, so a double-click is two clicks: a
+/// second one this soon after arming is the same gesture, not a confirmation.
+const PAY_DOUBLE_CLICK: Duration = Duration::from_millis(600);
 
 /// A binding's keystroke as shown: `cmd-shift-c` → `⌘⇧C`, `escape` → `esc`.
 fn shortcut_text(keys: &str) -> String {
@@ -609,6 +614,66 @@ fn click_remove(
         }
     };
     (action, command)
+}
+
+/// What one click on a claim's "Pay" button does ([`pay_click`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayClick {
+    /// Armed for this claim, from now.
+    Arm,
+    /// The second half of a double-click: still armed, nothing sent.
+    Ignore,
+    /// Armed for this claim and confirmed: send now; disarmed.
+    Pay,
+}
+
+/// One click at `now` on a claim's "Pay" button. It pays only when the
+/// button is armed for this claim, at least [`PAY_DOUBLE_CLICK`] and less
+/// than [`PAY_ARMED_FOR`] ago; otherwise it arms it.
+fn pay_click(
+    armed: &mut Option<((String, String), Instant)>,
+    key: &(String, String),
+    now: Instant,
+) -> PayClick {
+    if let Some((armed_key, at)) = armed.as_ref()
+        && armed_key == key
+    {
+        let since = now.saturating_duration_since(*at);
+        if since < PAY_DOUBLE_CLICK {
+            return PayClick::Ignore;
+        }
+        if since < PAY_ARMED_FOR {
+            *armed = None;
+            return PayClick::Pay;
+        }
+    }
+    *armed = Some((key.clone(), now));
+    PayClick::Arm
+}
+
+/// The hand-pay control for `claim` on `bounty`: only the issuer, active
+/// here, gets one, and only on a claim the runtime marked payable by hand.
+fn pay_control_for(
+    active: Option<&str>,
+    armed: Option<&(String, String)>,
+    sent: &HashMap<(String, String), String>,
+    bounty: &Bounty,
+    claim: &Claim,
+) -> bounties::PayControl {
+    let Some(address) = claim.hand_pay.as_ref() else {
+        return bounties::PayControl::None;
+    };
+    if active != Some(bounty.issuer_pubkey.as_str()) {
+        return bounties::PayControl::None;
+    }
+    let key = (bounty.id.clone(), address.clone());
+    if sent.contains_key(&key) {
+        bounties::PayControl::Sending
+    } else if armed == Some(&key) {
+        bounties::PayControl::Armed
+    } else {
+        bounties::PayControl::Ready
+    }
 }
 
 /// `held`: this is the active account and a form is in flight.
@@ -1343,6 +1408,19 @@ pub struct Shell {
     confirm_remove: Option<String>,
     /// The arming click's balance read for `confirm_remove`.
     remove_check: BalanceCheck,
+    /// "Pay" is armed on this `(bounty id, claim address)`: the next click
+    /// on it sends the sats. Selecting another bounty, navigating, an
+    /// account switch or `PAY_ARMED_FOR` (`pay_disarm`) disarms it.
+    /// With the arming click's time ([`pay_click`]).
+    pay_armed: Option<((String, String), Instant)>,
+    pay_disarm: Option<Task<()>>,
+    /// Claims a `PayClaim` went out for, to their claim event id: the
+    /// button reads "Sending payment…" until a `PaymentState` for the claim,
+    /// a snapshot that no longer offers it, or a refusal.
+    pay_sent: HashMap<(String, String), String>,
+    /// The last `PayClaimRefused` message per claim, shown on its card until
+    /// the next click on its button.
+    pay_refused: HashMap<(String, String), String>,
     /// The last arming click's `FetchBalance` request id.
     balance_request: u64,
     /// The last `FetchBounties` sequence number sent.
@@ -1557,6 +1635,10 @@ impl Shell {
             balance_poll: None,
             confirm_remove: None,
             remove_check: BalanceCheck::Done,
+            pay_armed: None,
+            pay_disarm: None,
+            pay_sent: HashMap::new(),
+            pay_refused: HashMap::new(),
             balance_request: 0,
             bounties_seq: 0,
             send_inputs,
@@ -2337,6 +2419,16 @@ impl Shell {
                     view.wallet.send = Some(SendState::Failed(message));
                 }
             }
+            Update::PayClaimRefused {
+                bounty_id,
+                claim_address,
+                message,
+            } => {
+                self.push_activity(RED, format!("Payment not sent: {message}"), now);
+                let key = (bounty_id, claim_address);
+                self.pay_sent.remove(&key);
+                self.pay_refused.insert(key, message);
+            }
             Update::Bounties { list, .. } => {
                 let stored: Vec<String> = self.views.iter().map(|(p, _)| p.clone()).collect();
                 let list = listed_bounties(list, &stored);
@@ -2439,6 +2531,12 @@ impl Shell {
                 // ledger's cue: a new claim is a new Payments row.
                 let claims = detail.claims.len();
                 let was = self.details.get(&detail.bounty.id).map(|d| d.claims.len());
+                // A claim this snapshot no longer offers has its attempt (or
+                // its answer) on the card now.
+                self.pay_sent.retain(|(bounty_id, address), _| {
+                    *bounty_id != detail.bounty.id
+                        || detail.claims.iter().any(|c| c.hand_pay.as_ref() == Some(address))
+                });
                 self.details.insert(detail.bounty.id.clone(), *detail);
                 if was.is_some_and(|was| was != claims) {
                     self.fetch_ledger(cx);
@@ -2539,10 +2637,17 @@ impl Shell {
                 reason,
                 ts,
             } => {
+                self.pay_sent
+                    .retain(|(bounty, _), event_id| !(*bounty == bounty_id && *event_id == claim_event_id));
                 let name = self.claim_name(&bounty_id, &claim_event_id);
                 let why = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+                // A manual bounty's payments are the issuer's own clicks.
+                let mode = match self.details.get(&bounty_id) {
+                    Some(detail) if !detail.bounty.auto_pay_on() => "Payment",
+                    _ => "Auto-pay",
+                };
                 let (dot, text) = match state.as_str() {
-                    "attempting" => (ACCENT, format!("Auto-pay started for \"{name}\"")),
+                    "attempting" => (ACCENT, format!("{mode} started for \"{name}\"")),
                     "paid" => (
                         AMBER,
                         format!("Paid \"{name}\". Waiting for the payment receipt."),
@@ -2552,7 +2657,7 @@ impl Shell {
                         AMBER,
                         format!("Paid \"{name}\", but no receipt arrived{why}"),
                     ),
-                    "failed" => (RED, format!("Auto-pay for \"{name}\" failed{why}")),
+                    "failed" => (RED, format!("{mode} for \"{name}\" failed{why}")),
                     other => (TEXT_MUTED, format!("\"{name}\" payment status: {other}{why}")),
                 };
                 self.push_activity(dot, text, if ts > 0 { ts } else { now });
@@ -2691,6 +2796,7 @@ impl Shell {
     pub(crate) fn go(&mut self, screen: Screen, window: &mut Window, cx: &mut Context<Self>) {
         self.screen = screen;
         self.confirm_remove = None;
+        self.disarm_pay();
         if screen != Screen::Account {
             self.hide_nsec();
         }
@@ -2716,6 +2822,7 @@ impl Shell {
             }
             self.active = Some(pubkey.to_string());
             self.confirm_remove = None;
+            self.disarm_pay();
             // An open form belongs to the account that opened it.
             self.close_forms(window, cx);
             self.send_inputs.clear(window, cx);
@@ -3298,6 +3405,75 @@ impl Shell {
         cx.notify();
     }
 
+    /// "Pay N sats" on a claim the issuer may pay by hand, in two clicks:
+    /// the first arms it for [`PAY_ARMED_FOR`], the second sends
+    /// `PayClaim`. The runtime checks everything again; this only spares
+    /// the issuer a stray click.
+    pub(crate) fn pay_claim(
+        &mut self,
+        bounty_id: String,
+        address: String,
+        claim_event_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pubkey) = self.active.clone() else {
+            return;
+        };
+        let key = (bounty_id, address);
+        self.pay_refused.remove(&key);
+        match pay_click(&mut self.pay_armed, &key, Instant::now()) {
+            PayClick::Ignore => return,
+            PayClick::Arm => {
+                let armed = key.clone();
+                self.pay_disarm = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(PAY_ARMED_FOR).await;
+                    let _ = this.update(cx, |shell, cx| {
+                        if shell.pay_armed.as_ref().is_some_and(|(key, _)| *key == armed) {
+                            shell.pay_armed = None;
+                            cx.notify();
+                        }
+                    });
+                }));
+                cx.notify();
+                return;
+            }
+            PayClick::Pay => {}
+        }
+        self.pay_disarm = None;
+        let _ = self.commands.unbounded_send(Command::PayClaim {
+            pubkey,
+            bounty_id: key.0.clone(),
+            claim_address: key.1.clone(),
+        });
+        self.pay_sent.insert(key, claim_event_id);
+        cx.notify();
+    }
+
+    /// Also drops "Sending payment…": a reply lost on the way must not
+    /// leave it up for good.
+    fn disarm_pay(&mut self) {
+        self.pay_armed = None;
+        self.pay_disarm = None;
+        self.pay_sent.clear();
+    }
+
+    /// The hand-pay control for `claim` on `bounty` as the card shows it.
+    pub(crate) fn pay_control(&self, bounty: &Bounty, claim: &Claim) -> bounties::PayControl {
+        pay_control_for(
+            self.active.as_deref(),
+            self.pay_armed.as_ref().map(|(key, _)| key),
+            &self.pay_sent,
+            bounty,
+            claim,
+        )
+    }
+
+    /// The refusal the runtime last sent for this claim, if any.
+    pub(crate) fn pay_refusal(&self, bounty_id: &str, claim: &Claim) -> Option<String> {
+        let address = claim.hand_pay.clone()?;
+        self.pay_refused.get(&(bounty_id.to_string(), address)).cloned()
+    }
+
     /// The wallet on screen ([`wallet_shown`]) is polled every 3 s while it
     /// has a token. Restarted only when the target changes, so re-renders
     /// never reset the cadence.
@@ -3360,6 +3536,9 @@ impl Shell {
         let _ = self
             .commands
             .unbounded_send(Command::WatchBounty { id: id.clone() });
+        if self.selected.as_deref() != Some(id.as_str()) {
+            self.disarm_pay();
+        }
         self.selected = Some(id);
         // An open claim form claims the highlighted bounty, not the one it
         // was opened on; otherwise "Claim selected" lies once you arrow away.
@@ -4942,7 +5121,7 @@ mod tests {
         can_post_on_list, claim_notice,
         click_remove, fold_checks, form_locked, list_has_open_bounty, new_bounty_since_submit,
         next_bounties_read, on_bounty_form_closed, on_list_create_unknown, on_list_created,
-        on_outcome_unknown, pick_active, relay_address_gap, remove_click, still_checking_list,
+        on_outcome_unknown, PayClick, pay_click, pay_control_for, pick_active, relay_address_gap, remove_click, still_checking_list,
     };
     use super::{
         BountyTab, EligibleSlot, Load, Screen, find_bounty, house_reply_pick, land_eligible,
@@ -5941,6 +6120,74 @@ mod tests {
         assert_eq!(remove_click(true, BalanceCheck::Done, true), Refuse);
         assert_eq!(remove_click(true, BalanceCheck::Failed, false), Remove);
         assert_eq!(remove_click(true, BalanceCheck::Done, false), Remove);
+    }
+
+    #[test]
+    fn a_pay_click_arms_and_only_a_second_click_on_the_same_claim_pays() {
+        let key = |address: &str| ("b1".to_string(), address.to_string());
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let armed_key = |armed: &Option<((String, String), Instant)>| armed.as_ref().map(|(k, _)| k.clone());
+        let mut armed = None;
+        assert_eq!(pay_click(&mut armed, &key("bob:1"), at(0)), PayClick::Arm, "the first click arms");
+        assert_eq!(armed_key(&armed), Some(key("bob:1")));
+        // A click on another claim moves the arming; it pays nothing.
+        assert_eq!(pay_click(&mut armed, &key("carol:2"), at(1_000)), PayClick::Arm);
+        assert_eq!(armed_key(&armed), Some(key("carol:2")));
+        assert_eq!(pay_click(&mut armed, &key("carol:2"), at(2_000)), PayClick::Pay, "the second click pays");
+        assert_eq!(armed, None, "and disarms");
+        assert_eq!(pay_click(&mut armed, &key("carol:2"), at(3_000)), PayClick::Arm, "a third click arms again");
+    }
+
+    #[test]
+    fn a_double_click_on_pay_arms_and_pays_nothing() {
+        let key = ("b1".to_string(), "bob:1".to_string());
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut armed = None;
+        assert_eq!(pay_click(&mut armed, &key, at(0)), PayClick::Arm);
+        assert_eq!(pay_click(&mut armed, &key, at(200)), PayClick::Ignore, "the double-click's second half");
+        assert_eq!(armed, Some((key.clone(), at(0))), "still armed, from the first click");
+        assert_eq!(pay_click(&mut armed, &key, at(700)), PayClick::Pay);
+        assert_eq!(armed, None);
+
+        // Past the arm window, a click arms again instead of paying.
+        assert_eq!(pay_click(&mut armed, &key, at(1_000)), PayClick::Arm);
+        assert_eq!(pay_click(&mut armed, &key, at(11_500)), PayClick::Arm);
+        assert_eq!(armed, Some((key, at(11_500))));
+    }
+
+    #[test]
+    fn only_the_active_issuer_gets_a_pay_button() {
+        let bounty: Bounty = serde_json::from_value(serde_json::json!({
+            "id": "b1", "issuer_pubkey": "aa", "list_coordinate": "39998:aa:x", "amount_sats": 100, "status": "open",
+        }))
+        .unwrap();
+        // The runtime marks a claim payable when the issuer is stored here,
+        // whichever account is active.
+        let claim = magic_carpet_chat::api::Claim {
+            hand_pay: Some("bob:1".into()),
+            ..magic_carpet_chat::api::Claim::from_event(serde_json::from_value(serde_json::json!({
+                "id": "e1", "pubkey": "bob",
+            }))
+            .unwrap())
+        };
+        let none = HashMap::new();
+        let control = |active| pay_control_for(active, None, &none, &bounty, &claim);
+        assert_eq!(control(Some("aa")), crate::bounties::PayControl::Ready);
+        assert_eq!(control(Some("cc")), crate::bounties::PayControl::None, "another stored account");
+        assert_eq!(control(None), crate::bounties::PayControl::None);
+        let key = ("b1".to_string(), "bob:1".to_string());
+        assert_eq!(
+            pay_control_for(Some("cc"), Some(&key), &none, &bounty, &claim),
+            crate::bounties::PayControl::None
+        );
+        assert_eq!(
+            pay_control_for(Some("aa"), Some(&key), &none, &bounty, &claim),
+            crate::bounties::PayControl::Armed
+        );
+        let sent = HashMap::from([(key, "e1".to_string())]);
+        assert_eq!(pay_control_for(Some("aa"), None, &sent, &bounty, &claim), crate::bounties::PayControl::Sending);
     }
 
     #[test]
