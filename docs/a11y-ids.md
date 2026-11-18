@@ -267,6 +267,7 @@ The map row's kind changes with the verdict, so match the prefix
 | `payments-loading` | Label | Loading payments… | first read for the account |
 | `payments-error` | Label | Payments didn't load: … | first read failed |
 | `payments-retry-hint` | Label | ⌘R tries again. | under `payments-error` |
+| `payments-stale` | Label | Couldn't refresh. Showing payments as of N min ago. Retrying… / … ⌘R tries again. | above the tabs while the rows predate a failed refresh; "⌘R tries again." once the automatic retries (15 s, then 60 s) are used up |
 | `payments-tabs` | TabList | Payment lists | |
 | `payments-tab-by-me`, `payments-tab-to-me` | Tab | Paid by me (N), Paid to me (N) | `Value: on` for the open tab; Paid by me opens first |
 | `payments-total-owed`, `payments-total-paying`, `payments-total-paid`, `payments-total-pledged` | Label | N sats | Paid by me tab; PAYING counts unknown outcomes too |
@@ -320,6 +321,7 @@ On the Wallet screen, the Account page's Wallet tab and the account-setup ready 
 | `wallet-debts-owed` | Label | Owed but unpaid: N sats / Owed but unpaid: … | |
 | `wallet-debts-total` | Label | Total debts: N sats / Total debts: … | |
 | `wallet-debts-error` | Label | Couldn't load your debts. | replaces the three lines when the ledger read failed |
+| `wallet-debts-stale` | Label | Couldn't refresh. These may be out of date. | under the three lines while the ledger predates a failed refresh |
 
 ## Chat
 

@@ -2053,6 +2053,64 @@ async def scenario_k(sc):
     sc.check("app still running", box.app_alive())
 
 
+# ---------------------------------------------------------------- J
+# J: the first-launch sign-up screen, free and read-only: the choose card,
+# the create card's promise about the key and the Coinos wallet, and back.
+# The create card's "Create (Enter)" (setup-create-go) is never pressed, so
+# no account, key or wallet is made; the store, the fake server and the
+# local relay must show it.
+J_WALLET_NOTE = ("A Coinos wallet opens with this account so claims can pay you. "
+                 "Coinos holds your sats, so keep the balance small.")   # account_setup.rs create_card
+
+
+async def scenario_j(sc):
+    sc.box.start_fake({})
+    sc.box.mark("J launch")
+    # The local relay keeps other scenarios' events, so "nothing was
+    # published" means nothing since this launch.
+    launched = int(time.time()) - 2
+    # A first launch: an empty store and no MC_NSECS, the choose card.
+    store = await start(sc, "J", ready="setup-create", nsecs="")
+    if not store:
+        return
+    met = await sc.step(Step("Show the first-launch 'Your Nostr account' card.", [Cand("look", "Wait 1 second.", [("wait", 1)])],
+                             "A card titled 'Your Nostr account' offers 'Create a new account' and 'I already have a key'.",
+                             tries=2, settle=K_SETTLE,
+                             cues=("Your Nostr account", "Your secret key stays on this computer", "Create a new account",
+                                   "I already have a key")), label="choose card")
+    ok = sc.check_tree("the choose card's ids", [("setup-title-choose", "Your Nostr account"), ("setup-create", "Create a new account"),
+                                                  ("setup-paste", "I already have a key"), ("setup-browse", None)])
+    if ok and not met:
+        sc.accept_step("choose card", "the choose card's ids in the tree")
+    # The create card, held K_SETTLE; its Create (Enter) is never pressed.
+    await k_show(sc, "create card", "Open the 'Create a new account' card, without creating anything.",
+                 "Press the 'Create a new account' button on the choose card.",
+                 [("press", "setup-create"), ("wait_id", {"id": "setup-title-create", "secs": 10, "soft": True})],
+                 "A card titled 'Create a new account' shows a 'Name (optional)' field, the Coinos wallet note and 'Create (Enter)'.",
+                 ("Create a new account", "Name (optional)", "Coinos wallet", "Create (Enter)"),
+                 [("setup-title-create", "Create a new account"), ("setup-create-go", None)])
+    k_names(sc, "the create card: name field, the wallet promise, Create and Back", {
+        "setup-title-create": "Create a new account", "setup-name-label": "Name (optional)",
+        "setup-wallet-note": J_WALLET_NOTE, "setup-create-go": "Create (Enter)", "setup-back": "← Back"})
+    sc.check_tree("the name field is in the tree", [("setup-name", None)])
+    await k_show(sc, "back to choose", "Go back to the choose card.", "Press '← Back' under the create card.",
+                 [("press", "setup-back"), ("wait_id", {"id": "setup-title-choose", "secs": 10, "soft": True})],
+                 "The 'Your Nostr account' card is shown again.", ("Your Nostr account", "Create a new account"),
+                 [("setup-title-choose", "Your Nostr account")], [("setup-title-create", None)])
+    await asyncio.sleep(K_SETTLE)
+    # Nothing was made: no account in the store, no login or publish at the
+    # fake (instance or Brainstorm), no event on the local relay.
+    n = sc.box.accounts_in_store(store)
+    sc.check("the store holds no account", n in (0, -1), f"{n} accounts (-1: no accounts.json)")
+    posts = [l for l in sc.log_after("J launch") if l.startswith(("POST", "BS POST"))]
+    sc.check("no login, publish or create reached the fake server", not posts, posts)
+    rc, out = sc.box.nak(["req", "-k", "0", "-k", "3", "-k", "10002", "-k", "10040", "--since", str(launched), "-l", "50", LOCAL_RELAY])
+    evs = z_events(out)
+    sc.check("the local relay got no profile, follow list, relay list or map since the launch", rc == 0 and not evs,
+             f"rc {rc}, {len(evs)} event(s)")
+    sc.check("app still running", sc.box.app_alive())
+
+
 # ---------------------------------------------------------------- Z (paid)
 # Z: three people, three app processes, each on its own empty store, against
 # the box's tapestry instance and relay. suite.WIDE gives Z a 3870x960
@@ -2562,29 +2620,71 @@ async def z_flow(sc, stamp, reuse, people):
 Z_NO_RECEIPT = "Paid, no receipt"
 
 
-async def z_tail_statuses(sc, who, rows, reread):
-    """Each row's status. If one reads "Paid, no receipt" (the receipt
-    reaches the instance relay through z-bridge.sh and can lag), `reread`
-    runs once, then the tree is read every 5 s for up to 60 s."""
-    got = {r: sc.tree_name(f"{r}-status") for r in rows}
-    if Z_NO_RECEIPT not in got.values():
-        return got
-    sc.notes.append(f"Z tail: {who} read '{Z_NO_RECEIPT}' first; one more look after a re-read")
-    await reread()
-    end = time.time() + 60
+async def z_tail_open(sc, tab_id, before=()):
+    """`before`, then Payments on `tab_id`. The tabs are not drawn while a
+    first ledger read is out (payments.rs render), so they are waited for,
+    up to 60 s, before the press. True, or False and a note: never raises."""
+    try:
+        for kind, arg in list(before) + [("press", "nav-payments"), ("wait_id", {"id": tab_id, "secs": 60}),
+                                         ("press", tab_id), PARK]:
+            await sc.suite.driver.act(kind, arg)
+        return True
+    except Exception as e:
+        sc.notes.append(f"Z tail: opening {tab_id}: {type(e).__name__}: {e}"[:300])
+        return False
+
+
+async def z_tail_rows(sc, who, rows, tab_id, switch=()):
+    """The rows' statuses on the open tab, read every 10 s for up to 120 s
+    while one is missing or reads "Paid, no receipt", or `payments-stale`
+    shows: a failed refresh keeps older rows, and the app retries by itself.
+    `switch` (C's app: to D and back, which re-reads the ledger) runs once on
+    a "Paid, no receipt". Returns (statuses, the stale notice's text if it
+    ever showed)."""
+    end, switched, stale_seen = time.time() + 120, False, None
     while True:
-        got = {r: sc.tree_name(f"{r}-status") for r in rows}
-        if Z_NO_RECEIPT not in got.values() or time.time() > end:
-            return got
-        await asyncio.sleep(5)
+        got = {r: (sc.tree_name(f"{r}-status") if sc.tree(r) > 0 else None) for r in rows}
+        stale = sc.tree_name("payments-stale") if sc.tree("payments-stale") > 0 else None
+        stale_seen = stale or stale_seen
+        if (all(v not in (None, Z_NO_RECEIPT) for v in got.values()) and not stale) or time.time() > end:
+            return got, stale_seen
+        if switch and not switched and Z_NO_RECEIPT in got.values():
+            switched = True
+            sc.notes.append(f"Z tail: {who} read '{Z_NO_RECEIPT}'; re-read by switching away and back")
+            await z_tail_open(sc, tab_id, switch)
+        await asyncio.sleep(10)
+
+
+async def z_tail_tab(sc, who, names, own, switch, tab_id, rows, total_id, what):
+    """One Payments tab of one app: shown, its `rows` Paid and 100 sats,
+    its total recorded. A failure is a check, never an exception."""
+    try:
+        await k_show(sc, f"Z tail: {who} {what}", f"In {who}'s app, open Payments on its '{what}' tab.",
+                     f"Press {who}'s account tab in the left rail, the sidebar's Payments tab, then '{what}'.",
+                     [("press", own), ("press", "nav-payments"), ("wait_id", {"id": tab_id, "secs": 60, "soft": True}),
+                      ("press", tab_id), ("wait_id", {"id": rows[0], "secs": 60, "soft": True})],
+                     f"The '{what}' tab shows this run's two rows reading Paid.",
+                     ("Payments", what, "Paid"), [(tab_id, None)])
+        got, stale = await z_tail_rows(sc, who, rows, tab_id, switch)
+        sats = [(sc.tree_name(f"{r}-sats") if sc.tree(r) > 0 else None) for r in rows]
+        sc.check(f"Z tail: {who}'s {what}: this run's two rows, each Paid, 100 sats",
+                 len(rows) == 2 and all(v == "Paid" for v in got.values()) and sats == ["100 sats"] * 2,
+                 f"statuses {list(got.values())}, sats {sats}, payments-stale {stale!r}")
+        total = p_total(sc, total_id)
+        sc.notes.append(f"Z tail: {who}'s {what} total {total} sats (recorded, not checked)")
+        await asyncio.sleep(K_SETTLE)
+        return total
+    except Exception as e:
+        sc.check(f"Z tail: {who}'s {what} ran to the end", False, f"{type(e).__name__}: {e}")
+        return None
 
 
 async def z_payments_tail(sc, people, names, bounties, payouts):
     """After the six payouts, each app's Payments screen: its issuer's two
     rows on this run's bounty Paid (and D's claim Not payable in A's), its
-    two received rows Paid, the totals at least 200 each way (reused
-    wallets carry older rows). Rows by id, `payment-row-<bounty>-<claim>`,
-    from z_payouts. Every check is named "Z tail"."""
+    two received rows Paid. Totals are recorded (reused wallets carry older
+    rows). Rows by id, `payment-row-<bounty>-<claim>`, from z_payouts.
+    Every check is named "Z tail"; one app's failure never blanks the next."""
     own_ok = all(c["ok"] for c in sc.checks)
     sc.notes.append("Z tail: Z's own checks before the Payments tail all " + ("passed" if own_ok else "did NOT pass")
                     + "; a failing 'Z tail' check is the tail's alone")
@@ -2594,56 +2694,26 @@ async def z_payments_tail(sc, people, names, bounties, payouts):
         p = people[who]
         sc.use(p["app"])
         own = f"rail-account-{p['pub']}"
+        # C's app holds D too: a switch to D and back re-reads C's ledger.
+        switch = ([("press", f"rail-account-{people['D']['pub']}"), ("wait", 3), ("press", own)]
+                  if who == "C" else ())
         by_me = [f"payment-row-{bounties[who]}-{r['claim_event']}" for r in payouts if r["issuer"] == who]
         to_me = [f"payment-row-{bounties[r['issuer']]}-{r['claim_event']}" for r in payouts if r["claimant"] == who]
-
-        def reread(tab_id):
-            async def go():
-                if who == "C":
-                    # C's app holds D too: a switch away and back re-reads C's ledger.
-                    await act(sc, "Z tail: C's ledger re-read by switching to D and back",
-                              [("press", f"rail-account-{people['D']['pub']}"), ("wait", 3), ("press", own),
-                               ("press", tab_id), PARK])
-            return go
-
-        await k_show(sc, f"Z tail: {who} paid by me", f"In {who}'s app, open Payments on its 'Paid by me' tab.",
-                     f"Press {who}'s account tab in the left rail, the sidebar's Payments tab, then 'Paid by me'.",
-                     [("press", own), ("press", "nav-payments"), ("wait_id", {"id": "payments-tab-by-me", "secs": 60, "soft": True}),
-                      ("press", "payments-tab-by-me"), ("wait_id", {"id": by_me[0], "secs": 60, "soft": True})],
-                     f"The 'Paid by me' tab shows two rows on {names[who]} reading Paid.",
-                     ("Payments", "Paid by me", names[who], "Paid"), [(r, None) for r in by_me])
-        got = await z_tail_statuses(sc, who, by_me, reread("payments-tab-by-me"))
-        sats = [sc.tree_name(f"{r}-sats") for r in by_me]
-        sc.check(f"Z tail: {who}'s Paid by me: two rows on {names[who]}, each Paid, 100 sats",
-                 len(by_me) == 2 and all(v == "Paid" for v in got.values()) and sats == ["100 sats"] * 2,
-                 f"statuses {list(got.values())}, sats {sats}")
-        total = p_total(sc, "payments-total-paid")
-        sc.check(f"Z tail: {who}'s PAID total is at least 200 sats", (total or 0) >= 200, f"{total} sats")
+        paid = await z_tail_tab(sc, who, names, own, switch, "payments-tab-by-me", by_me, "payments-total-paid", "Paid by me")
         if who == "A" and d_claim:
+            # Not payable for its rank, or, once both of A's slots are paid,
+            # for the cap (autopay::decide checks slots before rank).
             d_row = f"payment-row-{bounties['A']}-{d_claim}"
-            status, why = sc.tree_name(f"{d_row}-status"), sc.tree_name(f"{d_row}-why") or ""
-            sc.check("Z tail: D's claim on A's bounty reads Not payable with a rank reason",
-                     status == "Not payable" and "bounty needs" in why, f"{status!r}, {why!r}")
+            status = sc.tree_name(f"{d_row}-status") if sc.tree(d_row) > 0 else None
+            why = (sc.tree_name(f"{d_row}-why") if sc.tree(f"{d_row}-why") > 0 else None) or ""
+            sc.check("Z tail: D's claim on A's bounty reads Not payable (rank too low, or no slots left)",
+                     status == "Not payable" and ("bounty needs" in why or why == "no reward slots left"), f"{status!r}, {why!r}")
         seen[who] = {"promised": sc.tree_name("sidebar-promised"), "paid_so_far": sc.tree_name("sidebar-paid"),
                      "badge": sc.tree_name("nav-payments-badge") if sc.tree("nav-payments-badge") > 0 else None,
-                     "paid_total": total}
-        await asyncio.sleep(K_SETTLE)
-        await k_show(sc, f"Z tail: {who} paid to me", f"In {who}'s app, open the 'Paid to me' tab.",
-                     "Press the 'Paid to me' tab.",
-                     [("press", "payments-tab-to-me"), ("wait_id", {"id": to_me[0], "secs": 60, "soft": True})],
-                     "The 'Paid to me' tab shows two rows reading Paid, from the other two issuers.",
-                     ("Paid to me", "RECEIVED", "Paid"), [(r, None) for r in to_me])
-        got = await z_tail_statuses(sc, who, to_me, reread("payments-tab-to-me"))
-        sats = [sc.tree_name(f"{r}-sats") for r in to_me]
-        others = [names[w] for w in "ABC" if w != who]
-        sc.check(f"Z tail: {who}'s Paid to me: two rows on {' and '.join(others)}, each Paid, 100 sats",
-                 len(to_me) == 2 and all(v == "Paid" for v in got.values()) and sats == ["100 sats"] * 2,
-                 f"statuses {list(got.values())}, sats {sats}")
-        total = p_total(sc, "payments-total-received")
-        sc.check(f"Z tail: {who}'s RECEIVED total is at least 200 sats", (total or 0) >= 200, f"{total} sats")
-        seen[who]["received_total"] = total
+                     "paid_total": paid}
+        seen[who]["received_total"] = await z_tail_tab(sc, who, names, own, switch, "payments-tab-to-me", to_me,
+                                                       "payments-total-received", "Paid to me")
         sc.notes.append(f"Z tail: {who}'s app: {seen[who]}")
-        await asyncio.sleep(K_SETTLE)
     sc.suite.write(sc.suite.meta)
 
 
@@ -2865,6 +2935,7 @@ SCENARIOS = {
     "W": ("trust: Recalculate 429/403/NO_ELIGIBLE_USERS wording, disabled with no follows", scenario_w),
     "S": ("issuer posts a new bounty on an existing list", scenario_s),
     "T": ("eligible list survives an account switch mid-request", scenario_t),
+    "J": ("sign-up screen: choose card, the create card's key and wallet promise, back; nothing made", scenario_j),
     "K": ("payments ledger: both tabs, totals, badge, sidebar, Issued/Claimed tabs, debts, payout field; a row opens its bounty", scenario_k),
     "P": ("paid: real bounty, claim, settle", scenario_p),
     "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),

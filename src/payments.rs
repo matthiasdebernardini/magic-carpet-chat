@@ -325,6 +325,15 @@ fn payment_row(shell: &Shell, row: &Row, now: u64, cx: &mut Context<Shell>) -> A
         .into_any_element()
 }
 
+/// The notice over rows that predate a failed refresh.
+fn stale_notice(now: u64, read_at: u64, retrying: bool) -> String {
+    let next = if retrying { "Retrying…" } else { "⌘R tries again." };
+    format!(
+        "Couldn't refresh. Showing payments as of {}. {next}",
+        timefmt::relative(now, read_at)
+    )
+}
+
 fn line(id: &'static str, text: impl Into<SharedString>, color: u32) -> AnyElement {
     let text = text.into();
     div()
@@ -386,6 +395,15 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
         .child(tab(Direction::PaidToMe, to_me, shell.payments_tab == Direction::PaidToMe, cx));
 
     let now = timefmt::now_unix();
+    let stale = shell.ledger_stale().map(|(read_at, retrying)| {
+        let text = stale_notice(now, read_at, retrying);
+        div()
+            .a11y("payments-stale", Role::Label, text.clone())
+            .mb(px(10.))
+            .text_size(px(11.))
+            .text_color(rgb(AMBER))
+            .child(SharedString::from(text))
+    });
     let rows: Vec<AnyElement> = shell
         .ledger_rows_for(shell.payments_tab)
         .map(|row| payment_row(shell, row, now, cx))
@@ -406,6 +424,7 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
 
     v_flex()
         .child(heading)
+        .children(stale)
         .child(tabs)
         .child(totals_strip(shell))
         .child(body)
@@ -413,7 +432,9 @@ pub fn render(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{Direction, Row, RowKey, Status, pill_look, row_id, sats, step, subtitle, tab_label};
+    use super::{
+        Direction, Row, RowKey, Status, pill_look, row_id, sats, stale_notice, step, subtitle, tab_label,
+    };
     use crate::palette::{AMBER, GREEN, RED};
 
     #[test]
@@ -515,5 +536,17 @@ mod tests {
         let unknown = pill_look(Status::Unknown);
         assert!(unknown.dashed && unknown.fill.is_none());
         assert_eq!(unknown.text, AMBER);
+    }
+
+    #[test]
+    fn the_stale_notice_says_how_old_the_rows_are_and_what_comes_next() {
+        assert_eq!(
+            stale_notice(1_000, 820, true),
+            "Couldn't refresh. Showing payments as of 3 min ago. Retrying…"
+        );
+        assert_eq!(
+            stale_notice(1_000, 820, false),
+            "Couldn't refresh. Showing payments as of 3 min ago. ⌘R tries again."
+        );
     }
 }

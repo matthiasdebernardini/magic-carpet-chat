@@ -196,6 +196,8 @@ pub struct OwnPage<'a> {
     pub send: &'a SendInputs,
     pub address: &'a AddressInput,
     pub debts: DebtsView,
+    /// The ledger behind the debts predates a refresh that failed.
+    pub debts_stale: bool,
 }
 
 /// Save is inert while a check runs and when the text is the address the
@@ -517,7 +519,8 @@ fn debt_row(
 
 /// What the account still owes on its bounties. A loading ledger shows "…",
 /// not zeros: zero is a real answer once the ledger is in.
-fn debts_card(debts: DebtsView) -> AnyElement {
+/// `stale` adds a line under the numbers: they predate a failed refresh.
+fn debts_card(debts: DebtsView, stale: bool) -> AnyElement {
     let card = own_card().child(section_title("DEBTS"));
     let debts = match debts {
         DebtsView::Ready(debts) => Some(debts),
@@ -548,6 +551,12 @@ fn debts_card(debts: DebtsView) -> AnyElement {
     ))
     .child(div().w_full().h(px(1.)).bg(rgb(LINE)))
     .child(debt_row("wallet-debts-total", "Total debts", None, sats(Debts::total), true))
+    .when(stale, |this| {
+        this.child(
+            line("wallet-debts-stale", "Couldn't refresh. These may be out of date.", AMBER)
+                .text_size(px(11.)),
+        )
+    })
     .into_any_element()
 }
 
@@ -738,7 +747,7 @@ pub fn panel(
         this.when(address_settable, |this| {
             this.child(address_card(view, own.address, cx))
         })
-        .child(debts_card(own.debts))
+        .child(debts_card(own.debts, own.debts_stale))
     })
     .into_any_element()
 }

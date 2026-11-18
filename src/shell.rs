@@ -991,6 +991,10 @@ pub(crate) struct Slot<T> {
     /// late never overwrites a newer one.
     applied: u64,
     pub list: Load<T>,
+    /// The latest reply failed while an earlier list stays on screen.
+    pub stale: bool,
+    /// When the list on screen was read (unix seconds); 0 before the first.
+    pub read_at: u64,
 }
 
 /// The eligible list for one account.
@@ -1015,6 +1019,8 @@ fn next_read<T>(slot: &mut Option<Slot<T>>, seq: &mut u64, pubkey: &str) -> u64 
             since: *seq,
             applied: 0,
             list: Load::Loading,
+            stale: false,
+            read_at: 0,
         });
     }
     *seq
@@ -1028,9 +1034,14 @@ fn land<T>(slot: Option<&mut Slot<T>>, pubkey: &str, seq: u64, result: Result<T,
     };
     slot.applied = seq;
     match result {
-        Ok(value) => slot.list = Load::Ready(value),
+        Ok(value) => {
+            slot.list = Load::Ready(value);
+            slot.stale = false;
+        }
         Err(message) => {
-            if !matches!(slot.list, Load::Ready(_)) {
+            if matches!(slot.list, Load::Ready(_)) {
+                slot.stale = true;
+            } else {
                 slot.list = Load::Failed(message);
             }
         }
@@ -1065,51 +1076,163 @@ fn next_ledger_read(slot: &mut Option<LedgerSlot>, seq: &mut u64, pubkey: &str) 
     }
 }
 
-/// The ledger read in flight and whether another was asked for meanwhile.
-/// One auto-pay tick emits a payment state per claim; each would otherwise
-/// start a full ledger read of its own.
+/// The least time between the starts of two ledger reads for one account:
+/// each read makes the instance scan the relay once per bounty.
+const LEDGER_READ_GAP: Duration = Duration::from_secs(10);
+
+/// The waits before the automatic retries after a failed ledger read; once
+/// they are used up only ⌘R or a new trigger reads again.
+const LEDGER_RETRY_AFTER: [Duration; 2] = [Duration::from_secs(15), Duration::from_secs(60)];
+
+/// When the ledger reads for one account go out. One auto-pay tick emits a
+/// payment state per claim; each would otherwise start a full ledger read of
+/// its own, so reads are one at a time, [`LEDGER_READ_GAP`] apart, and what
+/// lands in between collapses into one trailing read. Time is passed in, so
+/// the rules are testable; the Shell only sends reads and arms the timer
+/// [`LedgerReads::wake_at`] asks for.
 #[derive(Default)]
 pub(crate) struct LedgerReads {
-    /// The account and seq of the read in flight.
-    out: Option<(String, u64)>,
+    /// The account these reads are for; another one starts afresh.
+    account: Option<String>,
+    /// The seq of the read in flight.
+    out: Option<u64>,
+    /// When the last read started.
+    started: Option<Instant>,
+    /// A read was asked for while one was out or inside the gap.
     dirty: bool,
+    /// Failed replies since the last success.
+    failures: usize,
+    /// When the next automatic retry is due.
+    retry_at: Option<Instant>,
 }
 
-/// A ledger read for `pubkey`, or `None` when one for it is already out:
-/// that read's reply then sends one more. Another account reads at once.
+impl LedgerReads {
+    /// When the Shell should call [`ledger_timer_fired`]: the end of the gap
+    /// for a waiting read, or a retry. Nothing while a read is out: its reply
+    /// decides.
+    pub(crate) fn wake_at(&self) -> Option<Instant> {
+        if self.out.is_some() {
+            return None;
+        }
+        let trailing = self.started.filter(|_| self.dirty).map(|t| t + LEDGER_READ_GAP);
+        [trailing, self.retry_at].into_iter().flatten().min()
+    }
+
+    /// Automatic retries are still coming (or one is out) after a failure.
+    pub(crate) fn retrying(&self) -> bool {
+        self.failures <= LEDGER_RETRY_AFTER.len()
+    }
+}
+
+/// Points `reads` at `pubkey`; another account than before starts afresh, so
+/// its first read goes out at once and an old timer finds nothing to do.
+fn ledger_account(reads: &mut LedgerReads, pubkey: &str) {
+    if reads.account.as_deref() != Some(pubkey) {
+        *reads = LedgerReads {
+            account: Some(pubkey.to_string()),
+            ..LedgerReads::default()
+        };
+    }
+}
+
+/// Starts a read now. It answers any waiting request and any due retry.
+fn start_ledger_read(
+    slot: &mut Option<LedgerSlot>,
+    seq: &mut u64,
+    reads: &mut LedgerReads,
+    pubkey: &str,
+    now: Instant,
+) -> Command {
+    let read = next_ledger_read(slot, seq, pubkey);
+    reads.out = Some(*seq);
+    reads.started = Some(now);
+    reads.dirty = false;
+    reads.retry_at = None;
+    read
+}
+
+/// The gap since the last read started is over.
+fn ledger_gap_over(reads: &LedgerReads, now: Instant) -> bool {
+    reads.started.is_none_or(|t| now >= t + LEDGER_READ_GAP)
+}
+
+/// A ledger read for `pubkey`, or `None` when one is out or the last one
+/// started less than [`LEDGER_READ_GAP`] ago: the reply or the timer then
+/// sends one more. Another account reads at once.
 fn request_ledger(
     slot: &mut Option<LedgerSlot>,
     seq: &mut u64,
     reads: &mut LedgerReads,
     pubkey: &str,
+    now: Instant,
 ) -> Option<Command> {
-    if reads.out.as_ref().is_some_and(|(out, _)| out == pubkey) {
+    ledger_account(reads, pubkey);
+    if reads.out.is_some() || !ledger_gap_over(reads, now) {
         reads.dirty = true;
         return None;
     }
-    let read = next_ledger_read(slot, seq, pubkey);
-    reads.out = Some((pubkey.to_string(), *seq));
-    reads.dirty = false;
-    Some(read)
+    Some(start_ledger_read(slot, seq, reads, pubkey, now))
 }
 
-/// The reply (success or failure) to read `reply_seq` for `pubkey` landed:
-/// the follow-up read when one was asked for while it was out.
+/// ⌘R: reads at once, gap or not. A read already out answers it, with one
+/// more after it as for any request.
+fn refresh_ledger(
+    slot: &mut Option<LedgerSlot>,
+    seq: &mut u64,
+    reads: &mut LedgerReads,
+    pubkey: &str,
+    now: Instant,
+) -> Option<Command> {
+    ledger_account(reads, pubkey);
+    if reads.out.is_some() {
+        reads.dirty = true;
+        return None;
+    }
+    Some(start_ledger_read(slot, seq, reads, pubkey, now))
+}
+
+/// The reply to read `reply_seq` for `pubkey` landed, `ok` or failed. A
+/// failure schedules the next retry from [`LEDGER_RETRY_AFTER`]; a success
+/// clears them. Sends the waiting read when the gap is already over.
 fn ledger_replied(
     slot: &mut Option<LedgerSlot>,
     seq: &mut u64,
     reads: &mut LedgerReads,
     pubkey: &str,
     reply_seq: u64,
+    ok: bool,
+    now: Instant,
 ) -> Option<Command> {
-    if reads.out.as_ref().is_none_or(|(out, s)| out != pubkey || *s != reply_seq) {
+    if reads.account.as_deref() != Some(pubkey) || reads.out != Some(reply_seq) {
         return None;
     }
     reads.out = None;
-    if !std::mem::take(&mut reads.dirty) {
+    if ok {
+        reads.failures = 0;
+        reads.retry_at = None;
+    } else {
+        reads.retry_at = LEDGER_RETRY_AFTER.get(reads.failures).map(|wait| now + *wait);
+        reads.failures += 1;
+    }
+    (reads.dirty && ledger_gap_over(reads, now))
+        .then(|| start_ledger_read(slot, seq, reads, pubkey, now))
+}
+
+/// The timer armed for `pubkey` went off: the waiting read or a due retry
+/// goes out. A timer for another account, or one that a newer read has
+/// overtaken, does nothing.
+fn ledger_timer_fired(
+    slot: &mut Option<LedgerSlot>,
+    seq: &mut u64,
+    reads: &mut LedgerReads,
+    pubkey: &str,
+    now: Instant,
+) -> Option<Command> {
+    if reads.account.as_deref() != Some(pubkey) || reads.out.is_some() {
         return None;
     }
-    request_ledger(slot, seq, reads, pubkey)
+    let due = reads.dirty || reads.retry_at.is_some_and(|t| now >= t);
+    (due && ledger_gap_over(reads, now)).then(|| start_ledger_read(slot, seq, reads, pubkey, now))
 }
 
 /// The claimant's one-field claim form for the selected bounty.
@@ -1143,8 +1266,11 @@ pub struct Shell {
     pub(crate) ledger: Option<LedgerSlot>,
     /// The last `FetchLedger` sequence number sent.
     ledger_seq: u64,
-    /// The ledger read in flight, so requests that land meanwhile coalesce.
+    /// When the ledger reads go out: one at a time, paced, retried.
     ledger_reads: LedgerReads,
+    /// The task that wakes `ledger_reads`: the account it is for, the
+    /// deadline it sleeps to (`None` once it ended) and the task itself.
+    ledger_timer: Option<(String, Option<Instant>, Task<()>)>,
     /// The Payments screen's tab.
     pub(crate) payments_tab: Direction,
     /// The highlighted Payments row, by (bounty id, claim event id).
@@ -1293,6 +1419,13 @@ impl Shell {
             _ => None,
         }
     }
+
+    /// The rows on screen predate a refresh that failed: when they were read
+    /// (unix seconds), and whether automatic retries are still coming.
+    pub(crate) fn ledger_stale(&self) -> Option<(u64, bool)> {
+        let slot = self.ledger.as_ref().filter(|slot| slot.stale)?;
+        Some((slot.read_at, self.ledger_reads.retrying()))
+    }
 }
 
 impl Shell {
@@ -1391,6 +1524,7 @@ impl Shell {
             ledger: None,
             ledger_seq: 0,
             ledger_reads: LedgerReads::default(),
+            ledger_timer: None,
             payments_tab: Direction::PaidByMe,
             payment_selected: None,
             selected: None,
@@ -1639,31 +1773,112 @@ impl Shell {
 
     /// Asks for the active account's payments ledger. A re-read keeps the
     /// rows on screen until the reply lands; read-only mode has none. While
-    /// a read is out this only marks the ledger for one more read.
-    fn fetch_ledger(&mut self) {
+    /// a read is out, or the last started under [`LEDGER_READ_GAP`] ago,
+    /// this only marks the ledger for one more read.
+    fn fetch_ledger(&mut self, cx: &mut Context<Self>) {
+        self.ask_ledger(request_ledger, cx);
+    }
+
+    /// ⌘R's ledger read: at once, gap or not.
+    fn refresh_ledger(&mut self, cx: &mut Context<Self>) {
+        self.ask_ledger(refresh_ledger, cx);
+    }
+
+    fn ask_ledger(
+        &mut self,
+        ask: fn(&mut Option<LedgerSlot>, &mut u64, &mut LedgerReads, &str, Instant) -> Option<Command>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pubkey) = self.active.clone() else {
             self.ledger = None;
             self.ledger_reads = LedgerReads::default();
+            self.ledger_timer = None;
             return;
         };
-        if let Some(read) =
-            request_ledger(&mut self.ledger, &mut self.ledger_seq, &mut self.ledger_reads, &pubkey)
-        {
-            let _ = self.commands.unbounded_send(read);
-        }
+        let read = ask(
+            &mut self.ledger,
+            &mut self.ledger_seq,
+            &mut self.ledger_reads,
+            &pubkey,
+            Instant::now(),
+        );
+        self.send_ledger_read(read, cx);
     }
 
-    /// A ledger reply landed: send the read that was asked for meanwhile.
-    fn ledger_replied(&mut self, pubkey: &str, seq: u64) {
-        if let Some(read) = ledger_replied(
+    /// A ledger reply landed: send the read that was asked for meanwhile, or
+    /// wait for the gap or a retry.
+    fn ledger_replied(&mut self, pubkey: &str, seq: u64, ok: bool, cx: &mut Context<Self>) {
+        let read = ledger_replied(
             &mut self.ledger,
             &mut self.ledger_seq,
             &mut self.ledger_reads,
             pubkey,
             seq,
+            ok,
+            Instant::now(),
+        );
+        self.send_ledger_read(read, cx);
+    }
+
+    fn send_ledger_read(&mut self, read: Option<Command>, cx: &mut Context<Self>) {
+        if let Some(read) = read {
+            let _ = self.commands.unbounded_send(read);
+        }
+        self.arm_ledger_timer(cx);
+    }
+
+    /// Keeps one timer on [`LedgerReads::wake_at`] for the active account.
+    /// Replacing the timer drops, and so cancels, the old one; the timer
+    /// itself only sends `FetchLedger` through [`ledger_timer_fired`].
+    fn arm_ledger_timer(&mut self, cx: &mut Context<Self>) {
+        let wake = self.active.clone().zip(self.ledger_reads.wake_at());
+        let armed = self.ledger_timer.as_ref().and_then(|(p, at, _)| Some((p.as_str(), (*at)?)));
+        if armed == wake.as_ref().map(|(p, at)| (p.as_str(), *at)) {
+            return;
+        }
+        self.ledger_timer = wake.map(|(pubkey, at)| {
+            let woken = pubkey.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let mut at = at;
+                // Ends by returning, never by dropping itself: a fire that
+                // leaves more to wait for only moves the deadline.
+                loop {
+                    cx.background_executor()
+                        .timer(at.saturating_duration_since(Instant::now()))
+                        .await;
+                    match this.update(cx, |shell, cx| shell.ledger_timer_fired(&woken, cx)) {
+                        Ok(Some(next)) => at = next,
+                        _ => return,
+                    }
+                }
+            });
+            (pubkey, Some(at), task)
+        });
+    }
+
+    /// The ledger timer for `pubkey` went off. The next deadline when it
+    /// should sleep again, `None` when it ends.
+    fn ledger_timer_fired(&mut self, pubkey: &str, cx: &mut Context<Self>) -> Option<Instant> {
+        if let Some(read) = ledger_timer_fired(
+            &mut self.ledger,
+            &mut self.ledger_seq,
+            &mut self.ledger_reads,
+            pubkey,
+            Instant::now(),
         ) {
             let _ = self.commands.unbounded_send(read);
         }
+        let next = self
+            .ledger_reads
+            .wake_at()
+            .filter(|_| self.active.as_deref() == Some(pubkey));
+        if let Some((armed, at, _)) = &mut self.ledger_timer
+            && armed == pubkey
+        {
+            *at = next;
+        }
+        cx.notify();
+        next
     }
 
     /// A tab click: the Eligible tab re-reads its list, and the selection
@@ -1843,7 +2058,7 @@ impl Shell {
                     self.send_inputs.clear(window, cx);
                     self.prefill_address(window, cx);
                     self.fetch_eligible();
-                    self.fetch_ledger();
+                    self.fetch_ledger(cx);
                     self.reconcile_selection(window, cx);
                 }
                 let first_load = !self.first_screen_decided;
@@ -1948,7 +2163,7 @@ impl Shell {
                 if self.active.is_none() {
                     self.active = Some(pubkey.clone());
                     self.fetch_eligible();
-                    self.fetch_ledger();
+                    self.fetch_ledger(cx);
                 }
                 // The create path continues straight into the wallet: the
                 // view exists now, so its panel can show the spinner.
@@ -2190,13 +2405,16 @@ impl Shell {
                 seq,
                 ledger,
             } => {
-                if land(self.ledger.as_mut(), &pubkey, seq, Ok(ledger))
-                    && matches!(self.bounty_tab, BountyTab::Issued | BountyTab::Claimed)
-                {
-                    self.refresh_order();
-                    self.reconcile_selection(window, cx);
+                if land(self.ledger.as_mut(), &pubkey, seq, Ok(ledger)) {
+                    if let Some(slot) = self.ledger.as_mut() {
+                        slot.read_at = now;
+                    }
+                    if matches!(self.bounty_tab, BountyTab::Issued | BountyTab::Claimed) {
+                        self.refresh_order();
+                        self.reconcile_selection(window, cx);
+                    }
                 }
-                self.ledger_replied(&pubkey, seq);
+                self.ledger_replied(&pubkey, seq, true, cx);
             }
             Update::LedgerFailed {
                 pubkey,
@@ -2210,7 +2428,7 @@ impl Shell {
                         self.reconcile_selection(window, cx);
                     }
                 }
-                self.ledger_replied(&pubkey, seq);
+                self.ledger_replied(&pubkey, seq, false, cx);
             }
             Update::BountyDetail(detail) => {
                 if self.optimistic.as_ref().is_some_and(|b| b.id == detail.bounty.id) {
@@ -2223,7 +2441,7 @@ impl Shell {
                 let was = self.details.get(&detail.bounty.id).map(|d| d.claims.len());
                 self.details.insert(detail.bounty.id.clone(), *detail);
                 if was.is_some_and(|was| was != claims) {
-                    self.fetch_ledger();
+                    self.fetch_ledger(cx);
                 }
             }
             Update::DListPublished { pubkey, coordinate } => {
@@ -2268,7 +2486,7 @@ impl Shell {
                 let _ = self.commands.unbounded_send(Command::WatchBounty { id });
                 self.fetch_bounties();
                 // A new bounty changes what this account has pledged.
-                self.fetch_ledger();
+                self.fetch_ledger(cx);
             }
             Update::ClaimPublished {
                 bounty_id,
@@ -2312,7 +2530,7 @@ impl Shell {
                     .unbounded_send(Command::WatchBounty { id: bounty_id });
                 // The claim may have used the account's last slot.
                 self.fetch_eligible();
-                self.fetch_ledger();
+                self.fetch_ledger(cx);
             }
             Update::PaymentState {
                 bounty_id,
@@ -2342,7 +2560,7 @@ impl Shell {
                     window.push_notification(Notification::info(text), cx);
                 }
                 // The runtime sends this only on a change.
-                self.fetch_ledger();
+                self.fetch_ledger(cx);
             }
             Update::ReceiptSeen {
                 bounty_id: _,
@@ -2361,7 +2579,7 @@ impl Shell {
                     if at > 0 { at } else { now },
                 );
                 // A "Paid, no receipt" row turns "Paid" now, not at ⌘R.
-                self.fetch_ledger();
+                self.fetch_ledger(cx);
             }
             Update::Error { source, message } => {
                 sentry::capture_message(&format!("{source:?}: {message}"), sentry::Level::Error);
@@ -2506,7 +2724,7 @@ impl Shell {
                 pubkey: pubkey.to_string(),
             });
             self.fetch_eligible();
-            self.fetch_ledger();
+            self.fetch_ledger(cx);
             self.reconcile_selection(window, cx);
         }
         self.sync_balance_poll(cx);
@@ -2876,6 +3094,7 @@ impl Shell {
             send: &self.send_inputs,
             address: &self.address_input,
             debts,
+            debts_stale: self.ledger_stale().is_some(),
         }
     }
 
@@ -3118,7 +3337,7 @@ impl Shell {
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.fetch_bounties();
         self.fetch_eligible();
-        self.fetch_ledger();
+        self.refresh_ledger(cx);
         let _ = self.commands.unbounded_send(Command::LoadAccounts);
         // LoadAccounts re-reads every kind-0; a failed one is pending again.
         for (_, view) in &mut self.views {
@@ -4729,7 +4948,11 @@ mod tests {
         BountyTab, EligibleSlot, Load, Screen, find_bounty, house_reply_pick, land_eligible,
         next_eligible_read, opens_claim, selection_for, takes,
     };
-    use super::{LedgerReads, LedgerSlot, claimable_from_tab, land, ledger_replied, next_ledger_read, request_ledger};
+    use super::{
+        LEDGER_READ_GAP, LedgerReads, LedgerSlot, claimable_from_tab, land, ledger_replied,
+        ledger_timer_fired, next_ledger_read, next_read, refresh_ledger, request_ledger,
+    };
+    use std::time::{Duration, Instant};
     use magic_carpet_chat::ledger::Ledger;
     use magic_carpet_chat::api::Bounty;
     use std::collections::{HashMap, HashSet};
@@ -4868,28 +5091,224 @@ mod tests {
             Some(Command::FetchLedger { pubkey, seq }) => (pubkey, seq),
             _ => panic!("no ledger read sent"),
         };
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
 
         // Three requests in a row (an auto-pay tick, ⌘R): one read.
-        let (_, a1) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "a"));
-        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "a").is_none());
-        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "a").is_none());
+        let (_, a1) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(0)));
+        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(1)).is_none());
+        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(2)).is_none());
         // Its reply sends exactly one more, and that one's reply none.
-        let (to, a2) = sent(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a1));
+        let (to, a2) = sent(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a1, true, at(10)));
         assert_eq!((to.as_str(), a2), ("a", 2));
-        assert!(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a2).is_none());
+        assert!(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a2, true, at(11)).is_none());
         // The previous rows stay on screen during the follow-up read.
         assert!(land(slot.as_mut(), "a", a2, Ok(Ledger::default())));
-        let (_, a3) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "a"));
+        let (_, a3) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(20)));
         assert!(matches!(&slot, Some(LedgerSlot { list: Load::Ready(_), .. })));
 
         // An account switch mid-read reads for the new account at once; the
         // old account's reply sends nothing.
-        let (to, b4) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "b"));
+        let (to, b4) = sent(request_ledger(&mut slot, &mut seq, &mut reads, "b", at(21)));
         assert_eq!((to.as_str(), b4), ("b", 4));
-        assert!(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a3).is_none());
-        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "b").is_none());
-        let (to, _) = sent(ledger_replied(&mut slot, &mut seq, &mut reads, "b", b4));
+        assert!(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a3, true, at(22)).is_none());
+        assert!(request_ledger(&mut slot, &mut seq, &mut reads, "b", at(23)).is_none());
+        let (to, _) = sent(ledger_replied(&mut slot, &mut seq, &mut reads, "b", b4, true, at(31)));
         assert_eq!(to, "b");
+    }
+
+    /// The seq of the ledger read `command` sends, if it sends one.
+    fn ledger_read(command: Option<Command>) -> Option<u64> {
+        match command {
+            Some(Command::FetchLedger { seq, .. }) => Some(seq),
+            Some(_) => panic!("not a ledger read"),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn a_burst_of_ledger_requests_reads_at_most_four_times_in_thirty_seconds() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let mut reads = LedgerReads::default();
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // 20 requests 1.5 s apart; every read answers 1 s after it starts;
+        // the Shell's timer fires when `wake_at` says.
+        let mut out: Option<(u64, Instant)> = None;
+        let (mut started, mut last_request) = (Vec::new(), ms(0));
+        for tick in 0..=40_000 {
+            let now = ms(tick);
+            if let Some((reply, when)) = out
+                && now >= when
+            {
+                out = None;
+                if let Some(s) = ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", reply, true, now)) {
+                    out = Some((s, now + Duration::from_secs(1)));
+                    started.push(now);
+                }
+            }
+            if tick % 1_500 == 0 && tick < 30_000 {
+                last_request = now;
+                if let Some(s) = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", now)) {
+                    out = Some((s, now + Duration::from_secs(1)));
+                    started.push(now);
+                }
+            }
+            if reads.wake_at().is_some_and(|wake| now >= wake)
+                && let Some(s) = ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", now))
+            {
+                out = Some((s, now + Duration::from_secs(1)));
+                started.push(now);
+            }
+        }
+        let in_burst = started.iter().filter(|t| **t < ms(30_000)).count();
+        assert!(in_burst <= 4, "{in_burst} reads in 30 s");
+        assert!(started.windows(2).all(|w| w[1] - w[0] >= LEDGER_READ_GAP));
+        // The last request is answered by a read that starts after it.
+        assert!(started.last().is_some_and(|t| *t >= last_request));
+        assert_eq!(reads.wake_at(), None);
+    }
+
+    #[test]
+    fn ledger_requests_inside_the_gap_send_exactly_one_trailing_read() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let mut reads = LedgerReads::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        let a1 = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(0)));
+        let a1 = a1.expect("the first read goes out at once");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a1, true, at(1))), None);
+        for s in 2..9 {
+            assert_eq!(ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(s))), None);
+        }
+        assert_eq!(reads.wake_at(), Some(at(10)));
+        // Early is nothing; at the end of the gap, one read.
+        assert_eq!(ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(9))), None);
+        let a2 = ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(10)));
+        let a2 = a2.expect("one trailing read");
+        assert_eq!(reads.wake_at(), None);
+        assert_eq!(ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(10))), None);
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a2, true, at(11))), None);
+        assert_eq!(reads.wake_at(), None);
+    }
+
+    #[test]
+    fn refresh_inside_the_gap_reads_at_once() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let mut reads = LedgerReads::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        let a1 = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(0)));
+        let a1 = a1.expect("the first read goes out at once");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a1, true, at(1))), None);
+        assert_eq!(ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(2))), None);
+        assert!(ledger_read(refresh_ledger(&mut slot, &mut seq, &mut reads, "a", at(3))).is_some());
+        // It answered the waiting request too.
+        assert_eq!(reads.wake_at(), None);
+    }
+
+    #[test]
+    fn a_failed_ledger_read_retries_after_15_then_60_seconds_then_stops() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let mut reads = LedgerReads::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        let a1 = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(0)));
+        let a1 = a1.expect("the first read goes out at once");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a1, false, at(1))), None);
+        assert_eq!(reads.wake_at(), Some(at(16)));
+        assert!(reads.retrying());
+        let a2 = ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(16)));
+        let a2 = a2.expect("the first retry");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a2, false, at(17))), None);
+        assert_eq!(reads.wake_at(), Some(at(77)));
+        assert!(reads.retrying());
+        let a3 = ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(77)));
+        let a3 = a3.expect("the second retry");
+        assert!(reads.retrying(), "the last retry is out");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a3, false, at(78))), None);
+        assert_eq!(reads.wake_at(), None);
+        assert!(!reads.retrying());
+        assert_eq!(ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(500))), None);
+    }
+
+    #[test]
+    fn a_successful_ledger_read_clears_the_retries() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let mut reads = LedgerReads::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        let a1 = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(0)));
+        let a1 = a1.expect("the first read goes out at once");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a1, false, at(1))), None);
+        assert_eq!(reads.wake_at(), Some(at(16)));
+        // A trigger after the gap reads, and that read stands in for the retry.
+        let a2 = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(12)));
+        let a2 = a2.expect("a trigger past the gap reads");
+        assert_eq!(ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(16))), None);
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a2, true, at(17))), None);
+        assert_eq!(reads.wake_at(), None);
+        assert_eq!(ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(18))), None);
+        // A later failure starts the retries over at 15 s.
+        let a3 = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(30)));
+        let a3 = a3.expect("past the gap");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a3, false, at(31))), None);
+        assert_eq!(reads.wake_at(), Some(at(46)));
+    }
+
+    #[test]
+    fn an_account_switch_reads_at_once_and_a_late_timer_for_the_old_account_does_nothing() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let mut reads = LedgerReads::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        let a1 = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(0)));
+        let a1 = a1.expect("the first read goes out at once");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "a", a1, false, at(1))), None);
+        assert_eq!(ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(2))), None);
+        // Inside A's gap and with A's retry pending, B still reads at once.
+        let b2 = ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "b", at(3)));
+        let b2 = b2.expect("a switch reads at once");
+        assert_eq!(ledger_read(ledger_replied(&mut slot, &mut seq, &mut reads, "b", b2, true, at(4))), None);
+        assert_eq!(reads.wake_at(), None, "A's retry and trailing read are gone");
+        assert_eq!(ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(10))), None);
+        assert_eq!(ledger_read(ledger_timer_fired(&mut slot, &mut seq, &mut reads, "a", at(16))), None);
+        // Back to A: a fresh start, read at once.
+        assert!(ledger_read(request_ledger(&mut slot, &mut seq, &mut reads, "a", at(5))).is_some());
+    }
+
+    #[test]
+    fn the_ledger_is_stale_exactly_between_a_failed_refresh_and_the_next_success() {
+        let (mut slot, mut seq): (Option<LedgerSlot>, u64) = (None, 0);
+        let stale = |slot: &Option<LedgerSlot>| slot.as_ref().is_some_and(|s| s.stale);
+
+        // A failed first load is a failure, not stale rows.
+        let a1 = next_read(&mut slot, &mut seq, "a");
+        assert!(land(slot.as_mut(), "a", a1, Err("down".into())));
+        assert!(!stale(&slot));
+        let a2 = next_read(&mut slot, &mut seq, "a");
+        assert!(land(slot.as_mut(), "a", a2, Ok(Ledger::default())));
+        assert!(!stale(&slot));
+        let a3 = next_read(&mut slot, &mut seq, "a");
+        let a4 = next_read(&mut slot, &mut seq, "a");
+        assert!(land(slot.as_mut(), "a", a3, Err("down".into())));
+        assert!(stale(&slot));
+        let a5 = next_read(&mut slot, &mut seq, "a");
+        assert!(stale(&slot), "a read out is not a success");
+        assert!(land(slot.as_mut(), "a", a4, Err("down".into())));
+        assert!(stale(&slot));
+        assert!(land(slot.as_mut(), "a", a5, Ok(Ledger::default())));
+        assert!(!stale(&slot));
+        // Another account starts with a fresh slot.
+        let a6 = next_read(&mut slot, &mut seq, "a");
+        assert!(land(slot.as_mut(), "a", a6, Err("down".into())));
+        let _ = next_read(&mut slot, &mut seq, "b");
+        assert!(!stale(&slot));
     }
 
     #[test]
