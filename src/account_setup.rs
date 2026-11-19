@@ -17,6 +17,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use magic_carpet_chat::lnbits;
+
 use crate::a11y::Accessible as _;
 use crate::dashboard::{MONO, muted};
 use crate::palette::*;
@@ -274,8 +276,14 @@ fn create_card(setup: &AccountSetup, cx: &mut Context<Shell>) -> AnyElement {
         .child(dot_row(
             "setup-wallet-note",
             GREEN,
-            "A Coinos wallet opens with this account so claims can pay you. \
-             Coinos holds your sats, so keep the balance small.",
+            match lnbits::signup_host() {
+                Some(host) => format!(
+                    "A wallet on {host} opens with this account so claims can pay you."
+                ),
+                None => "A Coinos wallet opens with this account so claims can pay you. \
+                         Coinos holds your sats, so keep the balance small."
+                    .to_string(),
+            },
             TEXT_MUTED,
         ))
         .children(error_line(setup.error.clone()))
@@ -474,7 +482,10 @@ fn ready_steps(shell: &Shell, summary: &ReadySummary, cx: &mut Context<Shell>) -
     let wallet_tag = if let Some(created) = &view.wallet.created {
         Some(status_tag(
             "setup-step-wallet-tag",
-            format!("Coinos wallet ready — {}", created.lightning_address),
+            match &created.server_host {
+                Some(host) => format!("Wallet ready on {host} — {}", created.lightning_address),
+                None => format!("Coinos wallet ready — {}", created.lightning_address),
+            },
         ))
     } else {
         view.lud16

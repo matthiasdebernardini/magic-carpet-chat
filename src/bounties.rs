@@ -1208,9 +1208,9 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             } else if form.submitting {
                 "Publishing…"
             } else if form.existing_list.is_some() {
-                "Enter moves to the next field. Enter on the last field creates the bounty. With auto-pay on, this app pays qualifying claims from your Coinos wallet while it runs. esc cancels."
+                "Enter moves to the next field. Enter on the last field creates the bounty. With auto-pay on, this app pays qualifying claims from your wallet while it runs. esc cancels."
             } else {
-                "Enter moves to the next field. Enter on the last field publishes the list and creates the bounty. With auto-pay on, this app pays qualifying claims from your Coinos wallet while it runs. esc cancels."
+                "Enter moves to the next field. Enter on the last field publishes the list and creates the bounty. With auto-pay on, this app pays qualifying claims from your wallet while it runs. esc cancels."
             },
             Some(form_locked(form.submitting, form.checking_list)),
             cx,

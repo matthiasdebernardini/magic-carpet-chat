@@ -570,6 +570,7 @@ async fn issuer_pays_a_claimant_on_another_lightning_provider() {
             username: String::new(),
             password: Secret::new(""),
             token,
+            server: None,
         },
     )
     .expect("store the payer token as the issuer's wallet");

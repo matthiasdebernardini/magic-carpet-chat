@@ -24,6 +24,7 @@ use magic_carpet_chat::bounty_search::{self, Snapshot, Visits};
 use magic_carpet_chat::coinos;
 use magic_carpet_chat::events;
 use magic_carpet_chat::ledger::{self, Direction, Ledger, Row};
+use magic_carpet_chat::lnbits;
 use magic_carpet_chat::nostr::{self, Command, ErrorSource, Update, WalletCreated};
 use magic_carpet_chat::secrets::{self, Secret};
 
@@ -2113,6 +2114,7 @@ impl Shell {
                             view.wallet.has_token = true;
                             if view.wallet.created.is_none() {
                                 view.wallet.created = Some(WalletCreated {
+                                    server_host: wallet.server_host,
                                     username: wallet.username,
                                     lightning_address: wallet.lightning_address,
                                     publish_error: None,
@@ -2260,7 +2262,10 @@ impl Shell {
                     self.setup.working = self
                         .setup
                         .awaiting_wallet
-                        .then_some("Opening your Coinos wallet…");
+                        .then_some(match lnbits::signup_host() {
+                            Some(_) => "Opening your wallet…",
+                            None => "Opening your Coinos wallet…",
+                        });
                     self.setup.ready = Some(ReadySummary {
                         pubkey,
                         npub,
@@ -2286,7 +2291,13 @@ impl Shell {
                 };
                 self.push_activity(
                     dot,
-                    format!("Coinos wallet ready: {}{suffix}", created.lightning_address),
+                    match &created.server_host {
+                        Some(host) => format!(
+                            "Wallet ready on {host}: {}{suffix}",
+                            created.lightning_address
+                        ),
+                        None => format!("Coinos wallet ready: {}{suffix}", created.lightning_address),
+                    },
                     now,
                 );
                 if let Some(view) = self.view_mut(&pubkey) {
@@ -2304,7 +2315,7 @@ impl Shell {
                     view.wallet.error = Some(message.clone());
                 }
                 let who = self.label(&pubkey);
-                self.push_activity(RED, format!("Coinos wallet problem for {who}: {message}"), now);
+                self.push_activity(RED, format!("Wallet problem for {who}: {message}"), now);
                 self.finish_setup_wallet(&pubkey);
             }
             Update::LightningAddressSet { pubkey, address } => {
@@ -3369,13 +3380,19 @@ impl Shell {
             }
             BalanceCheck::Done => {}
         }
-        let sats = self.view(pubkey)?.wallet.balance?;
+        let wallet = &self.view(pubkey)?.wallet;
+        let sats = wallet.balance?;
+        let on_server = wallet.created.as_ref().is_some_and(|c| c.server_host.is_some());
         (sats > 0).then(|| {
-            format!(
-                "This wallet still holds {} sats. Send them first, \
-                 or copy the Coinos username and password.",
-                timefmt::fmt_sats(sats)
-            )
+            if on_server {
+                format!("This wallet still holds {} sats. Send them first.", timefmt::fmt_sats(sats))
+            } else {
+                format!(
+                    "This wallet still holds {} sats. Send them first, \
+                     or copy the Coinos username and password.",
+                    timefmt::fmt_sats(sats)
+                )
+            }
         })
     }
 

@@ -1005,7 +1005,7 @@ fn remove_card(shell: &Shell, pubkey: &str, cx: &mut Context<Shell>) -> AnyEleme
                                 .text_size(px(12.5))
                                 .text_color(rgb(TEXT_MUTED))
                                 .child(
-                                    "Deletes the nsec and Coinos login from accounts.json. \
+                                    "Deletes the nsec and wallet login from accounts.json. \
                                      Export the nsec first if you ever want this identity back.",
                                 ),
                         )

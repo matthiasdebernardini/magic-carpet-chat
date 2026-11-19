@@ -139,7 +139,7 @@ impl Hold {
         Some(match self {
             Hold::Paid => return None,
             Hold::Attempted(AttemptState::Sending | AttemptState::Unknown) => {
-                "Payment outcome unknown. The app won't try again; check the issuer's Coinos wallet."
+                "Payment outcome unknown. The app won't try again; check the issuer's wallet."
                     .to_string()
             }
             Hold::Attempted(AttemptState::Paid) => {

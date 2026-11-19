@@ -18,6 +18,7 @@ pub mod coinos;
 pub mod diag;
 pub mod events;
 pub mod ledger;
+pub mod lnbits;
 pub mod nostr;
 pub mod secrets;
 pub mod timefmt;

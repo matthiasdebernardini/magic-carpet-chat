@@ -27,6 +27,7 @@ use crate::coinos;
 use crate::diag;
 use crate::events::{self, EventError};
 use crate::ledger::{self, ClaimView, Direction, Ledger, Row, Status};
+use crate::lnbits;
 use crate::secrets::{self, Secret, SecretError};
 use crate::trust::{self, Assertion, BrainstormKey, Designation};
 
@@ -647,6 +648,8 @@ pub struct PublishOk {
 /// only — fixed text, and the password stays in the store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalletCreated {
+    /// The LNbits server's host for a wallet there; `None` is Coinos.
+    pub server_host: Option<String>,
     pub username: String,
     pub lightning_address: String,
     pub publish_error: Option<String>,
@@ -664,6 +667,8 @@ pub struct AccountInfo {
 /// login saved before a register that never answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletInfo {
+    /// The LNbits server's host for a wallet there; `None` is Coinos.
+    pub server_host: Option<String>,
     pub username: String,
     pub lightning_address: String,
     pub has_token: bool,
@@ -1610,7 +1615,8 @@ const NO_TOKEN: &str = "This app lost access to the wallet. Remove the account a
 /// A login already stored with a token (a retry after a publish failure)
 /// skips to step 3. One stored WITHOUT a token probes coinos first: no
 /// wallet → register with the same login; a wallet → [`NO_TOKEN`], never a
-/// second account.
+/// second account. Steps 1 and 2 are [`open_wallet`], which also covers a
+/// wallet on an LNbits server.
 async fn create_coinos_wallet(
     sessions: SharedSessions,
     pubkey: String,
@@ -1631,33 +1637,12 @@ async fn create_coinos_wallet(
         Err(e) => return fail(e.to_string()),
     };
 
-    let stored = match secrets::load_coinos_login(&pubkey) {
-        Ok(stored) => stored,
-        Err(e) => return fail(e.to_string()),
-    };
-    let login = match stored {
-        Some(login) if login.has_token() => login,
-        Some(login) => match coinos::wallet_exists(&login.username).await {
-            Ok(true) => return fail(NO_TOKEN.into()),
-            Ok(false) => match register_wallet(&pubkey, login).await {
-                Ok(login) => login,
-                Err(message) => return fail(message),
-            },
-            Err(e) => return fail(e.to_string()),
-        },
-        None => {
-            let login = coinos::Login::fresh();
-            if let Err(e) = secrets::store_coinos_login(&pubkey, &login) {
-                return fail(e.to_string());
-            }
-            match register_wallet(&pubkey, login).await {
-                Ok(login) => login,
-                Err(message) => return fail(message),
-            }
-        }
+    let login = match open_wallet(&pubkey).await {
+        Ok(login) => login,
+        Err(message) => return fail(message),
     };
 
-    let lightning_address = coinos::lightning_address(&login.username);
+    let lightning_address = login.lightning_address();
     let published = publish_lud16(
         &keys,
         &api,
@@ -1671,6 +1656,7 @@ async fn create_coinos_wallet(
     let _ = updates.unbounded_send(Update::WalletCreated {
         pubkey: pubkey.clone(),
         created: WalletCreated {
+            server_host: login.server_host(),
             username: login.username,
             lightning_address,
             publish_error: published.as_ref().err().map(ToString::to_string),
@@ -1680,6 +1666,93 @@ async fn create_coinos_wallet(
         let profile = Profile::from_value(&serde_json::Value::Object(profile));
         let _ = updates.unbounded_send(profile_loaded(pubkey, profile));
     }
+}
+
+/// Steps 1 and 2 of the signup for `pubkey`'s stored account: the login it
+/// already has, finished if it needs it, or a new one. A new wallet goes to
+/// the LNbits server in `MC_WALLET_SERVER` when that is set, else to Coinos;
+/// a stored login keeps the service it names. The error is the fixed text
+/// the panel shows.
+pub async fn open_wallet(pubkey: &str) -> Result<coinos::Login, String> {
+    match secrets::load_coinos_login(pubkey).map_err(|e| e.to_string())? {
+        Some(login) => match login.server.clone() {
+            Some(server) => open_server_wallet(pubkey, &server, login).await,
+            None if login.has_token() => Ok(login),
+            None => match coinos::wallet_exists(&login.username).await {
+                Ok(true) => Err(NO_TOKEN.into()),
+                Ok(false) => register_wallet(pubkey, login).await,
+                Err(e) => Err(e.to_string()),
+            },
+        },
+        None => {
+            let server = lnbits::server_from_env().map_err(|e| e.to_string())?;
+            let login = match &server {
+                Some(server) => coinos::Login::fresh_on(server.clone()),
+                None => coinos::Login::fresh(),
+            };
+            secrets::store_coinos_login(pubkey, &login).map_err(|e| e.to_string())?;
+            match server {
+                Some(server) => open_server_wallet(pubkey, &server, login).await,
+                None => register_wallet(pubkey, login).await,
+            }
+        }
+    }
+}
+
+/// Fixed text for an address name that stays taken after one fresh pick.
+const NAME_TAKEN: &str = "The wallet server already has that address name. Try again.";
+
+/// The LNbits half of [`open_wallet`], with the login already in the store:
+///
+/// 1. No admin key yet: create the account and store its key at once. An
+///    earlier try may have made an account whose key never came back; that
+///    empty account is harmless, and nothing could reach it anyway.
+/// 2. With a key: an address that already answers is done. Otherwise create
+///    it. A 409 on a name this wallet's own links hold is done too; on a
+///    name someone else holds, store a fresh name and try once more.
+async fn open_server_wallet(
+    pubkey: &str,
+    server: &str,
+    mut login: coinos::Login,
+) -> Result<coinos::Login, String> {
+    if !login.has_token() {
+        match lnbits::create_account(server, &login.username).await {
+            Ok(key) => {
+                login.token = key;
+                secrets::store_coinos_login(pubkey, &login).map_err(|e| e.to_string())?;
+            }
+            Err(e) => {
+                if e.account_definitely_not_created() {
+                    let _ = secrets::forget_coinos_login(pubkey);
+                }
+                return Err(e.to_string());
+            }
+        }
+    } else if lnbits::address_exists(server, &login.username)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(login);
+    }
+    for last in [false, true] {
+        let made = lnbits::create_address(server, &login.token, &login.username)
+            .await
+            .map_err(|e| e.to_string())?;
+        if made == lnbits::NewAddress::Created {
+            return Ok(login);
+        }
+        let own = lnbits::own_usernames(server, &login.token)
+            .await
+            .map_err(|e| e.to_string())?;
+        if own.iter().any(|name| name.eq_ignore_ascii_case(&login.username)) {
+            return Ok(login);
+        }
+        if !last {
+            login = login.renamed();
+            secrets::store_coinos_login(pubkey, &login).map_err(|e| e.to_string())?;
+        }
+    }
+    Err(NAME_TAKEN.into())
 }
 
 /// "Save" on the payout address: the check first, so an address bounties
@@ -1778,7 +1851,7 @@ async fn send_sats(
         Ok(bolt11) => bolt11,
         Err(e) => return fail(e.to_string()),
     };
-    match coinos::pay_invoice(&login.token, &bolt11, sats).await {
+    match coinos::wallet_pay(&login, &bolt11, sats).await {
         Ok(()) => {
             let _ = updates.unbounded_send(Update::Sent {
                 pubkey: pubkey.clone(),
@@ -1821,7 +1894,7 @@ async fn fetch_balance(
             set.remove(&pubkey)
         }
     };
-    match coinos::balance(&login.token).await {
+    match coinos::wallet_balance(&login).await {
         Ok(sats) => {
             mark(false);
             let _ = updates.unbounded_send(Update::Balance {
@@ -1865,7 +1938,8 @@ async fn load_accounts(updates: mpsc::UnboundedSender<Update>) {
             npub: account.npub(),
             wallet: account.coinos.as_ref().map(|login| WalletInfo {
                 username: login.username.clone(),
-                lightning_address: coinos::lightning_address(&login.username),
+                lightning_address: login.lightning_address(),
+                server_host: login.server_host(),
                 has_token: login.has_token(),
             }),
         })
@@ -3577,12 +3651,16 @@ async fn pay_claim(
             return PayOutcome::Retry;
         }
     };
-    match coinos::balance(&login.token).await {
+    match coinos::wallet_balance(&login).await {
         Ok(balance) if balance < sats => {
+            let wallet = match login.server_host() {
+                Some(host) => format!("wallet on {host}"),
+                None => "Coinos wallet".to_string(),
+            };
             ctx.note(
                 &claim.address,
                 format!(
-                    "Wallet empty: the issuer's Coinos wallet holds {balance} sats, and the reward is {sats}."
+                    "Wallet empty: the issuer's {wallet} holds {balance} sats, and the reward is {sats}."
                 ),
             );
             return PayOutcome::Retry;
@@ -3646,7 +3724,7 @@ async fn pay_claim(
     };
     report("attempting", None);
 
-    let (state, reason) = match coinos::pay_invoice(&login.token, &bolt11, sats).await {
+    let (state, reason) = match coinos::wallet_pay(&login, &bolt11, sats).await {
         Ok(()) => (AttemptState::Paid, None),
         Err(e @ coinos::CoinosError::OutcomeUnknown) => (AttemptState::Unknown, Some(e.to_string())),
         Err(e) => (AttemptState::Failed, Some(e.to_string())),
@@ -7077,6 +7155,7 @@ mod tests {
         let update = Update::WalletCreated {
             pubkey: "aa".repeat(32),
             created: WalletCreated {
+                server_host: None,
                 username: "carpetab12cd34".into(),
                 lightning_address: "carpetab12cd34@coinos.io".into(),
                 publish_error: Some("The Nostr servers didn't accept the profile update.".into()),

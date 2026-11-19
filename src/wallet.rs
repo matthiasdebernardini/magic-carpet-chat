@@ -32,6 +32,7 @@ use qrcode::QrCode;
 
 use magic_carpet_chat::coinos::lnurl_pay;
 use magic_carpet_chat::ledger::Debts;
+use magic_carpet_chat::lnbits;
 use magic_carpet_chat::nostr::{self, WalletCreated};
 
 use crate::a11y::Accessible as _;
@@ -254,10 +255,11 @@ fn line(id: &'static str, text: impl Into<SharedString>, color: u32) -> Stateful
         .a11y(id, Role::Label, text)
 }
 
-fn button(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div> {
+fn button(id: &'static str, label: impl Into<SharedString>, primary: bool) -> Stateful<Div> {
+    let label: SharedString = label.into();
     let base = div()
         .id(id)
-        .a11y(id, Role::Button, label)
+        .a11y(id, Role::Button, label.clone())
         .px(px(14.))
         .py(px(8.))
         .rounded(px(9.))
@@ -591,7 +593,14 @@ pub fn panel(
             .gap(px(8.))
             .items_center()
             .child(Spinner::new().small().color(rgb(TEXT_MUTED).into()))
-            .child(line("wallet-opening", "Opening a Coinos wallet…", TEXT_MUTED))
+            .child(line(
+                "wallet-opening",
+                match lnbits::signup_host() {
+                    Some(host) => format!("Opening a wallet on {host}…"),
+                    None => "Opening a Coinos wallet…".to_string(),
+                },
+                TEXT_MUTED,
+            ))
     } else if let Some(address) = address {
         v_flex()
             .gap(px(10.))
@@ -636,41 +645,54 @@ pub fn panel(
                     .filter(|l| !l.eq_ignore_ascii_case(&created.lightning_address));
                 let username = created.username.clone();
                 let for_password = pubkey.clone();
-                this.child(
-                    v_flex()
-                        .gap(px(10.))
-                        .items_start()
-                        .child(line(
-                            "wallet-username",
-                            format!(
-                                "Coinos username: {}. Only needed on coinos.io.",
-                                created.username
-                            ),
-                            TEXT_MUTED,
-                        ))
-                        .child(
-                            h_flex()
-                                .gap(px(8.))
-                                .child(
-                                    button("wallet-copy-username", "Copy username", false)
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                username.clone(),
-                                            ));
-                                        })),
-                                )
-                                .child(
-                                    button("wallet-copy-password", "Copy password", false)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.copy_coinos_password(&for_password, cx);
-                                        })),
+                let this = match &created.server_host {
+                    // An LNbits wallet has no login to copy: the admin key
+                    // stays in the store.
+                    Some(host) => this.child(line(
+                        "wallet-server",
+                        format!("Wallet server: {host}."),
+                        TEXT_MUTED,
+                    )),
+                    None => this.child(
+                        v_flex()
+                            .gap(px(10.))
+                            .items_start()
+                            .child(line(
+                                "wallet-username",
+                                format!(
+                                    "Coinos username: {}. Only needed on coinos.io.",
+                                    created.username
                                 ),
-                        ),
-                )
-                .when_some(other.clone(), |this, other| {
+                                TEXT_MUTED,
+                            ))
+                            .child(
+                                h_flex()
+                                    .gap(px(8.))
+                                    .child(
+                                        button("wallet-copy-username", "Copy username", false)
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    username.clone(),
+                                                ));
+                                            })),
+                                    )
+                                    .child(
+                                        button("wallet-copy-password", "Copy password", false)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.copy_coinos_password(&for_password, cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+                };
+                let this_wallet = match created.server_host {
+                    Some(_) => "this wallet",
+                    None => "this Coinos wallet",
+                };
+                this.when_some(other.clone(), |this, other| {
                     this.child(line(
                         "wallet-other-address",
-                        format!("Claims pay {other}, not this Coinos wallet."),
+                        format!("Claims pay {other}, not {this_wallet}."),
                         TEXT_MUTED,
                     ))
                 })
@@ -728,10 +750,17 @@ pub fn panel(
                 AMBER,
             ))
             .child(
-                button("wallet-create", "Create a Coinos wallet for this account", true)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.create_wallet(for_create.clone(), cx)
-                    })),
+                button(
+                    "wallet-create",
+                    match lnbits::signup_host() {
+                        Some(host) => format!("Create a wallet on {host} for this account"),
+                        None => "Create a Coinos wallet for this account".to_string(),
+                    },
+                    true,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.create_wallet(for_create.clone(), cx)
+                })),
             )
     };
 

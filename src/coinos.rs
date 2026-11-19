@@ -20,8 +20,14 @@
 //!   (`lnurl_invoice`, any domain), so one account here can pay another, or
 //!   a Strike address, straight from the panel.
 //!
-//! ponytail: one provider, no account recovery, no NWC. Someone who outgrows
-//! a custodial wallet sets a different lud16 in any Nostr client.
+//! Two wallet services: hosted Coinos (above), or a self-hosted LNbits server
+//! (`crate::lnbits`) when `MC_WALLET_SERVER` is set at signup. The stored
+//! [`Login`] names its service, and [`wallet_balance`] / [`wallet_pay`]
+//! route every later read and payment on it. The LNURL code below is
+//! service-neutral.
+//!
+//! ponytail: no account recovery, no NWC. Someone who outgrows a custodial
+//! wallet sets a different lud16 in any Nostr client.
 
 use std::str::FromStr as _;
 use std::sync::LazyLock;
@@ -40,7 +46,7 @@ const BASE: &str = "https://coinos.io";
 /// One client for every call: a connection pool, and the builder runs once.
 /// The TLS backend is chosen at compile time, so the build cannot fail for a
 /// reason a retry would fix.
-static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+pub(crate) static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent(crate::USER_AGENT)
         .timeout(std::time::Duration::from_secs(30))
@@ -57,6 +63,14 @@ pub enum CoinosError {
     /// payment coinos would not make ("Insufficient funds").
     #[error("Coinos said no{}.", crate::api::detail(.0))]
     Refused(String),
+    /// [`Self::Http`] for a wallet on an LNbits server: the server's host,
+    /// then the failure.
+    #[error("{0} request failed: {1}.")]
+    ServerHttp(String, String),
+    /// [`Self::Refused`] for a wallet on an LNbits server: the server's host,
+    /// then its `detail` text.
+    #[error("{0} said no{detail}.", detail = crate::api::detail(.1))]
+    ServerRefused(String, String),
     /// The recipient's side of a send: its LNURL server was unreachable,
     /// answered something other than a pay request, or said no. Named after
     /// the recipient's domain, because coinos had no part in it.
@@ -86,7 +100,7 @@ impl CoinosError {
     /// unknown — once the server has refused outright, the saved login
     /// describes nothing and should go.
     pub fn account_definitely_not_created(&self) -> bool {
-        matches!(self, CoinosError::Refused(_))
+        matches!(self, CoinosError::Refused(_) | CoinosError::ServerRefused(..))
     }
 }
 
@@ -95,15 +109,23 @@ impl CoinosError {
 /// is the Lightning address); the password and token are not, so both are
 /// [`Secret`]s and a `{:?}` on the whole thing stays clean. It lives on the
 /// account record itself, so it can never belong to a different key.
+///
+/// A wallet on an LNbits server has `server` set to that server's base URL
+/// (`https://host`). There `username` is the Lightning address's local part,
+/// `password` is empty (LNbits accounts made through the API have none), and
+/// `token` is the wallet's admin key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Login {
     pub username: String,
     pub password: Secret,
-    /// The bearer JWT from `POST /api/register`. Empty until register
-    /// answers: the login is saved BEFORE the request (see
-    /// `nostr::create_coinos_wallet`), so an empty token means "the outcome
-    /// of that request is unknown".
+    /// The bearer JWT from `POST /api/register`, or the LNbits admin key.
+    /// Empty until the signup answers: the login is saved BEFORE the request
+    /// (see `nostr::open_wallet`), so an empty token means "the outcome of
+    /// that request is unknown".
     pub token: Secret,
+    /// The LNbits server's base URL; `None` is Coinos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 impl Login {
@@ -112,16 +134,59 @@ impl Login {
             username: suggest_username(),
             password: generate_password(),
             token: Secret::new(""),
+            server: None,
         }
+    }
+
+    /// A login for a wallet on the LNbits server at `server`, saved before
+    /// the account exists.
+    pub fn fresh_on(server: String) -> Self {
+        Self {
+            username: suggest_username(),
+            password: Secret::new(""),
+            token: Secret::new(""),
+            server: Some(server),
+        }
+    }
+
+    /// The same login under a new random username, for an address name
+    /// someone else already holds.
+    pub fn renamed(mut self) -> Self {
+        self.username = suggest_username();
+        self
     }
 
     pub fn has_token(&self) -> bool {
         !self.token.expose().is_empty()
     }
+
+    /// The LNbits server's host (with a port, if any); `None` for Coinos.
+    pub fn server_host(&self) -> Option<String> {
+        self.server.as_deref().map(crate::lnbits::host_of)
+    }
+
+    pub fn lightning_address(&self) -> String {
+        match self.server_host() {
+            Some(host) => format!("{}@{host}", self.username),
+            None => format!("{}@coinos.io", self.username),
+        }
+    }
 }
 
-pub fn lightning_address(username: &str) -> String {
-    format!("{username}@coinos.io")
+/// The balance of the wallet `login` opens, from whichever service holds it.
+pub async fn wallet_balance(login: &Login) -> Result<u64, CoinosError> {
+    match &login.server {
+        Some(server) => crate::lnbits::balance(server, &login.token).await,
+        None => balance(&login.token).await,
+    }
+}
+
+/// [`pay_invoice`], from whichever service holds the wallet `login` opens.
+pub async fn wallet_pay(login: &Login, bolt11: &str, sats: u64) -> Result<(), CoinosError> {
+    match &login.server {
+        Some(server) => crate::lnbits::pay_invoice(server, &login.token, bolt11, sats).await,
+        None => pay_invoice(&login.token, bolt11, sats).await,
+    }
 }
 
 /// Coinos requires 2-24 letters or digits and lowercases the name itself
@@ -474,7 +539,7 @@ fn bound_to(invoice: &Bolt11Invoice, zap_request_json: &str) -> Result<(), Coino
 
 /// Time since the Unix epoch. A clock before 1970 reads as zero, which
 /// expires nothing; coinos still refuses an invoice that really expired.
-fn now() -> Duration {
+pub(crate) fn now() -> Duration {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -486,7 +551,7 @@ const MIN_INVOICE_LIFETIME: Duration = Duration::from_secs(30);
 
 /// [`invoice_for`], and still valid [`MIN_INVOICE_LIFETIME`] after `now`.
 /// `now` is passed in so the check is testable against fixed vectors.
-fn payable_invoice(bolt11: &str, sats: u64, now: Duration) -> Result<Bolt11Invoice, CoinosError> {
+pub(crate) fn payable_invoice(bolt11: &str, sats: u64, now: Duration) -> Result<Bolt11Invoice, CoinosError> {
     let invoice = invoice_for(bolt11, sats)?;
     if invoice.would_expire(now.saturating_add(MIN_INVOICE_LIFETIME)) {
         return Err(CoinosError::InvoiceExpired);
@@ -515,12 +580,12 @@ fn invoice_for(bolt11: &str, sats: u64) -> Result<Bolt11Invoice, CoinosError> {
 
 /// Coinos truncates nothing, and a proxy error page can be long; the panel
 /// shows this text.
-const REFUSAL_TEXT_CAP: usize = 200;
+pub(crate) const REFUSAL_TEXT_CAP: usize = 200;
 
 /// A Lightning payment can take a while to settle through the network, and
 /// coinos answers only once it has; the client's 30 s default would give up
 /// on payments that go through.
-const PAYMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+pub(crate) const PAYMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Pay `bolt11` from the wallet `token` opens, after checking the invoice
 /// asks for exactly `sats` and has not expired. `Ok` once coinos accepted
@@ -770,6 +835,7 @@ mod tests {
             username: "carpetabcd1234".into(),
             password: generate_password(),
             token: Secret::new("eyJhbGciOiJIUzI1NiJ9.payload.signature"),
+            server: None,
         };
         let printed = format!("{login:?}");
         assert!(!printed.contains("eyJ"), "token leaked: {printed}");
