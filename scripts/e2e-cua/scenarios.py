@@ -405,8 +405,9 @@ async def scenario_h(sc):
 
 # ---------------------------------------------------------------- P (paid)
 async def scenario_p(sc):
-    """One real bounty (100 sats, cap 100) and one claim against tapestry,
-    with R's gates. Never retried."""
+    """One real bounty (100 sats, cap 100) from the house's app and one
+    claim the suite signs with the claimant's key, against tapestry; the
+    server pays it. Never retried."""
     stamp = sc.suite.run_id.replace("-", "")[-10:]
     name, item = f"e2e-{stamp}", f"E2E Roasters {stamp}"
     meta = sc.suite.meta
@@ -414,6 +415,11 @@ async def scenario_p(sc):
     sc.check("float at least 200 sats", (meta["float_before"] or 0) >= 200, f"{meta['float_before']} sats")
     if not await start(sc, "P", target="instance", seed=True):
         return
+    # Fast steps, as in Y and Z: a one-candidate step runs without a Jev
+    # choose (the launch screen already shows "New DList + bounty", so the
+    # judge abstains on the first one); Jev still judges every after-look,
+    # and the hard gates before the publish and the claim are unchanged.
+    sc.fast = True
     try:
         await paid_flow(sc, name, item)
     finally:
@@ -427,16 +433,143 @@ async def paid_flow(sc, name, item):
     # leftover e2e bounty can never pay again.
     if not await house_publishes(sc, name, cap="100"):
         return
-    claimant = tab(sc, "claimant")
-    acct = sc.tree_name(claimant)
-    if not sc.check("the claimant's account tab names it", bool(acct), repr(acct)):
+    # Every account may issue, so the claimant's Bounties header offers a
+    # claim only on Eligible and Claimed by me, and the box's claimant is
+    # not on its Eligible list: the suite signs the claim with the
+    # claimant's key, in the shape events::claim builds, and posts it as the
+    # app does (Api::publish_event). The house's app, on this bounty since
+    # its publish, watches it and shows the server's payment.
+    house_pub, me = sc.suite.keys["house"]["pub"], sc.suite.keys["claimant"]["pub"]
+    coord = f"39998:{house_pub}:{name}"
+    n_settled = sc.tree(PAYMENT, has="Payment settled")
+    claim = nak_signed(sc.box, sc.suite.keys["claimant"]["sec"], {
+        "kind": 39999, "content": item,
+        "tags": [["d", z_child_dtag(item, coord)], ["z", coord], ["name", item]]}, publish=False)
+    # Gate: the claim names this run's list and nothing else, the one the
+    # house's detail pane shows (house_publishes checked its name, reward and
+    # cap), and the claimant signed it. A wrong z would claim another bounty.
+    zs = [t[1] for t in (claim or {}).get("tags", []) if len(t) > 1 and t[0] == "z"]
+    title = sc.tree_name("bounty-detail-title")
+    if not sc.check("the claim is the claimant's, its only z this run's list coordinate",
+                    claim is not None and claim.get("pubkey") == me and claim.get("kind") == 39999
+                    and zs == [coord] and z_slug(name) == name and title == name,
+                    f"z {zs}, list {coord.rsplit(':', 1)[-1]}, detail {title!r}"):
         return
-    if not await claim_and_settle(sc, "claimant", name, item, claimant, acct, r_open_form(name)):
+    # Once, never retried: an unknown outcome is reported and watched.
+    code, body = p_publish_claim(claim)
+    published = 200 <= code < 300 and '"success":true' in body.replace(" ", "")
+    if not sc.check("the instance accepted the claim (POST /api/strfry/publish, once)", published, f"{code}: {body[:200]}") and code:
         return
-    await sc.step(Step("Show the claimant's wallet balance.",
-                       [Cand("open-wallet", "Press the sidebar's Wallet tab.", [("press", "nav-wallet"), ("wait_id", "wallet-balance"), PARK])],
-                       "The Wallet screen is shown with a sats balance.", settle=5, cues=("Wallet", "sats", "coinos")),
-                  label="claimant wallet")
+    sc.notes.append(f"P: claim {claim['id'][:12]}… on {name} posted once ({code})")
+    sc.wait_tree(CLAIM_CARD, 60, name=item)
+    if not await await_settled(sc, "claimant", name, item, n_settled, card=f"claim-{claim['id']}",
+                               refresh=Cand("reselect-issued", f"Press Bounties, then 'Issued by me', and select '{name}' again with Down.",
+                                            [("press", "nav-bounties"), ("press", "bounties-tab-issued"),
+                                             ("wait_id", {"id": BOUNTY_ROW, "name": name, "secs": 30}), ("select_bounty", name), PARK])):
+        return
+    await p_payments_tail(sc, item, claim["id"])
+
+
+P_BASE = "http://tapestry"   # Box.launch's target="instance"
+
+
+def p_publish_claim(event):
+    """POST a signed claim to the instance's /api/strfry/publish with signAs
+    "client", from inside mc, as Api::publish_event does. (HTTP status,
+    body); status 0 when no answer came. Called once, never retried."""
+    body = json.dumps({"event": event, "signAs": "client"})
+    r = dx(f"curl -s -m 30 -o {CDIR}/p-publish.out -w '%{{http_code}}' -H 'Content-Type: application/json' "
+           f"--data-binary @- {P_BASE}/api/strfry/publish; echo; cat {CDIR}/p-publish.out", input=body, timeout=60)
+    lines = r.stdout.splitlines()
+    try:
+        return int(lines[0]), "\n".join(lines[1:])[:300]
+    except (ValueError, IndexError):
+        return 0, r.stdout[:300]
+
+
+async def p_tail_row(sc, who, row, away, back):
+    """This run's row on the open Payments tab: its status and id stem. A
+    'Paid, no receipt' gets one more look after switching away and `back`
+    (an account switch re-reads the ledger; cmd-R never reaches the app)."""
+    node = sc.tree_node(row)
+    if not node:
+        return None, None
+    rid = node["id"]
+    status = sc.tree_name(f"{rid}-status")
+    if status == "Paid, no receipt":
+        sc.notes.append(f"P tail: {who}'s row read 'Paid, no receipt' first; one more look after a re-read")
+        await act(sc, f"P tail: {who}'s ledger re-read by an account switch",
+                  [("press", away), ("wait", 3)] + back + [("wait_id", {"id": row, "secs": 90, "soft": True}), PARK])
+        await asyncio.sleep(5)
+        status = sc.tree_name(f"{rid}-status")
+    return status, rid
+
+
+def p_total(sc, tid):
+    """A Payments total ("1,300 sats") as a number, or None."""
+    digits = re.sub(r"[^0-9]", "", sc.tree_name(tid) or "")
+    return int(digits) if digits else None
+
+
+async def p_payments_tail(sc, item, claim_id):
+    """After P's payment: the real payment on the house's Payments screen
+    (Paid by me), its Wallet DEBTS card (recorded, no exact value: the
+    instance's house has other bounties), and the claimant's Paid to me.
+    The server pays this bounty, so the app reads it through get_bounty and
+    ledger::classify_server. Spends nothing; every tail check is named
+    "P tail", so a failure here never reads as a failed payment."""
+    paid_ok = all(c["ok"] for c in sc.checks)
+    sc.notes.append("P tail: P's own checks before the Payments tail all "
+                    + ("passed" if paid_ok else "did NOT pass") + "; a failing 'P tail' check is the tail's alone")
+    if not sc.check("P tail: this run's claim card id is known", bool(claim_id), item):
+        return
+    row = f"~payment-row-[0-9a-f-]{{36}}-{claim_id}"
+    house_tab, claimant_tab = tab(sc, "house"), tab(sc, "claimant")
+    # 1. The house: Paid by me.
+    await k_show(sc, "P tail house payments", "Switch to the house issuer and open Payments on its 'Paid by me' tab.",
+                 "Press the house's account tab in the left rail, the sidebar's Payments tab, then 'Paid by me'.",
+                 [("press", house_tab), ("wait_id", "nav-payments"), ("press", "nav-payments"),
+                  ("wait_id", {"id": "payments-tab-by-me", "secs": 90, "soft": True}), ("press", "payments-tab-by-me"),
+                  ("wait_id", {"id": row, "secs": 90, "soft": True})],
+                 f"The Payments screen's 'Paid by me' tab shows a row '{item}' reading Paid.",
+                 ("Payments", "Paid by me", item, "Paid"), [(row, item)])
+    status, rid = await p_tail_row(sc, "the house", row, claimant_tab,
+                                   [("press", house_tab), ("press", "payments-tab-by-me")])
+    sc.check("P tail: the house's row for this run's claim reads Paid", status == "Paid",
+             f"{status!r}" + (" (no receipt in the app's read after a second look: timing, the payment itself settled above)"
+                              if status == "Paid, no receipt" else ""))
+    sc.check("P tail: the house's row is 100 sats", rid and sc.tree_name(f"{rid}-sats") == "100 sats",
+             sc.tree_name(f"{rid}-sats") if rid else "no row")
+    total = p_total(sc, "payments-total-paid")
+    sc.check("P tail: the house's PAID total is at least 100 sats", (total or 0) >= 100, f"{total} sats")
+    # 2. The house's DEBTS card, recorded as it reads.
+    await k_show(sc, "P tail house debts", "Open the Wallet screen and show its DEBTS card.",
+                 "Press the sidebar's Wallet tab, then bring the DEBTS card into view.",
+                 [("press", "nav-wallet"), ("wait_id", {"id": "wallet-debts-total", "secs": 30, "soft": True}),
+                  ("scroll_to", "wallet-debts-total")],
+                 "The Wallet screen shows a DEBTS card with 'Pledged outstanding', 'Owed but unpaid' and 'Total debts'.",
+                 ("DEBTS", "Pledged outstanding", "Owed but unpaid", "Total debts"), [("wallet-debts-total", None)])
+    debts = {i: sc.tree_name(i) for i in ("wallet-debts-pledged", "wallet-debts-owed", "wallet-debts-total")}
+    sc.suite.meta["p_house_debts"] = debts
+    sc.notes.append(f"P tail: the house's DEBTS card: {debts}")
+    # 3. The claimant: Paid to me.
+    await k_show(sc, "P tail claimant payments", "Switch to the claimant and open Payments on its 'Paid to me' tab.",
+                 "Press the claimant's account tab in the left rail, the sidebar's Payments tab, then 'Paid to me'.",
+                 [("press", claimant_tab), ("wait_id", "nav-payments"), ("press", "nav-payments"),
+                  ("wait_id", {"id": "payments-tab-to-me", "secs": 90, "soft": True}), ("press", "payments-tab-to-me"),
+                  ("wait_id", {"id": row, "secs": 90, "soft": True})],
+                 f"The Payments screen's 'Paid to me' tab shows a row '{item}' reading Paid.",
+                 ("Payments", "Paid to me", item, "RECEIVED"), [(row, item)])
+    status, rid = await p_tail_row(sc, "the claimant", row, house_tab,
+                                   [("press", claimant_tab), ("press", "payments-tab-to-me")])
+    sc.check("P tail: the claimant's row for this run's claim reads Paid, 100 sats",
+             status == "Paid" and rid and sc.tree_name(f"{rid}-sats") == "100 sats",
+             f"{status!r}, {sc.tree_name(f'{rid}-sats') if rid else 'no row'}"
+             + (" (no receipt in the app's read after a second look: timing)" if status == "Paid, no receipt" else ""))
+    total = p_total(sc, "payments-total-received")
+    sc.check("P tail: the claimant's RECEIVED total is at least 100 sats", (total or 0) >= 100, f"{total} sats")
+    # 4. Held on screen for the recording.
+    await asyncio.sleep(K_SETTLE)
 
 
 # ---------------------------------------------------------------- R (paid)
@@ -661,10 +794,19 @@ async def claim_and_settle(sc, who, name, item, tab_, acct, open_cands, refresh=
                   "The claim card shows 'Claim submitted'.", tries=1, settle=1, cues=("Claim submitted", item))
     if not await sc.step(submit, must_act=True, label=f"submit claim {who}"):
         return False
+    return await await_settled(sc, who, name, item, n_settled, refresh)
+
+
+async def await_settled(sc, who, name, item, n_settled, refresh=None, card=None):
+    """After a claim of `item`: wait for its card to settle, show its latest
+    state (`refresh`, by default Bounties and the bounty again with Down) and
+    check it settled with its receipt row, one more settled card than the
+    `n_settled` before. `card` when its id is known, else found by name."""
     # This claim's card, by its item name; its receipt row appears once
     # the zap receipt is in.
-    node = sc.tree_node(CLAIM_CARD, name=item)
-    card = node["id"] if node else None
+    if card is None:
+        node = sc.tree_node(CLAIM_CARD, name=item)
+        card = node["id"] if node else None
     wait, tries = Cand("wait-for-settlement", "Wait 20 seconds for the auto-pay watcher to pay and the zap receipt to arrive.", [("wait", 20)]), 6
     if card:
         wait, tries = Cand("wait-for-receipt", "Wait up to 150 seconds for this claim's card to show its payment receipt.",
@@ -1561,13 +1703,13 @@ async def scenario_s(sc):
               + [("key", "Return")])
     # The box can lag the keystrokes by several seconds: a fixed sleep once
     # caught the untouched form before Enter landed. Wait for the second row.
-    sc.wait_tree("bounties-tab-house", 30, has="House bounties (2)")
+    sc.wait_tree("bounties-tab-house", 30, has="All open (2)")
     lines = sc.log_after("S submit")
     posts = [l for l in lines if l.startswith("POST /api/bounties")]
     sc.check("exactly one create, on the existing list", len(posts) == 1 and posts[0].endswith("coord=post-city"), posts)
     pubs = [l for l in lines if l.startswith("POST strfry/publish")]
     sc.check("no list publish reached the server", not pubs, pubs)
-    sc.check_tree("form closed after the create", [("bounties-tab-house", "House bounties (2)")], [("bounty-form", None)])
+    sc.check_tree("form closed after the create", [("bounties-tab-house", "All open (2)")], [("bounty-form", None)])
     # Direct, as in H: the rail avatars all read "New account", so the judge
     # cannot tell the claimant's tab apart and halted here (p 0.56, abstain
     # 0.40). The tree check below decides.
@@ -1577,7 +1719,7 @@ async def scenario_s(sc):
 
 
 # ---------------------------------------------------------------- T
-ELIGIBLE_TAB = Cand("eligible-tab", "Press the 'Eligible for me to claim' tab above the bounty list.",
+ELIGIBLE_TAB = Cand("eligible-tab", "Press the 'Eligible' tab above the bounty list.",
                     [("press", "bounties-tab-eligible"), ("wait", 1), PARK])
 
 
@@ -1617,8 +1759,8 @@ async def scenario_t(sc):
         return
     await sc.step(Step("Show the Bounties screen for the claimant (the claimant's header button reads 'Submit a bounty claim').",
                        [Cand("press-bounties", "Press the sidebar's Bounties tab.", TO_BOUNTIES + [("wait_id", {"id": "bounties-tab-eligible", "soft": True})])],
-                       "The Bounties screen shows the 'Eligible for me to claim' tab and the header button reads 'Submit a bounty claim'.", settle=3,
-                       cues=("Submit a bounty claim", "New DList + bounty", "Eligible for me to claim")),
+                       "The Bounties screen shows the 'Eligible' tab and the header button reads 'Submit a bounty claim'.", settle=3,
+                       cues=("Submit a bounty claim", "New DList + bounty", "Eligible")),
                   must_act=True, label="claimant")
     if not sc.check_tree("claimant selected, Eligible tab shown", [CLAIMANT, ("bounties-tab-eligible", None)]):
         return
@@ -1627,11 +1769,11 @@ async def scenario_t(sc):
     # One candidate: the switch must land while the claimant's 8 s GET is
     # held. The house's rail tab switches as super+] does (set_account) and
     # keeps the screen.
-    await sc.step(Step("Open the 'Eligible for me to claim' tab, then switch to the house account while its list is still loading.",
-                       [Cand("tab-then-switch", "Press the 'Eligible for me to claim' tab, then the house's account tab in the left rail.",
+    await sc.step(Step("Open the 'Eligible' tab, then switch to the house account while its list is still loading.",
+                       [Cand("tab-then-switch", "Press the 'Eligible' tab, then the house's account tab in the left rail.",
                              [("press", "bounties-tab-eligible"), ("stamp", "tab"), ("press", tab(sc, "house")), ("wait", 1), PARK])],
                        "The eligible list shows a row on 'eligible-house' (the house is selected; on this tab its header button reads 'Submit a bounty claim').",
-                       tries=1, settle=1, cues=("eligible-house", "Submit a bounty claim", "Eligible for me to claim")),
+                       tries=1, settle=1, cues=("eligible-house", "Submit a bounty claim", "Eligible")),
                   must_act=True, label="tab then switch")
     await asyncio.sleep(max(0, sc.stamps.get("tab", time.time()) + 12 - time.time()))
     # On the Eligible tab the house claims too, so its header button reads
@@ -1667,6 +1809,327 @@ async def scenario_t(sc):
     sc.wait_tree("bounties-empty", 20)
     sc.check_tree("empty eligible list says so, no stale detail",
                   [("bounties-empty", "No open bounties match"), ("bounty-detail-empty", None)], [(ROW, "eligible-claimant")])
+    sc.check("app still running", sc.box.app_alive())
+
+
+# ---------------------------------------------------------------- K
+# K: the payments ledger, free. The fake serves three bounties, all
+# app-paid (no server auto-pay), made an hour ago so the claims count on
+# them; the local relay holds the claims, receipts and ranks the ledger
+# reads (nostr.rs payments_ledger):
+#   B1  the house's, 100 sats, cap 300, on K_LISTS[0]: a paid claim (a
+#       receipt whose zap request the house signed), an owed one (rank 3)
+#       and a not payable one (rank 1); the house's store has no auto-pay
+#       setting, so the owed one reads "manual pay".
+#   B2  a throwaway issuer's, 250 sats, on K_LISTS[1]: the claimant's
+#       claim, ranked 3 by that issuer's map: owed to the claimant.
+#   B3  a second throwaway issuer's, 150 sats, on K_LISTS[2]: the
+#       claimant's claim, paid by a receipt that issuer signed.
+# One throwaway score key ranks everyone; the house's and B2's issuer's
+# kind-10040s name its 30382:rank on the local relay. Nothing pays: no
+# store holds an auto-pay setting, and Save on the payout field is never
+# pressed.
+import uuid
+
+K_LISTS = ("ledger-coffee-shops", "ledger-bookshops", "ledger-bakeries")
+K_SETTLE = 3   # after each navigation, so the recording can be followed
+
+
+def nak_signed(box, sec, event, publish=True):
+    """`event` (kind, content, tags) signed as `sec` by nak, from its stdin
+    (a description tag holds JSON, which -t cannot carry), and published to
+    the local relay unless publish=False. The signed event, or None."""
+    rc, out = box.nak(["event", "--sec", "$NAK_SEC"] + ([LOCAL_RELAY] if publish else []),
+                      input=json.dumps(event), sec=sec)
+    evs = z_events(out) if rc == 0 else []
+    return evs[0] if len(evs) == 1 else None
+
+
+def k_bounty(issuer, dtag, sats, cap, born):
+    return {"id": str(uuid.uuid4()), "issuer_pubkey": issuer, "list_coordinate": f"39998:{issuer}:{dtag}",
+            "amount_sats": sats, "bounty_cap_sats": cap, "criteria": f"A {dtag} name, one per claim",
+            "created_at": born, "status": "open", "derivedStatus": "open"}
+
+
+def k_claim(box, sec, item, bounty):
+    """A claim in the shape events::claim builds."""
+    coord = bounty["list_coordinate"]
+    return nak_signed(box, sec, {"kind": 39999, "content": item,
+                                 "tags": [["d", z_child_dtag(item, coord)], ["z", coord], ["name", item]]})
+
+
+def k_receipt(box, issuer_sec, zapper_sec, claim, bounty):
+    """A kind-9735 naming `claim` whose description is a kind-9734 the
+    issuer signed for the bounty's reward, list and id (events::zap_request).
+    The receipt's own signer stands for the LNURL zapper and is not checked."""
+    req = nak_signed(box, issuer_sec, {"kind": 9734, "content": "", "tags": [
+        ["p", claim["pubkey"]], ["e", claim["id"]], ["a", bounty["list_coordinate"]], ["bounty", bounty["id"]],
+        ["amount", str(bounty["amount_sats"] * 1000)], ["relays", LOCAL_RELAY]]}, publish=False)
+    if not req:
+        return None
+    return nak_signed(box, zapper_sec, {"kind": 9735, "content": "", "tags": [
+        ["p", claim["pubkey"]], ["e", claim["id"]], ["description", json.dumps(req)]]})
+
+
+def k_row(bounty, claim):
+    return f"payment-row-{bounty['id']}-{claim['id']}"
+
+
+def k_sats(n):
+    """timefmt::fmt_sats: thousands with commas."""
+    return f"{n:,}"
+
+
+async def k_show(sc, label, goal, desc, do, done, cues, want, unwanted=()):
+    """One navigation, judged by Jev, then held for K_SETTLE; `want` and
+    `unwanted` on the tree decide when the judge does not."""
+    met = await sc.step(Step(goal, [Cand(label, desc, do + [PARK])], done, tries=2, settle=K_SETTLE, cues=cues),
+                        must_act=True, label=label)
+    ok = sc.check_tree(f"{label}: shown", want, unwanted)
+    if ok and not met:
+        sc.accept_step(label, "the screen's ids in the tree")
+    return ok
+
+
+def k_names(sc, name, want):
+    """Hard check: each id's name is exactly its value (None: not in the tree)."""
+    got = {i: (sc.tree_name(i) if sc.tree(i) > 0 else None) for i in want}
+    return sc.check(name, got == want, json.dumps({i: (got[i], v) for i, v in want.items() if got[i] != v}))
+
+
+async def scenario_k(sc):
+    # The house key is the same on every run, so its list is named per run:
+    # the local relay keeps earlier runs' claims on the old name.
+    coffee = f"{K_LISTS[0]}-{sc.suite.run_id.replace('-', '')[-10:]}"
+    box, keys = sc.box, sc.suite.keys
+    house_pub, me = keys["house"]["pub"], keys["claimant"]["pub"]
+    paid_c, owed_c, low_c, issuer2, issuer3, score, zapper = (fresh_key(box) for _ in range(7))
+    # An hour old: a claim counts on a bounty only when made after it.
+    born = int(time.time()) - 3600
+    b1 = k_bounty(house_pub, coffee, 100, 300, born)
+    b2 = k_bounty(issuer2["pub"], K_LISTS[1], 250, 250, born)
+    b3 = k_bounty(issuer3["pub"], K_LISTS[2], 150, 150, born)
+    sc.box.start_fake({"bounties": [b1, b2, b3]})
+    rank_row = ["30382:rank", score["pub"], LOCAL_RELAY]
+    seeded = {
+        "the house's map": nak_signed(box, keys["house"]["sec"], {"kind": 10040, "content": "", "tags": [rank_row]}),
+        "B2's issuer's map": nak_signed(box, issuer2["sec"], {"kind": 10040, "content": "", "tags": [rank_row]}),
+    }
+    # B1's not payable claimant ranks 1, under the minimum of 2 (no setting:
+    # Bounty::claim_min_rank); the owed one and the claimant rank 3.
+    for subject, rank in ((owed_c["pub"], 3), (low_c["pub"], 1), (me, 3)):
+        seeded[f"rank {rank} for {subject[:8]}"] = nak_signed(
+            box, score["sec"], {"kind": 30382, "content": "", "tags": [["d", subject], ["rank", str(rank)]]})
+    claims = {
+        "paid": k_claim(box, paid_c["sec"], "K Paid Roasters", b1),
+        "owed": k_claim(box, owed_c["sec"], "K Owed Roasters", b1),
+        "low": k_claim(box, low_c["sec"], "K Low Rank Roasters", b1),
+        "mine owed": k_claim(box, keys["claimant"]["sec"], "K Corner Books", b2),
+        "mine paid": k_claim(box, keys["claimant"]["sec"], "K Rye Bakery", b3),
+    }
+    seeded.update({f"claim {k}": v for k, v in claims.items()})
+    if claims["paid"]:
+        seeded["B1 receipt"] = k_receipt(box, keys["house"]["sec"], zapper["sec"], claims["paid"], b1)
+    if claims["mine paid"]:
+        seeded["B3 receipt"] = k_receipt(box, issuer3["sec"], zapper["sec"], claims["mine paid"], b3)
+    missing = [k for k, v in seeded.items() if not v]
+    if not sc.check("maps, ranks, five claims and two receipts signed and on the local relay", not missing, missing):
+        return
+    # What the house's ledger must read (ledger.rs totals, pledged, debts):
+    # B1 has cap / reward = 3 slots; the paid claim holds one, so two are
+    # open, and the owed claim (no slot held yet) comes off the pledge.
+    reward = b1["amount_sats"]
+    slots = b1["bounty_cap_sats"] // reward
+    pledged = (slots - 1) * reward - reward
+    owed = paid = reward
+    if not await start(sc, "K"):
+        return
+    paid_row, owed_row, low_row = (k_row(b1, claims[k]) for k in ("paid", "owed", "low"))
+
+    # 1. The house's Payments, Paid by me.
+    await k_show(sc, "house payments", "Switch to the house issuer and open Payments on its 'Paid by me' tab.",
+                 "Press the house's account tab in the left rail, the sidebar's Payments tab, then 'Paid by me'.",
+                 [("press", tab(sc, "house")), ("wait_id", "nav-payments"), ("press", "nav-payments"),
+                  ("wait_id", {"id": "payments-tab-by-me", "secs": 45, "soft": True}), ("press", "payments-tab-by-me"),
+                  ("wait_id", {"id": paid_row, "secs": 45, "soft": True})],
+                 f"The Payments screen shows 'Paid by me (3)' with three rows on {coffee}: Paid, Owed and Not payable.",
+                 ("Payments", "Paid by me", "Owed", "Not payable", "PLEDGED"), [(paid_row, None)])
+    k_names(sc, "the house's ledger: three rows, each status and why", {
+        "payments-tab-by-me": "Paid by me (3)",
+        f"{paid_row}-status": "Paid", f"{paid_row}-why": None, f"{paid_row}-sats": "100 sats",
+        f"{owed_row}-status": "Owed", f"{owed_row}-why": "manual pay",
+        f"{low_row}-status": "Not payable", f"{low_row}-why": "rank 1, bounty needs 2"})
+    sc.check_tree("each row names its list", [(f"{r}-who", f"· list {coffee}") for r in (paid_row, owed_row, low_row)])
+    k_names(sc, "the house's totals and the unsettled badge", {
+        "payments-total-owed": f"{k_sats(owed)} sats", "payments-total-paying": "0 sats",
+        "payments-total-paid": f"{k_sats(paid)} sats", "payments-total-pledged": f"{k_sats(pledged)} sats",
+        "nav-payments-badge": "1"})   # the one owed row is the only unsettled claim
+    # 2. The sidebar reads the same ledger (no unit in its labels).
+    k_names(sc, "sidebar PROMISED and PAID SO FAR equal PLEDGED and PAID",
+            {"sidebar-promised": k_sats(pledged), "sidebar-paid": k_sats(paid)})
+
+    # 3. Bounties: Issued by me, then Claimed by me (the house claims nothing).
+    await k_show(sc, "house issued", "Open Bounties on its 'Issued by me' tab.",
+                 "Press the sidebar's Bounties tab, then 'Issued by me'.",
+                 TO_BOUNTIES + [("press", "bounties-tab-issued"), ("wait_id", {"id": f"bounty-row-{b1['id']}", "secs": 20, "soft": True})],
+                 f"The Bounties screen shows the 'Issued by me (1)' tab with one bounty, {coffee}.",
+                 ("Issued by me", coffee, "Bounties"), [("bounties-tab-issued", "Issued by me (1)")])
+    k_names(sc, "Issued by me lists B1 only", {"bounties-tab-issued": "Issued by me (1)", f"bounty-row-{b1['id']}": coffee})
+    # Pay by hand: B1 is manual, so the owed claim's card offers the
+    # issuer's button and the rules' holds say why. Armed once, never pressed
+    # twice: K pays nothing. The arm lapses after 10 s (shell.rs PAY_ARMED_FOR).
+    owed_card, paid_card, low_card = (f"claim-{claims[k]['id']}" for k in ("owed", "paid", "low"))
+    pay = f"{owed_card}-pay"
+    await k_show(sc, "house claim cards", f"Show {coffee}'s claim cards with the owed claim's 'Pay 100 sats' button.",
+                 f"Select {coffee} with the arrow keys and bring the owed claim's 'Pay 100 sats' button into view.",
+                 [("select_bounty", coffee), ("wait_id", {"id": pay, "secs": 30, "soft": True}), ("scroll_to", pay)],
+                 "A claim card 'K Owed Roasters' shows a 'Pay 100 sats' button.",
+                 ("K Owed Roasters", "Pay 100 sats", "Rank too low"), [(pay, None)])
+    k_names(sc, "only the owed claim offers a hand payment; the low rank card says why", {
+        pay: "Pay 100 sats", f"{paid_card}-pay": None, f"{low_card}-pay": None,
+        f"{low_card}-unpaid-reason": "Rank too low: the issuer's scores rank this account 1, and the bounty needs 2."})
+    # One press, outside a Jev step (a retried step would press again, and
+    # a second press pays), read at once: the arm lasts only 10 s.
+    await act(sc, "the pay button pressed once", [("scroll_to", pay), ("press", pay), ("stamp", "armed"), PARK])
+    sc.wait_tree(pay, 5, has="Click again to pay")
+    armed = sc.tree_name(pay) or ""
+    sc.check("the first press arms the button, nothing is sent", armed.startswith("Click again to pay 100 sats to"), repr(armed))
+    await asyncio.sleep(K_SETTLE)   # the armed button, for the recording
+    await asyncio.sleep(max(0, sc.stamps.get("armed", time.time()) + 11 - time.time()))
+    k_names(sc, "the arm lapses after 10 s, no payment started", {pay: "Pay 100 sats", f"{owed_card}-pay-sending": None})
+    await k_show(sc, "house claimed", "Open the 'Claimed by me' tab.", "Press the 'Claimed by me' tab above the bounty list.",
+                 [("press", "bounties-tab-claimed"), ("wait_id", {"id": "bounties-empty", "secs": 10, "soft": True})],
+                 "The 'Claimed by me (0)' tab is open and says 'You haven't claimed a bounty yet.'",
+                 ("Claimed by me", "You haven't claimed a bounty yet"), [("bounties-tab-claimed", "Claimed by me (0)")])
+    k_names(sc, "the house has claimed nothing", {"bounties-tab-claimed": "Claimed by me (0)",
+                                                    "bounties-empty": "You haven't claimed a bounty yet."})
+
+    # 4. Wallet: the house's debts. The house key's wallet is managed
+    # elsewhere (wallet.rs), so its page has no payout field; the
+    # claimant's does (step 5).
+    await k_show(sc, "house wallet", "Open the Wallet screen and show its DEBTS card.",
+                 "Press the sidebar's Wallet tab, then bring the DEBTS card into view.",
+                 [("press", "nav-wallet"), ("wait_id", {"id": "wallet-debts-total", "secs": 20, "soft": True}),
+                  ("scroll_to", "wallet-debts-total")],
+                 "The Wallet screen shows a DEBTS card with 'Pledged outstanding', 'Owed but unpaid' and 'Total debts'.",
+                 ("DEBTS", "Pledged outstanding", "Owed but unpaid", "Total debts"), [("wallet-debts-total", None)])
+    k_names(sc, "the house's debts: pledged outstanding, owed but unpaid, total", {
+        "wallet-debts-pledged": f"Pledged outstanding: {k_sats(pledged)} sats",
+        "wallet-debts-owed": f"Owed but unpaid: {k_sats(owed)} sats",
+        "wallet-debts-total": f"Total debts: {k_sats(pledged + owed)} sats",
+        "wallet-payout-address": None})
+
+    # 5. The claimant: the switch keeps the Wallet screen; its payout field
+    # is shown, never saved. Then its Payments, Paid to me.
+    mine_owed, mine_paid = k_row(b2, claims["mine owed"]), k_row(b3, claims["mine paid"])
+    await k_show(sc, "claimant wallet", "Switch to the claimant and show its Wallet with 'WHERE CLAIMS PAY YOU' and DEBTS.",
+                 "Press the claimant's account tab in the left rail (the Wallet screen stays).",
+                 [("press", tab(sc, "claimant")), ("wait_id", {"id": "wallet-payout-address", "secs": 30, "soft": True}),
+                  ("scroll_to", "wallet-debts-total")],
+                 "The Wallet screen shows 'WHERE CLAIMS PAY YOU' with a Lightning address field and a Save button, and a DEBTS card.",
+                 ("WHERE CLAIMS PAY YOU", "Save", "DEBTS", "Total debts"),
+                 [("wallet-payout-address", None), ("wallet-payout-save", "Save"), ("wallet-debts-total", None)])
+    k_names(sc, "the claimant owes nothing", {"wallet-debts-pledged": "Pledged outstanding: 0 sats",
+                                               "wallet-debts-owed": "Owed but unpaid: 0 sats",
+                                               "wallet-debts-total": "Total debts: 0 sats"})
+    await k_show(sc, "claimant payments", "Open Payments on the 'Paid to me' tab.",
+                 "Press the sidebar's Payments tab, then 'Paid to me'.",
+                 [("press", "nav-payments"), ("wait_id", {"id": "payments-tab-to-me", "secs": 45, "soft": True}),
+                  ("press", "payments-tab-to-me"), ("wait_id", {"id": mine_owed, "secs": 45, "soft": True})],
+                 "The 'Paid to me (2)' tab shows two rows: Owed on ledger-bookshops and Paid on ledger-bakeries.",
+                 ("Paid to me", "OWED TO ME", "RECEIVED", "Owed", "Paid"), [(mine_owed, None)])
+    k_names(sc, "the claimant's ledger: an owed row and a paid one, its totals, no badge", {
+        "payments-tab-to-me": "Paid to me (2)",
+        f"{mine_owed}-status": "Owed", f"{mine_owed}-sats": f"{k_sats(b2['amount_sats'])} sats",
+        f"{mine_paid}-status": "Paid", f"{mine_paid}-sats": f"{k_sats(b3['amount_sats'])} sats",
+        "payments-total-owed-to-me": f"{k_sats(b2['amount_sats'])} sats",
+        "payments-total-received": f"{k_sats(b3['amount_sats'])} sats",
+        "nav-payments-badge": None, "sidebar-promised": "0", "sidebar-paid": "0"})
+    await k_show(sc, "claimant claimed", "Open Bounties on its 'Claimed by me' tab.",
+                 "Press the sidebar's Bounties tab, then 'Claimed by me'.",
+                 TO_BOUNTIES + [("press", "bounties-tab-claimed"), ("wait_id", {"id": f"bounty-row-{b2['id']}", "secs": 20, "soft": True})],
+                 "The 'Claimed by me (2)' tab lists ledger-bookshops and ledger-bakeries.",
+                 ("Claimed by me", K_LISTS[1], K_LISTS[2]), [("bounties-tab-claimed", "Claimed by me (2)")])
+    k_names(sc, "Claimed by me lists B2 and B3", {"bounties-tab-claimed": "Claimed by me (2)",
+                                                   f"bounty-row-{b2['id']}": K_LISTS[1], f"bounty-row-{b3['id']}": K_LISTS[2]})
+
+    # 6. The owed row opens its bounty on Bounties. The row is a Group with
+    # no AT-SPI action: a pointer click at its centre, as a person would.
+    await k_show(sc, "back to payments", "Open Payments on the 'Paid to me' tab again.",
+                 "Press the sidebar's Payments tab, then 'Paid to me'.",
+                 [("press", "nav-payments"), ("wait_id", "payments-tab-to-me"), ("press", "payments-tab-to-me"),
+                  ("wait_id", {"id": mine_owed, "secs": 20, "soft": True})],
+                 "The 'Paid to me (2)' tab is shown with its two rows.", ("Paid to me", "Owed"), [(mine_owed, None)])
+    await k_show(sc, "owed row opens", "Open the owed row's bounty: click the 'K Corner Books' row.",
+                 "Click the 'K Corner Books' row (Owed); the app opens its bounty on the Bounties screen.",
+                 [("click_id", mine_owed), ("wait_id", {"id": "bounty-detail-title", "name": K_LISTS[1], "secs": 20, "soft": True})],
+                 "The Bounties screen shows the bounty ledger-bookshops in its detail pane.",
+                 ("Bounties", K_LISTS[1]), [("bounties-title", None), ("bounty-detail-title", K_LISTS[1])])
+    k_names(sc, "the row landed on its bounty's detail pane", {"bounty-detail-title": K_LISTS[1]})
+
+    # 7. End on Payments.
+    await k_show(sc, "end on payments", "Open the Payments screen again.", "Press the sidebar's Payments tab.",
+                 [("press", "nav-payments"), ("wait_id", "payments-title")],
+                 "The Payments screen is shown.", ("Payments", "Paid to me"), [("payments-title", "Payments")])
+    await asyncio.sleep(K_SETTLE)
+    sc.check("app still running", box.app_alive())
+
+
+# ---------------------------------------------------------------- J
+# J: the first-launch sign-up screen, free and read-only: the choose card,
+# the create card's promise about the key and the Coinos wallet, and back.
+# The create card's "Create (Enter)" (setup-create-go) is never pressed, so
+# no account, key or wallet is made; the store, the fake server and the
+# local relay must show it.
+J_WALLET_NOTE = ("A Coinos wallet opens with this account so claims can pay you. "
+                 "Coinos holds your sats, so keep the balance small.")   # account_setup.rs create_card
+
+
+async def scenario_j(sc):
+    sc.box.start_fake({})
+    sc.box.mark("J launch")
+    # The local relay keeps other scenarios' events, so "nothing was
+    # published" means nothing since this launch.
+    launched = int(time.time()) - 2
+    # A first launch: an empty store and no MC_NSECS, the choose card.
+    store = await start(sc, "J", ready="setup-create", nsecs="")
+    if not store:
+        return
+    met = await sc.step(Step("Show the first-launch 'Your Nostr account' card.", [Cand("look", "Wait 1 second.", [("wait", 1)])],
+                             "A card titled 'Your Nostr account' offers 'Create a new account' and 'I already have a key'.",
+                             tries=2, settle=K_SETTLE,
+                             cues=("Your Nostr account", "Your secret key stays on this computer", "Create a new account",
+                                   "I already have a key")), label="choose card")
+    ok = sc.check_tree("the choose card's ids", [("setup-title-choose", "Your Nostr account"), ("setup-create", "Create a new account"),
+                                                  ("setup-paste", "I already have a key"), ("setup-browse", None)])
+    if ok and not met:
+        sc.accept_step("choose card", "the choose card's ids in the tree")
+    # The create card, held K_SETTLE; its Create (Enter) is never pressed.
+    await k_show(sc, "create card", "Open the 'Create a new account' card, without creating anything.",
+                 "Press the 'Create a new account' button on the choose card.",
+                 [("press", "setup-create"), ("wait_id", {"id": "setup-title-create", "secs": 10, "soft": True})],
+                 "A card titled 'Create a new account' shows a 'Name (optional)' field, the Coinos wallet note and 'Create (Enter)'.",
+                 ("Create a new account", "Name (optional)", "Coinos wallet", "Create (Enter)"),
+                 [("setup-title-create", "Create a new account"), ("setup-create-go", None)])
+    k_names(sc, "the create card: name field, the wallet promise, Create and Back", {
+        "setup-title-create": "Create a new account", "setup-name-label": "Name (optional)",
+        "setup-wallet-note": J_WALLET_NOTE, "setup-create-go": "Create (Enter)", "setup-back": "← Back"})
+    sc.check_tree("the name field is in the tree", [("setup-name", None)])
+    await k_show(sc, "back to choose", "Go back to the choose card.", "Press '← Back' under the create card.",
+                 [("press", "setup-back"), ("wait_id", {"id": "setup-title-choose", "secs": 10, "soft": True})],
+                 "The 'Your Nostr account' card is shown again.", ("Your Nostr account", "Create a new account"),
+                 [("setup-title-choose", "Your Nostr account")], [("setup-title-create", None)])
+    await asyncio.sleep(K_SETTLE)
+    # Nothing was made: no account in the store, no login or publish at the
+    # fake (instance or Brainstorm), no event on the local relay.
+    n = sc.box.accounts_in_store(store)
+    sc.check("the store holds no account", n in (0, -1), f"{n} accounts (-1: no accounts.json)")
+    posts = [l for l in sc.log_after("J launch") if l.startswith(("POST", "BS POST"))]
+    sc.check("no login, publish or create reached the fake server", not posts, posts)
+    rc, out = sc.box.nak(["req", "-k", "0", "-k", "3", "-k", "10002", "-k", "10040", "--since", str(launched), "-l", "50", LOCAL_RELAY])
+    evs = z_events(out)
+    sc.check("the local relay got no profile, follow list, relay list or map since the launch", rc == 0 and not evs,
+             f"rc {rc}, {len(evs)} event(s)")
     sc.check("app still running", sc.box.app_alive())
 
 
@@ -1862,16 +2325,17 @@ def z_issuer_paid(receipt, issuer, claim_id, coordinate):
     return dx(f"{CDIR}/nak verify", input=json.dumps(req)).returncode == 0
 
 
-def z_fill(name):
-    """The eight bounty fields: reward 100, cap 200, auto-pay on, min rank
-    2. Enter in the last field (min rank) publishes."""
+def z_fill(name, cap="200", auto_pay="on"):
+    """The eight bounty fields: reward 100, `cap`, auto-pay `auto_pay` (the
+    field defaults to on; "off" makes a bounty its issuer pays by hand), min
+    rank 2. Enter in the last field (min rank) publishes."""
     words = name.replace("-", " ")
     fields = BOUNTY_FIELDS[:6] + ("auto-pay", "min-rank")
     do = type_fields(zip(fields, (name, name + "s", f"{words}s for the e2e suite", f"A {words} name, one per claim",
-                                  "100", "200", "on", "2")))
+                                  "100", cap, auto_pay, "2")))
     do += [("key", "Return"), ("stamp", "submitted"), ("wait_id", {"id": "bounty-detail-title", "name": name, "secs": 45, "soft": True})]
     return Cand("fill-and-publish",
-                f"Click each of the eight fields and type it: singular '{name}', plural, description, criteria, reward 100, cap 200, auto-pay on, min rank 2; Enter in the last field publishes.",
+                f"Click each of the eight fields and type it: singular '{name}', plural, description, criteria, reward 100, cap {cap}, auto-pay {auto_pay}, min rank 2; Enter in the last field publishes.",
                 do)
 
 
@@ -1888,11 +2352,13 @@ def z_selected(sc, who, acct, want, unwanted):
     return sc.check(f"{who} selected (sidebar-account)", chip == acct, repr(chip)) and ok
 
 
-async def z_publishes(sc, who, pub, acct, name):
-    """`who`, in its own (pinned) app, publishes `name` with auto-pay on.
-    The bounty id from its store, or None where the flow has to stop."""
-    if not await sc.step(Step(f"Select {who} in the left rail and show Bounties on its 'House bounties' tab (the header button reads 'New DList + bounty').",
-                              [Cand("account-bounties-house", f"Press {who}'s account tab in the left rail, the sidebar's Bounties tab, then 'House bounties'.",
+async def z_publishes(sc, who, pub, acct, name, cap="200", auto_pay=True):
+    """`who`, in its own (pinned) app, publishes `name` (reward 100, `cap`)
+    with auto-pay on, or off (`auto_pay=False`: a bounty `who` pays by
+    hand). The bounty id (from its store, or for a manual bounty from the
+    instance's list), or None where the flow has to stop."""
+    if not await sc.step(Step(f"Select {who} in the left rail and show Bounties on its 'All open' tab (the header button reads 'New DList + bounty').",
+                              [Cand("account-bounties-house", f"Press {who}'s account tab in the left rail, the sidebar's Bounties tab, then 'All open'.",
                                     z_to_bounties(who, pub, "bounties-tab-house", ISSUER[1]))],
                               "The Bounties screen is shown and its header button reads 'New DList + bounty'.", settle=1, cues=HOUSE_CUES),
                          must_act=True, label=f"{who} on bounties"):
@@ -1913,11 +2379,15 @@ async def z_publishes(sc, who, pub, acct, name):
         return None
     # tries=1: a retried Enter is a second bounty.
     if not await sc.step(Step(f"Fill the bounty form for '{name}' and publish it.",
-                              [z_fill(name), Cand("cancel-form", "Press the form's 'Cancel (esc)' button.", [("press", "bounty-form-cancel")])],
-                              "The new bounty is listed and auto-pay is armed.", tries=1, settle=1,
-                              cues=(name, "Auto-pay armed")),
+                              [z_fill(name, cap, "on" if auto_pay else "off"),
+                               Cand("cancel-form", "Press the form's 'Cancel (esc)' button.", [("press", "bounty-form-cancel")])],
+                              "The new bounty is listed and auto-pay is armed." if auto_pay
+                              else "The new bounty is listed with a 'manual pay' pill.", tries=1, settle=1,
+                              cues=(name, "Auto-pay armed" if auto_pay else "manual pay")),
                          must_act=True, label=f"{who} publish"):
         return None
+    if not auto_pay:
+        return await z_manual_published(sc, who, pub, name, cap)
     sc.wait_tree("top-auto-pay", 20, has="Auto-pay armed")
     title, reward, cap, rank = (sc.tree_name(i) or "" for i in ("bounty-detail-title", "bounty-detail-reward",
                                                                    "bounty-detail-cap", "bounty-detail-min-rank"))
@@ -1939,15 +2409,16 @@ async def z_publishes(sc, who, pub, acct, name):
     return bid
 
 
-async def z_claim(sc, app, who, pub, acct, name, item):
+async def z_claim(sc, app, who, pub, acct, name, item, form_note=None):
     """`who` claims `item` on `name` in its own app, from the Eligible tab,
-    with R's gates. The claim card's id, or None."""
+    with R's gates; with `form_note`, the claim form's payout note must
+    start with it. The claim card's id, or None."""
     sc.use(app)
-    if not await sc.step(Step(f"Select {who} in the left rail and show Bounties on its 'Eligible for me to claim' tab (the header button reads 'Submit a bounty claim').",
-                              [Cand("account-bounties-eligible", f"Press {who}'s account tab, the sidebar's Bounties tab, then 'Eligible for me to claim'.",
+    if not await sc.step(Step(f"Select {who} in the left rail and show Bounties on its 'Eligible' tab (the header button reads 'Submit a bounty claim').",
+                              [Cand("account-bounties-eligible", f"Press {who}'s account tab, the sidebar's Bounties tab, then 'Eligible'.",
                                     z_to_bounties(who, pub, "bounties-tab-eligible", CLAIMANT[1]))],
-                              "The Bounties screen shows the 'Eligible for me to claim' tab and the header button reads 'Submit a bounty claim'.",
-                              settle=1, cues=("Submit a bounty claim", "Eligible for me to claim")),
+                              "The Bounties screen shows the 'Eligible' tab and the header button reads 'Submit a bounty claim'.",
+                              settle=1, cues=("Submit a bounty claim", "Eligible")),
                          must_act=True, label=f"select {who} for {name}"):
         return None
     if not z_selected(sc, who, acct, CLAIMANT, ISSUER):
@@ -1955,7 +2426,7 @@ async def z_claim(sc, app, who, pub, acct, name, item):
     # The Eligible tab re-reads its list on a press: the issuer's ranks of
     # `who` come from the relays, so the row can take a while.
     if not await sc.step(Step(f"Open the claim form for '{name}'.",
-                              [Cand("select-then-claim", f"Press 'Eligible for me to claim', Down until '{name}' is selected, then '+ Submit a bounty claim'.",
+                              [Cand("select-then-claim", f"Press 'Eligible', Down until '{name}' is selected, then '+ Submit a bounty claim'.",
                                     [("press", "bounties-tab-eligible"), ("wait_id", {"id": BOUNTY_ROW, "name": name, "secs": 60}),
                                      ("select_bounty", name), ("press", "bounties-new"), ("wait_id", "claim-form-item-name"), PARK])],
                               "A claim form is open (a 'Cancel' control is visible and the 'Submit a bounty claim' button is gone).",
@@ -1968,23 +2439,30 @@ async def z_claim(sc, app, who, pub, acct, name, item):
         await sc.suite.driver.act("key", "Escape")
         sc.notes.append(f"claim form for {who} was not on {name}; cancelled, nothing claimed")
         return None
+    note = sc.tree_name("claim-form-note") or ""
+    if form_note and not sc.check(f"{who}: the claim form's note starts {form_note!r}", note.startswith(form_note), repr(note)):
+        await sc.suite.driver.act("key", "Escape")
+        return None
     # tries=1: a second submit is a second claim. No cancel candidate.
     if not await sc.step(Step("Submit the claim.",
                               [Cand("type-item-and-submit", f"Click into the Item name input, type '{item}' and press Enter to publish the claim.",
                                     [FOCUS, ("click_id", "claim-form-item-name"), ("type", item), ("wait", 0.3), ("key", "Return"),
-                                     ("stamp", f"claim {item}"), ("wait_id", {"id": CLAIM_CARD, "name": item, "secs": 20, "soft": True})])],
+                                     ("stamp", f"claim {item}"), ("wait_id", {"id": CLAIM_CARD, "name": item, "secs": 50, "soft": True})])],
                               "The claim card shows 'Claim submitted'.", tries=1, settle=1, cues=("Claim submitted", item)),
                          must_act=True, label=f"submit {item}"):
         return None
+    # The card arrives with the watch's next poll, up to 30 s apart on a
+    # bounty this app does not pay, so the wait above covers one full poll.
     node = sc.tree_node(CLAIM_CARD, name=item)
     return node["id"] if sc.check(f"{who}: the claim card for {item} is in its app's tree", bool(node), item) else None
 
 
-def z_issuer_view(who, pub, name, item):
-    return Step(f"In {who}'s app, show its bounty '{name}' on the 'House bounties' tab with the claim card '{item}'.",
-                [Cand("issuer-bounty", f"Press {who}'s account tab, Bounties and 'House bounties', select '{name}' with Down and wait for the '{item}' card.",
+def z_issuer_view(who, pub, name, item, tab_id="bounties-tab-house"):
+    what = "Issued by me" if tab_id == "bounties-tab-issued" else "All open"
+    return Step(f"In {who}'s app, show its bounty '{name}' on the '{what}' tab with the claim card '{item}'.",
+                [Cand("issuer-bounty", f"Press {who}'s account tab, Bounties and '{what}', select '{name}' with Down and wait for the '{item}' card.",
                       [("press", f"rail-account-{pub}")] + TO_BOUNTIES +
-                      [("press", "bounties-tab-house"), ("wait_id", {"id": BOUNTY_ROW, "name": name, "secs": 30}), ("select_bounty", name),
+                      [("press", tab_id), ("wait_id", {"id": BOUNTY_ROW, "name": name, "secs": 30}), ("select_bounty", name),
                        ("wait_id", {"id": CLAIM_CARD, "name": item, "secs": 60, "soft": True}), PARK])],
                 f"The detail pane shows '{name}' and a claim card for '{item}'.", settle=1, cues=(name, item))
 
@@ -1993,13 +2471,13 @@ def z_bridge_add(claim_id):
     dx(f"echo {z_hex(claim_id)} >> {CDIR}/z-claims")
 
 
-async def z_settled(sc, app, who, pub, name, item, card, submitted):
+async def z_settled(sc, app, who, pub, name, item, card, submitted, tab_id="bounties-tab-house"):
     """The issuer's own app (nobody acts in it but to look) shows the card
     settled with its receipt row by `submitted` + Z_SETTLE. The time seen,
     or None."""
     sc.use(app)
     label = f"{who} shows {item}"
-    met = await sc.step(z_issuer_view(who, pub, name, item), label=label)
+    met = await sc.step(z_issuer_view(who, pub, name, item, tab_id), label=label)
     if sc.tree(CLAIM_CARD, name=item) == 1 and not met:
         sc.accept_step(label, "the claim card is in the issuer's app's tree")
     # Looked at least once, even when getting here took past the deadline;
@@ -2047,8 +2525,11 @@ async def scenario_z(sc):
     stamp = sc.suite.run_id.replace("-", "")[-10:]
     meta = sc.suite.meta
     meta["float_before_z"] = sc.box.float_sats()
-    if not sc.check(f"float at least {Z_FLOAT} sats (three wallets of {Z_FUND} plus fees)",
-                    (meta["float_before_z"] or 0) >= Z_FLOAT, f"{meta['float_before_z']} sats"):
+    # Reused wallets may already hold their float: z_fund checks the exact
+    # top-ups against the float before any send.
+    floor = 300 if sc.suite.args.reuse_wallets else Z_FLOAT
+    if not sc.check(f"float at least {floor} sats (three wallets of {Z_FUND} plus fees, less what reused wallets hold)",
+                    (meta["float_before_z"] or 0) >= floor, f"{meta['float_before_z']} sats"):
         return
     reuse = None
     if sc.suite.args.reuse_wallets:
@@ -2165,23 +2646,130 @@ async def z_flow(sc, stamp, reuse, people):
         sc.check(f"{issuer}'s wallet down by 100 sats plus at most 10 in fees", None not in (ib0, ib1) and 100 <= ib0 - ib1 <= 110,
                  f"{ib0} -> {ib1}")
     z_final_checks(sc, people, names, bounties, payouts)
+    # Before the wind-down, which never depends on it: an error here is a
+    # failed tail check, not a lost sweep.
+    try:
+        await z_payments_tail(sc, people, names, bounties, payouts)
+    except Exception as e:
+        sc.check("Z tail: ran to the end", False, f"{type(e).__name__}: {e}")
 
 
-def z_trust(sc, people):
+Z_NO_RECEIPT = "Paid, no receipt"
+
+
+async def z_tail_open(sc, tab_id, before=()):
+    """`before`, then Payments on `tab_id`. The tabs are not drawn while a
+    first ledger read is out (payments.rs render), so they are waited for,
+    up to 60 s, before the press. True, or False and a note: never raises."""
+    try:
+        for kind, arg in list(before) + [("press", "nav-payments"), ("wait_id", {"id": tab_id, "secs": 60}),
+                                         ("press", tab_id), PARK]:
+            await sc.suite.driver.act(kind, arg)
+        return True
+    except Exception as e:
+        sc.notes.append(f"Z tail: opening {tab_id}: {type(e).__name__}: {e}"[:300])
+        return False
+
+
+async def z_tail_rows(sc, who, rows, tab_id, switch=()):
+    """The rows' statuses on the open tab, read every 10 s for up to 120 s
+    while one is missing or reads "Paid, no receipt", or `payments-stale`
+    shows: a failed refresh keeps older rows, and the app retries by itself.
+    `switch` (C's app: to D and back, which re-reads the ledger) runs once on
+    a "Paid, no receipt". Returns (statuses, the stale notice's text if it
+    ever showed)."""
+    end, switched, stale_seen = time.time() + 120, False, None
+    while True:
+        got = {r: (sc.tree_name(f"{r}-status") if sc.tree(r) > 0 else None) for r in rows}
+        stale = sc.tree_name("payments-stale") if sc.tree("payments-stale") > 0 else None
+        stale_seen = stale or stale_seen
+        if (all(v not in (None, Z_NO_RECEIPT) for v in got.values()) and not stale) or time.time() > end:
+            return got, stale_seen
+        if switch and not switched and Z_NO_RECEIPT in got.values():
+            switched = True
+            sc.notes.append(f"Z tail: {who} read '{Z_NO_RECEIPT}'; re-read by switching away and back")
+            await z_tail_open(sc, tab_id, switch)
+        await asyncio.sleep(10)
+
+
+async def z_tail_tab(sc, who, names, own, switch, tab_id, rows, total_id, what, want="Paid", tag="Z tail"):
+    """One Payments tab of one app: shown, its `rows` reading `want` (Paid)
+    and 100 sats, its total recorded. A failure is a check, never an
+    exception. Checks and steps are named `tag`."""
+    try:
+        await k_show(sc, f"{tag}: {who} {what}", f"In {who}'s app, open Payments on its '{what}' tab.",
+                     f"Press {who}'s account tab in the left rail, the sidebar's Payments tab, then '{what}'.",
+                     [("press", own), ("press", "nav-payments"), ("wait_id", {"id": tab_id, "secs": 60, "soft": True}),
+                      ("press", tab_id), ("wait_id", {"id": rows[0], "secs": 60, "soft": True})],
+                     f"The '{what}' tab shows this run's {len(rows)} row(s) reading {want}.",
+                     ("Payments", what, want), [(tab_id, None)])
+        got, stale = await z_tail_rows(sc, who, rows, tab_id, switch)
+        sats = [(sc.tree_name(f"{r}-sats") if sc.tree(r) > 0 else None) for r in rows]
+        sc.check(f"{tag}: {who}'s {what}: this run's {len(rows)} row(s), each {want}, 100 sats",
+                 bool(rows) and all(v == want for v in got.values()) and sats == ["100 sats"] * len(rows),
+                 f"statuses {list(got.values())}, sats {sats}, payments-stale {stale!r}")
+        total = p_total(sc, total_id)
+        sc.notes.append(f"{tag}: {who}'s {what} total {total} sats (recorded, not checked)")
+        await asyncio.sleep(K_SETTLE)
+        return total
+    except Exception as e:
+        sc.check(f"{tag}: {who}'s {what} ran to the end", False, f"{type(e).__name__}: {e}")
+        return None
+
+
+async def z_payments_tail(sc, people, names, bounties, payouts):
+    """After the six payouts, each app's Payments screen: its issuer's two
+    rows on this run's bounty Paid (and D's claim Not payable in A's), its
+    two received rows Paid. Totals are recorded (reused wallets carry older
+    rows). Rows by id, `payment-row-<bounty>-<claim>`, from z_payouts.
+    Every check is named "Z tail"; one app's failure never blanks the next."""
+    own_ok = all(c["ok"] for c in sc.checks)
+    sc.notes.append("Z tail: Z's own checks before the Payments tail all " + ("passed" if own_ok else "did NOT pass")
+                    + "; a failing 'Z tail' check is the tail's alone")
+    d_claim = (sc.suite.meta.get("z_outsider") or {}).get("claim_event")
+    seen = sc.suite.meta.setdefault("z_tail", {})
+    for who in "ABC":
+        p = people[who]
+        sc.use(p["app"])
+        own = f"rail-account-{p['pub']}"
+        # C's app holds D too: a switch to D and back re-reads C's ledger.
+        switch = ([("press", f"rail-account-{people['D']['pub']}"), ("wait", 3), ("press", own)]
+                  if who == "C" else ())
+        by_me = [f"payment-row-{bounties[who]}-{r['claim_event']}" for r in payouts if r["issuer"] == who]
+        to_me = [f"payment-row-{bounties[r['issuer']]}-{r['claim_event']}" for r in payouts if r["claimant"] == who]
+        paid = await z_tail_tab(sc, who, names, own, switch, "payments-tab-by-me", by_me, "payments-total-paid", "Paid by me")
+        if who == "A" and d_claim:
+            # Not payable for its rank, or, once both of A's slots are paid,
+            # for the cap (autopay::decide checks slots before rank).
+            d_row = f"payment-row-{bounties['A']}-{d_claim}"
+            status = sc.tree_name(f"{d_row}-status") if sc.tree(d_row) > 0 else None
+            why = (sc.tree_name(f"{d_row}-why") if sc.tree(f"{d_row}-why") > 0 else None) or ""
+            sc.check("Z tail: D's claim on A's bounty reads Not payable (rank too low, or no slots left)",
+                     status == "Not payable" and ("bounty needs" in why or why == "no reward slots left"), f"{status!r}, {why!r}")
+        seen[who] = {"promised": sc.tree_name("sidebar-promised"), "paid_so_far": sc.tree_name("sidebar-paid"),
+                     "badge": sc.tree_name("nav-payments-badge") if sc.tree("nav-payments-badge") > 0 else None,
+                     "paid_total": paid}
+        seen[who]["received_total"] = await z_tail_tab(sc, who, names, own, switch, "payments-tab-to-me", to_me,
+                                                       "payments-total-received", "Paid to me")
+        sc.notes.append(f"Z tail: {who}'s app: {seen[who]}")
+    sc.suite.write(sc.suite.meta)
+
+
+def z_trust(sc, people, whos="ABC"):
     """A per-run score key S: each newcomer's kind-10040 names S's
     30382:rank on the instance relay (on the trust read set), and S ranks
-    A, B and C 3 there. D is ranked by nobody."""
+    each of `whos` 3 there. D is ranked by nobody."""
     box = sc.box
     score = fresh_key(box)
     sc.notes.append(f"score key {score['pub'][:12]}…")
-    issuers = [people[w]["pub"] for w in "ABC"]
+    issuers = [people[w]["pub"] for w in whos]
     for sub in issuers:
         box.nak(["event", "-k", "30382", "-c", "", "-t", f"d={sub}", "-t", "rank=3", "--sec", "$NAK_SEC", INSTANCE_RELAY],
                 sec=score["sec"])
     got = {z_tag(e, "d"): z_tag(e, "rank") for e in z_req(box, ["-k", "30382", "-a", score["pub"], INSTANCE_RELAY])}
-    ok = sc.check("the score key's kind-30382s rank A, B and C 3 on the instance relay, and nobody else",
+    ok = sc.check(f"the score key's kind-30382s rank {', '.join(whos)} 3 on the instance relay, and nobody else",
                   got == {s: "3" for s in issuers}, json.dumps({k[:8]: v for k, v in got.items()}))
-    for who in "ABC":
+    for who in whos:
         p = people[who]
         z_nak_as(p["store"], p["pub"], ["event", "-k", "10040", "-c", "", "-t", f"30382:rank={score['pub']};{INSTANCE_RELAY}",
                                         "$SEC", *TRUST_READ])
@@ -2192,15 +2780,23 @@ def z_trust(sc, people):
     return ok
 
 
-async def z_fund(sc, people):
-    """Top each issuer's Coinos wallet up to Z_FUND from the agent-wallet,
+async def z_fund(sc, people, whos="ABC", floor=Z_FUND):
+    """Top each issuer in `whos` up to `floor` sats from the agent-wallet,
     then wait for the balance to show. A send is never retried."""
-    for who in "ABC":
+    # Nothing is sent unless the float covers every top-up plus fees.
+    bals = {who: coinos_balance(people[who]["store"], people[who]["pub"]) for who in whos}
+    if not sc.check("every issuer's Coinos balance reads", all(b is not None for b in bals.values()), str(bals)):
+        return False
+    total = sum(max(0, floor - b) for b in bals.values())
+    have = sc.box.float_sats()
+    if not sc.check(f"the float covers the top-ups ({total} sats) plus 60 for fees", (have or 0) >= total + 60, f"{have} sats"):
+        return False
+    for who in whos:
         p = people[who]
         bal = coinos_balance(p["store"], p["pub"])
         if not sc.check(f"{who}'s Coinos balance reads", bal is not None, str(bal)):
             return False
-        need = Z_FUND - bal
+        need = floor - bal
         if need > 0:
             login = z_account(p["store"], p["pub"], ".coinos.username") or ""
             lud16 = f"{login}@coinos.io"
@@ -2215,10 +2811,37 @@ async def z_fund(sc, people):
             refused = isinstance(said, dict) and bool(said.get("error"))
             if not sc.check(f"agent-wallet sent {need} sats to {who}", rc == 0 and not refused, out[-200:]):
                 return False
-        bal = await z_balance_after(p["store"], p["pub"], Z_FUND, secs=120)
-        if not sc.check(f"{who}'s Coinos wallet holds at least {Z_FUND} sats", (bal or 0) >= Z_FUND, f"{bal} sats"):
+        bal = await z_balance_after(p["store"], p["pub"], floor, secs=120)
+        if not sc.check(f"{who}'s Coinos wallet holds at least {floor} sats", (bal or 0) >= floor, f"{bal} sats"):
             return False
     return True
+
+
+async def z_manual_published(sc, who, pub, name, cap):
+    """z_publishes past the publish of a manual bounty: the detail pane
+    names it with the "manual pay" pill, reward 100 and `cap`; the instance
+    lists exactly one bounty on its list; the issuer's store holds no
+    auto-pay setting for it. The bounty id, or None."""
+    sc.wait_tree("bounty-detail-paymode", 20, has="manual pay")
+    title, reward, got_cap, mode = (sc.tree_name(i) or "" for i in ("bounty-detail-title", "bounty-detail-reward",
+                                                                   "bounty-detail-cap", "bounty-detail-paymode"))
+    ok = sc.check(f"{who}: the new bounty is {name}, reward 100 sats, cap {cap} sats, manual pay",
+                  title == name and reward.startswith("100 sats") and got_cap.startswith(f"{cap} sats") and mode == "manual pay",
+                  f"title {title!r}, reward {reward!r}, cap {got_cap!r}, paymode {mode!r}")
+    coord = f"39998:{pub}:{name}"
+    out = dx(f"curl -sf -m 20 'http://tapestry/api/bounties?status=all&limit=500&issuer={z_hex(pub)}'").stdout
+    try:
+        listed = json.loads(out).get("bounties") or []
+    except (ValueError, AttributeError):
+        listed = []
+    mine = [b for b in listed if b.get("list_coordinate") == coord]
+    ok = sc.check(f"{who}: the instance holds one bounty on {coord}", len(mine) == 1,
+                  f"{len(mine)} of {len(listed)} listed") and ok
+    bid = mine[0].get("id") if len(mine) == 1 else None
+    setting = z_account(sc.app.store, pub, ".auto_pay // []") or []
+    ok = sc.check(f"{who}: no auto-pay setting for it in its store",
+                  bool(bid) and all(x.get("bounty_id") != bid for x in setting), json.dumps(setting)) and ok
+    return bid if ok else None
 
 
 async def z_outsider(sc, people, name_a, stamp):
@@ -2227,11 +2850,11 @@ async def z_outsider(sc, people, name_a, stamp):
     two poll intervals, and A's store records no attempt for it."""
     d, a = people["D"], people["A"]
     sc.use(d["app"])
-    if not await sc.step(Step("Select D in the left rail and show Bounties on its 'Eligible for me to claim' tab.",
-                              [Cand("account-bounties-eligible", "Press D's account tab, the sidebar's Bounties tab, then 'Eligible for me to claim'.",
+    if not await sc.step(Step("Select D in the left rail and show Bounties on its 'Eligible' tab.",
+                              [Cand("account-bounties-eligible", "Press D's account tab, the sidebar's Bounties tab, then 'Eligible'.",
                                     z_to_bounties("D", d["pub"], "bounties-tab-eligible", CLAIMANT[1]))],
-                              "The Bounties screen shows the 'Eligible for me to claim' tab and the header button reads 'Submit a bounty claim'.",
-                              settle=1, cues=("Submit a bounty claim", "Eligible for me to claim")),
+                              "The Bounties screen shows the 'Eligible' tab and the header button reads 'Submit a bounty claim'.",
+                              settle=1, cues=("Submit a bounty claim", "Eligible")),
                          must_act=True, label="select D"):
         return False
     if not z_selected(sc, "D", d["acct"], CLAIMANT, ISSUER):
@@ -2357,6 +2980,175 @@ async def z_wind_down(sc, people):
     sc.suite.write(sc.suite.meta)
 
 
+# ---------------------------------------------------------------- I (paid)
+# I: pay one claim by hand. Two of an earlier Z run's people, in two apps
+# side by side (pinned like Y's): A issues a bounty with auto-pay OFF, B
+# claims it from its Eligible tab, nothing pays it by itself for three
+# auto-pay polls, then A presses its card's "Pay 100 sats" twice (arm, pay).
+# Trust as in Z (a per-run score key ranks A and B 3); receipts reach the
+# instance relay through z-bridge.sh as in Z. Needs --reuse-wallets <Z run>:
+# no Coinos account is made. Spends fees only: A is topped up to I_FUND,
+# and both wallets are swept back at the end.
+I_FUND = 150   # A's wallet: one 100-sat payout plus fees
+
+
+async def scenario_i(sc):
+    """A manual bounty paid by its issuer's two clicks, once. Never retried."""
+    stamp = sc.suite.run_id.replace("-", "")[-10:]
+    meta = sc.suite.meta
+    if not sc.check("I runs on reused Z wallets: --reuse-wallets <a Z run id> is given", bool(sc.suite.args.reuse_wallets),
+                    "I makes no Coinos account; rerun with --only I --reuse-wallets <Z run id>"):
+        return
+    reuse = sc.box.reusable_z_wallets(sc.suite.args.reuse_wallets)
+    if not sc.check("the reused Z stores hold their app-made Coinos accounts (1, 1, 2)", reuse is not None,
+                    sc.suite.args.reuse_wallets):
+        return
+    meta["float_before_i"] = sc.box.float_sats()
+    if not sc.check("accessibility bus up (python3-gi, at-spi, IsEnabled)", sc.box.a11y_up()):
+        return
+    sc.fast = True
+    people = {}   # who -> {"app", "store", "pub", "acct"}; the wind-down sweeps each wallet
+    dx(f": > {CDIR}/z-claims; : > {CDIR}/z-bridge.log")
+    dx(f"cat > {CDIR}/z-bridge.sh", input=Z_BRIDGE)
+    dx(f"exec sh {CDIR}/z-bridge.sh", detach=True)
+    try:
+        await i_flow(sc, stamp, reuse, people)
+    finally:
+        await z_wind_down(sc, people)
+        meta["float_after_i"] = sc.box.float_sats()
+        spent = (meta["float_before_i"] or 0) - (meta["float_after_i"] or 0)
+        sc.check("float back to within 150 sats of where it started (fees and reserves only)", spent <= 150,
+                 f"{meta['float_before_i']} -> {meta['float_after_i']} sats")
+
+
+async def i_flow(sc, stamp, reuse, people):
+    meta = sc.suite.meta
+    env = {"MC_AUTOPAY_POLL_SECS": str(Z_POLL)}
+    for who, at in (("A", APP_A_AT), ("B", APP_B_AT)):
+        sc.box.launch(f"I-{who}", sc.suite.run_id, target="instance", nsecs="", keep=who != "A", at=at,
+                      seed_account=reuse[who], extra_env=env)
+        app = sc.box.last_app
+        sc.use(app)
+        if not await a11y_preflight(sc):
+            return
+        pub = reuse[who][1][0]
+        acct = await reused_name(sc, who, pub)
+        if not acct:
+            return
+        people[who] = {"app": app, "store": app.store, "pub": pub, "acct": acct}
+    if not z_trust(sc, people, "AB"):
+        return
+    if not await z_fund(sc, people, "A", I_FUND):
+        return
+    a, b = people["A"], people["B"]
+    name, item = f"e2e-m-{stamp}", f"M B on A {stamp}"
+    coord = f"39998:{a['pub']}:{name}"
+    sc.use(a["app"])
+    bid = await z_publishes(sc, "A", a["pub"], a["acct"], name, cap="100", auto_pay=False)
+    if not bid:
+        return
+    # The claim form says how a manual bounty pays (bounties.rs claim form).
+    card = await z_claim(sc, b["app"], "B", b["pub"], b["acct"], name, item, form_note="Manual pay:")
+    if not card:
+        return
+    claim_id = card[len("claim-"):]
+    z_bridge_add(claim_id)
+    pay, row = f"{card}-pay", f"payment-row-{bid}-{claim_id}"
+    rec = meta["i_payment"] = {"bounty": bid, "claim_event": claim_id, "list": name}
+
+    # Nothing pays a manual bounty by itself: three auto-pay polls later the
+    # card still offers the button, A's store holds no attempt, A's wallet
+    # is where it was.
+    sc.use(a["app"])
+    ab0, bb0 = coinos_balance(a["store"], a["pub"]), coinos_balance(b["store"], b["pub"])
+    t0 = time.time()
+    label = "A shows the claim"
+    met = await sc.step(z_issuer_view("A", a["pub"], name, item, "bounties-tab-issued"), label=label)
+    sc.wait_tree(pay, 60)
+    await act(sc, "I: the pay button in view", [("scroll_to", pay), PARK])
+    if k_names(sc, "I: A's card offers 'Pay 100 sats'", {pay: "Pay 100 sats"}) and not met:
+        sc.accept_step(label, "the claim card's pay button in A's app's tree")
+    await asyncio.sleep(max(0, t0 + 3 * Z_POLL - time.time()))
+    held = [x for x in z_account(a["store"], a["pub"], ".pay_attempts // []") or [] if x.get("bounty_id") == bid]
+    sc.check(f"I: no attempt in A's store after {3 * Z_POLL} s (three auto-pay polls)", not held, json.dumps(held)[:300])
+    ab_held = coinos_balance(a["store"], a["pub"])
+    sc.check("I: A's wallet unchanged while nobody pays", ab0 is not None and ab_held == ab0, f"{ab0} -> {ab_held}")
+    k_names(sc, "I: the button still reads 'Pay 100 sats'", {pay: "Pay 100 sats"})
+    rec["balances_before"] = {"A": ab0, "B": bb0}
+    sc.suite.write(meta)
+
+    # Payments before: Owed both ways, "manual pay" in the issuer's row.
+    await z_tail_tab(sc, "A", {}, f"rail-account-{a['pub']}", (), "payments-tab-by-me", [row], "payments-total-paid",
+                     "Paid by me", want="Owed", tag="I before")
+    why = sc.tree_name(f"{row}-why") if sc.tree(f"{row}-why") > 0 else None
+    sc.check("I before: A's row says why: manual pay", why == "manual pay", repr(why))
+    sc.use(b["app"])
+    await z_tail_tab(sc, "B", {}, f"rail-account-{b['pub']}", (), "payments-tab-to-me", [row], "payments-total-received",
+                     "Paid to me", want="Owed", tag="I before")
+
+    # The payment: two presses, each outside a Jev step (a retried step
+    # would press again). Never a third, never retried.
+    sc.use(a["app"])
+    label = "A back on the claim"
+    met = await sc.step(z_issuer_view("A", a["pub"], name, item, "bounties-tab-issued"), label=label)
+    await act(sc, "I: the pay button in view", [("scroll_to", pay), PARK])
+    if not k_names(sc, "I: the button reads 'Pay 100 sats' before the payment", {pay: "Pay 100 sats"}):
+        return
+    if not met:
+        sc.accept_step(label, "the claim card's pay button in A's app's tree")
+    if not await act(sc, "I: the pay button pressed once (arms)", [("press", pay)]):
+        return
+    sc.wait_tree(pay, 5, has="Click again to pay")
+    armed = sc.tree_name(pay) or ""
+    if not sc.check("I: the first press arms it: 'Click again to pay 100 sats to …'",
+                    armed.startswith("Click again to pay 100 sats to"), repr(armed)):
+        return
+    submitted = time.time()
+    pressed = await act(sc, "I: the pay button pressed a second time (pays)", [("press", pay)])
+    rec["second_press"] = "sent" if pressed else "raised (not repeated)"
+    sc.notes.append(f"I: second press {rec['second_press']}")
+    sc.wait_tree(f"{card}-pay-sending", 10, has="Sending payment")
+    seen = await z_settled(sc, a["app"], "A", a["pub"], name, item, card, submitted, "bounties-tab-issued")
+    refused = sc.tree_name(f"{card}-pay-refused") if sc.tree(f"{card}-pay-refused") > 0 else None
+    sc.check("I: no refusal on the card", refused is None, repr(refused))
+    rec["pressed_to_settled_s"] = round(seen - submitted, 1) if seen else None
+
+    # After: the money, the store, the receipt, the button gone.
+    bb1 = await z_balance_after(b["store"], b["pub"], (bb0 or 0) + 100)
+    ab1 = coinos_balance(a["store"], a["pub"])
+    rec["balances_after"] = {"A": ab1, "B": bb1}
+    sc.suite.write(meta)
+    sc.check("I: B's wallet up by exactly 100 sats", None not in (bb0, bb1) and bb1 - bb0 == 100, f"{bb0} -> {bb1}")
+    sc.check("I: A's wallet down by 100 sats plus at most 10 in fees", None not in (ab0, ab1) and 100 <= ab0 - ab1 <= 110,
+             f"{ab0} -> {ab1}")
+    mine = [x for x in z_account(a["store"], a["pub"], ".pay_attempts // []") or [] if x.get("bounty_id") == bid]
+    sc.check("I: exactly one attempt for the claim in A's store, paid, 100 sats to B",
+             len(mine) == 1 and mine[0].get("state") == "paid" and mine[0].get("sats") == 100 and mine[0].get("claimant") == b["pub"],
+             json.dumps([(x.get("claimant", "")[:8], x.get("state"), x.get("sats")) for x in mine]))
+    on_instance = z_req(sc.box, ["-k", "9735", "-e", claim_id, INSTANCE_RELAY])
+    signed = [r for r in on_instance if z_issuer_paid(r, a["pub"], claim_id, coord)]
+    sc.check(f"I: one receipt, its zap request signed by A for 100 sats on {name}", len(on_instance) == 1 and len(signed) == 1,
+             f"{len(on_instance)} on the instance relay, {len(signed)} issuer-signed")
+    sc.check("I: the pay button is gone from the settled card", sc.tree(pay) == 0 and sc.tree(f"{card}-pay-sending") == 0,
+             f"pay {sc.tree(pay)}, sending {sc.tree(f'{card}-pay-sending')}")
+
+    # Payments after: Paid both ways.
+    await z_tail_tab(sc, "A", {}, f"rail-account-{a['pub']}", (), "payments-tab-by-me", [row], "payments-total-paid",
+                     "Paid by me", tag="I after")
+    sc.use(b["app"])
+    await z_tail_tab(sc, "B", {}, f"rail-account-{b['pub']}", (), "payments-tab-to-me", [row], "payments-total-received",
+                     "Paid to me", tag="I after")
+    # No second payment: the card, looked at again, has no button.
+    sc.use(a["app"])
+    label = "A's card after"
+    met = await sc.step(z_issuer_view("A", a["pub"], name, item, "bounties-tab-issued"), label=label)
+    ok = sc.check("I: after settlement A's card offers no second payment", sc.tree(card) == 1 and sc.tree(pay) == 0,
+                  f"card {sc.tree(card)}, pay {sc.tree(pay)}")
+    if ok and not met:
+        sc.accept_step(label, "the settled card without a pay button in A's app's tree")
+    await asyncio.sleep(K_SETTLE)
+
+
 SCENARIOS = {
     "A": ("submit lock while a create hangs", scenario_a),
     "B": ("502 on create: hint and refetch", scenario_b),
@@ -2377,6 +3169,9 @@ SCENARIOS = {
     "W": ("trust: Recalculate 429/403/NO_ELIGIBLE_USERS wording, disabled with no follows", scenario_w),
     "S": ("issuer posts a new bounty on an existing list", scenario_s),
     "T": ("eligible list survives an account switch mid-request", scenario_t),
+    "J": ("sign-up screen: choose card, the create card's key and wallet promise, back; nothing made", scenario_j),
+    "I": ("manual pay: an issuer pays one claim by hand, two clicks, once; nothing pays it by itself", scenario_i),
+    "K": ("payments ledger: both tabs, totals, badge, sidebar, Issued/Claimed tabs, debts, payout field; a row opens its bounty", scenario_k),
     "P": ("paid: real bounty, claim, settle", scenario_p),
     "R": ("newcomers: create two accounts in the app, claim the house bounty, both paid", scenario_r),
     "Y": ("two apps: newcomers in separate app processes claim the house bounty, both paid, each sees the other", scenario_y),

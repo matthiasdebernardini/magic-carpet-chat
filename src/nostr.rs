@@ -26,6 +26,8 @@ use crate::brainstorm::{self, RunState, SearchHit};
 use crate::coinos;
 use crate::diag;
 use crate::events::{self, EventError};
+use crate::ledger::{self, ClaimView, Direction, Ledger, Row, Status};
+use crate::lnbits;
 use crate::secrets::{self, Secret, SecretError};
 use crate::trust::{self, Assertion, BrainstormKey, Designation};
 
@@ -172,6 +174,14 @@ pub enum Command {
         pubkey: String,
         seq: u64,
     },
+    /// Every bounty payment `pubkey` makes or gets, as finished
+    /// [`ledger::Row`]s: claims by others on its bounties, and its own claims
+    /// on others'. Emits `Ledger` or `LedgerFailed` carrying the same
+    /// `pubkey` and `seq`, like `FetchEligible`.
+    FetchLedger {
+        pubkey: String,
+        seq: u64,
+    },
     PublishDList {
         pubkey: String,
         singular: String,
@@ -217,6 +227,11 @@ pub enum Command {
     /// `WalletFailed`. Idempotent: a login already stored for the account is
     /// reused, so a retry after a publish failure never opens a second one.
     CreateCoinosWallet { pubkey: String },
+    /// The person's own Lightning address for payouts: check that it takes
+    /// payments and sends zap receipts, then write it into the kind-0,
+    /// replacing whatever address was there. Emits `LightningAddressSet`
+    /// (then `ProfileLoaded`) or `LightningAddressFailed`.
+    SetLightningAddress { pubkey: String, address: String },
     /// Read the wallet balance with the stored token. Emits `Balance` or
     /// `BalanceFailed` carrying the same `request`, plus one feed line per
     /// failure streak. `None` for polls; the armed remove sets its own id.
@@ -231,6 +246,15 @@ pub enum Command {
         pubkey: String,
         to: String,
         sats: u64,
+    },
+    /// Pay one claim by hand on `pubkey`'s own manual bounty (no auto-pay
+    /// setting here, not paid by the server), through the auto-pay path: the
+    /// attempt is recorded before anything is sent, so a second click never
+    /// pays twice. Emits `PaymentState`s as it goes, or `PayClaimRefused`.
+    PayClaim {
+        pubkey: String,
+        bounty_id: String,
+        claim_address: String,
     },
     /// Follow one bounty: receipts by `#e` on the relay, plus the API's
     /// payment state machine while a claim is pending. Idempotent — a bounty
@@ -384,6 +408,18 @@ pub enum Update {
         seq: u64,
         message: String,
     },
+    /// `pubkey`'s payments ledger, whole: a read that failed anywhere sends
+    /// `LedgerFailed` instead, never a ledger with rows missing.
+    Ledger {
+        pubkey: String,
+        seq: u64,
+        ledger: Ledger,
+    },
+    LedgerFailed {
+        pubkey: String,
+        seq: u64,
+        message: String,
+    },
     /// A fresh full snapshot of a watched bounty (emitted only on change).
     /// Boxed: the snapshot dwarfs every other variant on the channel.
     BountyDetail(Box<BountyDetail>),
@@ -426,6 +462,10 @@ pub enum Update {
     /// Fixed text from `coinos::CoinosError` or [`SecretError`]; never the
     /// password.
     WalletFailed { pubkey: String, message: String },
+    /// `address` passed the check and is on the profile.
+    LightningAddressSet { pubkey: String, address: String },
+    /// Fixed text from the address check or the profile write.
+    LightningAddressFailed { pubkey: String, message: String },
     /// The Coinos balance, in sats.
     Balance {
         pubkey: String,
@@ -455,6 +495,12 @@ pub enum Update {
         pubkey: String,
         message: String,
         may_have_paid: bool,
+    },
+    /// A `PayClaim` that sent nothing, and why, in fixed wording.
+    PayClaimRefused {
+        bounty_id: String,
+        claim_address: String,
+        message: String,
     },
     /// One finished piece of a `FetchTrust` — five of these arrive per fetch,
     /// each the moment its read completes rather than all at the end.
@@ -602,6 +648,8 @@ pub struct PublishOk {
 /// only — fixed text, and the password stays in the store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalletCreated {
+    /// The LNbits server's host for a wallet there; `None` is Coinos.
+    pub server_host: Option<String>,
     pub username: String,
     pub lightning_address: String,
     pub publish_error: Option<String>,
@@ -619,6 +667,8 @@ pub struct AccountInfo {
 /// login saved before a register that never answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletInfo {
+    /// The LNbits server's host for a wallet there; `None` is Coinos.
+    pub server_host: Option<String>,
     pub username: String,
     pub lightning_address: String,
     pub has_token: bool,
@@ -817,6 +867,15 @@ async fn run(
                     updates.clone(),
                 ));
             }
+            Command::FetchLedger { pubkey, seq } => {
+                tokio::spawn(fetch_ledger(
+                    client.clone(),
+                    ctx.clone(),
+                    pubkey,
+                    seq,
+                    updates.clone(),
+                ));
+            }
             Command::AddAccount {
                 secret,
                 name,
@@ -848,6 +907,11 @@ async fn run(
                 let updates = updates.clone();
                 tokio::spawn(create_coinos_wallet(sessions, pubkey, None, updates));
             }
+            Command::SetLightningAddress { pubkey, address } => {
+                let sessions = sessions.clone();
+                let updates = updates.clone();
+                tokio::spawn(set_lightning_address(sessions, pubkey, address, updates));
+            }
             Command::FetchBalance { pubkey, request } => {
                 let failures = balance_failures.clone();
                 let updates = updates.clone();
@@ -857,6 +921,20 @@ async fn run(
                 let failures = balance_failures.clone();
                 let updates = updates.clone();
                 tokio::spawn(send_sats(pubkey, to, sats, failures, updates));
+            }
+            Command::PayClaim {
+                pubkey,
+                bounty_id,
+                claim_address,
+            } => {
+                tokio::spawn(pay_claim_by_hand(
+                    client.clone(),
+                    ctx.clone(),
+                    pubkey,
+                    bounty_id,
+                    claim_address,
+                    updates.clone(),
+                ));
             }
             Command::PublishDList {
                 pubkey,
@@ -1294,11 +1372,22 @@ async fn publish_claim(
 /// the caller decides whether that is silent (startup) or shown (the account
 /// screen).
 async fn fetch_kind0(api: &Api, pubkey: &str) -> Result<Option<String>, ()> {
+    Ok(fetch_kind0_dated(api, pubkey)
+        .await?
+        .map(|(_, content)| content))
+}
+
+/// [`fetch_kind0`] with the event's `created_at` (0 when the row has none),
+/// so the pay path can weigh it against public copies.
+async fn fetch_kind0_dated(api: &Api, pubkey: &str) -> Result<Option<(u64, String)>, ()> {
     let filter = serde_json::json!({ "kinds": [0], "authors": [pubkey], "limit": 1 });
     let events = api.scan(&filter).await.map_err(|e| {
         diag::note(format!("kind-0 scan for {pubkey} failed: {e}"));
     })?;
-    Ok(events.into_iter().next().map(|event| event.content))
+    Ok(events
+        .into_iter()
+        .next()
+        .map(|event| (event.created_at.unwrap_or(0), event.content)))
 }
 
 /// The kind-0 fields the UI shows, read field by field from the JSON so one
@@ -1363,10 +1452,14 @@ fn profile_loaded(pubkey: String, profile: Profile) -> Update {
 /// wrong-typed fields included. `None` existing content means "confirmed no
 /// profile", and only that may start from a blank one; anything that is not
 /// a JSON object is left alone rather than overwritten.
-fn merge_lud16(
+///
+/// A different `lud16` already on the profile is refused unless `write` is
+/// [`Lud16Write::Replace`].
+fn merge_lud16_as(
     existing: Option<&str>,
     lud16: &str,
     name: Option<&str>,
+    write: Lud16Write,
 ) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
     let mut profile = match existing.map(str::trim) {
         None | Some("") => serde_json::Map::new(),
@@ -1383,7 +1476,9 @@ fn merge_lud16(
     // paid; replacing it would reroute their payouts. The same address is a
     // retry and goes through.
     let current = Profile::from_value(&serde_json::Value::Object(profile.clone())).lud16;
-    if current.is_some_and(|current| !current.eq_ignore_ascii_case(lud16.trim())) {
+    if write == Lud16Write::KeepOther
+        && current.is_some_and(|current| !current.eq_ignore_ascii_case(lud16.trim()))
+    {
         return Err(BridgeError::Profile(
             "Your profile already has a Lightning address, so this app left it alone.",
         ));
@@ -1399,26 +1494,56 @@ fn merge_lud16(
     Ok(profile)
 }
 
+/// Whether a kind-0 write may replace a different Lightning address already
+/// on the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lud16Write {
+    /// The app's own wallet setup: an address set elsewhere wins.
+    KeepOther,
+    /// The person typed this address to replace the old one.
+    Replace,
+}
+
+/// [`merge_lud16_as`] for the wallet setup, which never replaces an address.
+#[cfg(test)]
+fn merge_lud16(
+    existing: Option<&str>,
+    lud16: &str,
+    name: Option<&str>,
+) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
+    merge_lud16_as(existing, lud16, name, Lud16Write::KeepOther)
+}
+
 /// Write `lud16` into the account's kind-0 and push it to the instance AND the
 /// public relays. Returns the merged profile so the caller can announce it.
 ///
 /// A scan failure is an error, not an empty profile: a timed-out read used to
 /// look exactly like "no profile" in the desktop app, and the merge then
-/// published a kind-0 holding nothing but lud16.
+/// published a kind-0 holding nothing but lud16. A typed address
+/// ([`Lud16Write::Replace`]) merges into the newest copy across the instance
+/// and the public relays ([`profile_to_merge`]).
 async fn publish_lud16(
     keys: &Keys,
     api: &Api,
     lud16: &str,
     name: Option<&str>,
+    write: Lud16Write,
 ) -> Result<serde_json::Map<String, serde_json::Value>, BridgeError> {
-    let existing = fetch_kind0(api, &keys.public_key().to_hex())
-        .await
-        .map_err(|_| {
-            BridgeError::Profile(
-                "Couldn't read your profile from the Magic Carpet server. Try again.",
-            )
-        })?;
-    let profile = merge_lud16(existing.as_deref(), lud16, name)?;
+    let pubkey = keys.public_key().to_hex();
+    let unread = |_| {
+        BridgeError::Profile("Couldn't read your profile from the Magic Carpet server. Try again.")
+    };
+    let existing = match write {
+        Lud16Write::KeepOther => fetch_kind0(api, &pubkey).await.map_err(unread)?,
+        Lud16Write::Replace => {
+            let instance = fetch_kind0_dated(api, &pubkey).await.map_err(unread)?;
+            let public = public_kind0(&pubkey)
+                .await
+                .map(|event| event.map(|event| (event.created_at.as_secs(), event.content)));
+            profile_to_merge(instance, public)?
+        }
+    };
+    let profile = merge_lud16_as(existing.as_deref(), lud16, name, write)?;
     let content = serde_json::Value::Object(profile.clone()).to_string();
     let event = EventBuilder::new(Kind::Metadata, content)
         .finalize(keys)
@@ -1490,7 +1615,8 @@ const NO_TOKEN: &str = "This app lost access to the wallet. Remove the account a
 /// A login already stored with a token (a retry after a publish failure)
 /// skips to step 3. One stored WITHOUT a token probes coinos first: no
 /// wallet → register with the same login; a wallet → [`NO_TOKEN`], never a
-/// second account.
+/// second account. Steps 1 and 2 are [`open_wallet`], which also covers a
+/// wallet on an LNbits server.
 async fn create_coinos_wallet(
     sessions: SharedSessions,
     pubkey: String,
@@ -1511,39 +1637,26 @@ async fn create_coinos_wallet(
         Err(e) => return fail(e.to_string()),
     };
 
-    let stored = match secrets::load_coinos_login(&pubkey) {
-        Ok(stored) => stored,
-        Err(e) => return fail(e.to_string()),
-    };
-    let login = match stored {
-        Some(login) if login.has_token() => login,
-        Some(login) => match coinos::wallet_exists(&login.username).await {
-            Ok(true) => return fail(NO_TOKEN.into()),
-            Ok(false) => match register_wallet(&pubkey, login).await {
-                Ok(login) => login,
-                Err(message) => return fail(message),
-            },
-            Err(e) => return fail(e.to_string()),
-        },
-        None => {
-            let login = coinos::Login::fresh();
-            if let Err(e) = secrets::store_coinos_login(&pubkey, &login) {
-                return fail(e.to_string());
-            }
-            match register_wallet(&pubkey, login).await {
-                Ok(login) => login,
-                Err(message) => return fail(message),
-            }
-        }
+    let login = match open_wallet(&pubkey).await {
+        Ok(login) => login,
+        Err(message) => return fail(message),
     };
 
-    let lightning_address = coinos::lightning_address(&login.username);
-    let published = publish_lud16(&keys, &api, &lightning_address, name.as_deref()).await;
+    let lightning_address = login.lightning_address();
+    let published = publish_lud16(
+        &keys,
+        &api,
+        &lightning_address,
+        name.as_deref(),
+        Lud16Write::KeepOther,
+    )
+    .await;
     // The wallet exists either way; a publish failure travels inside
     // `WalletCreated` so the panel can show it next to the retry button.
     let _ = updates.unbounded_send(Update::WalletCreated {
         pubkey: pubkey.clone(),
         created: WalletCreated {
+            server_host: login.server_host(),
             username: login.username,
             lightning_address,
             publish_error: published.as_ref().err().map(ToString::to_string),
@@ -1552,6 +1665,132 @@ async fn create_coinos_wallet(
     if let Ok(profile) = published {
         let profile = Profile::from_value(&serde_json::Value::Object(profile));
         let _ = updates.unbounded_send(profile_loaded(pubkey, profile));
+    }
+}
+
+/// Steps 1 and 2 of the signup for `pubkey`'s stored account: the login it
+/// already has, finished if it needs it, or a new one. A new wallet goes to
+/// the LNbits server in `MC_WALLET_SERVER` when that is set, else to Coinos;
+/// a stored login keeps the service it names. The error is the fixed text
+/// the panel shows.
+pub async fn open_wallet(pubkey: &str) -> Result<coinos::Login, String> {
+    match secrets::load_coinos_login(pubkey).map_err(|e| e.to_string())? {
+        Some(login) => match login.server.clone() {
+            Some(server) => open_server_wallet(pubkey, &server, login).await,
+            None if login.has_token() => Ok(login),
+            None => match coinos::wallet_exists(&login.username).await {
+                Ok(true) => Err(NO_TOKEN.into()),
+                Ok(false) => register_wallet(pubkey, login).await,
+                Err(e) => Err(e.to_string()),
+            },
+        },
+        None => {
+            let server = lnbits::server_from_env().map_err(|e| e.to_string())?;
+            let login = match &server {
+                Some(server) => coinos::Login::fresh_on(server.clone()),
+                None => coinos::Login::fresh(),
+            };
+            secrets::store_coinos_login(pubkey, &login).map_err(|e| e.to_string())?;
+            match server {
+                Some(server) => open_server_wallet(pubkey, &server, login).await,
+                None => register_wallet(pubkey, login).await,
+            }
+        }
+    }
+}
+
+/// Fixed text for an address name that stays taken after one fresh pick.
+const NAME_TAKEN: &str = "The wallet server already has that address name. Try again.";
+
+/// The LNbits half of [`open_wallet`], with the login already in the store:
+///
+/// 1. No admin key yet: create the account and store its key at once. An
+///    earlier try may have made an account whose key never came back; that
+///    empty account is harmless, and nothing could reach it anyway.
+/// 2. With a key: an address that already answers is done. Otherwise create
+///    it. A 409 on a name this wallet's own links hold is done too; on a
+///    name someone else holds, store a fresh name and try once more.
+async fn open_server_wallet(
+    pubkey: &str,
+    server: &str,
+    mut login: coinos::Login,
+) -> Result<coinos::Login, String> {
+    if !login.has_token() {
+        match lnbits::create_account(server, &login.username).await {
+            Ok(key) => {
+                login.token = key;
+                secrets::store_coinos_login(pubkey, &login).map_err(|e| e.to_string())?;
+            }
+            Err(e) => {
+                if e.account_definitely_not_created() {
+                    let _ = secrets::forget_coinos_login(pubkey);
+                }
+                return Err(e.to_string());
+            }
+        }
+    } else if lnbits::address_exists(server, &login.username)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(login);
+    }
+    for last in [false, true] {
+        let made = lnbits::create_address(server, &login.token, &login.username)
+            .await
+            .map_err(|e| e.to_string())?;
+        if made == lnbits::NewAddress::Created {
+            return Ok(login);
+        }
+        let own = lnbits::own_usernames(server, &login.token)
+            .await
+            .map_err(|e| e.to_string())?;
+        if own.iter().any(|name| name.eq_ignore_ascii_case(&login.username)) {
+            return Ok(login);
+        }
+        if !last {
+            login = login.renamed();
+            secrets::store_coinos_login(pubkey, &login).map_err(|e| e.to_string())?;
+        }
+    }
+    Err(NAME_TAKEN.into())
+}
+
+/// "Save" on the payout address: the check first, so an address bounties
+/// cannot pay never reaches the profile, then the kind-0 write. The one
+/// write that replaces a different address, because the person typed it.
+async fn set_lightning_address(
+    sessions: SharedSessions,
+    pubkey: String,
+    address: String,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let fail = |message: String| {
+        let _ = updates.unbounded_send(Update::LightningAddressFailed {
+            pubkey: pubkey.clone(),
+            message,
+        });
+    };
+    let address = address.trim().to_string();
+    if let Err(e) = coinos::check_address(&address).await {
+        return fail(e.to_string());
+    }
+    let (keys, api) = match session(&sessions, &pubkey).await {
+        Ok(session) => {
+            let session = session.lock().await;
+            (session.keys.clone(), session.api.clone())
+        }
+        Err(e) => return fail(e.to_string()),
+    };
+    match publish_lud16(&keys, &api, &address, None, Lud16Write::Replace).await {
+        Ok(profile) => {
+            let _ = updates.unbounded_send(Update::LightningAddressSet {
+                pubkey: pubkey.clone(),
+                address,
+            });
+            let profile = Profile::from_value(&serde_json::Value::Object(profile));
+            let _ = updates.unbounded_send(profile_loaded(pubkey, profile));
+        }
+        Err(e) => fail(e.to_string()),
     }
 }
 
@@ -1612,7 +1851,7 @@ async fn send_sats(
         Ok(bolt11) => bolt11,
         Err(e) => return fail(e.to_string()),
     };
-    match coinos::pay_invoice(&login.token, &bolt11, sats).await {
+    match coinos::wallet_pay(&login, &bolt11, sats).await {
         Ok(()) => {
             let _ = updates.unbounded_send(Update::Sent {
                 pubkey: pubkey.clone(),
@@ -1655,7 +1894,7 @@ async fn fetch_balance(
             set.remove(&pubkey)
         }
     };
-    match coinos::balance(&login.token).await {
+    match coinos::wallet_balance(&login).await {
         Ok(sats) => {
             mark(false);
             let _ = updates.unbounded_send(Update::Balance {
@@ -1699,7 +1938,8 @@ async fn load_accounts(updates: mpsc::UnboundedSender<Update>) {
             npub: account.npub(),
             wallet: account.coinos.as_ref().map(|login| WalletInfo {
                 username: login.username.clone(),
-                lightning_address: coinos::lightning_address(&login.username),
+                lightning_address: login.lightning_address(),
+                server_host: login.server_host(),
                 has_token: login.has_token(),
             }),
         })
@@ -2064,8 +2304,12 @@ async fn rank_source(
     map
 }
 
-/// Whether `pubkey`'s kind-0 names a Lightning address. `None` when the
-/// profile could not be read.
+/// Whether `pubkey`'s kind-0 names a Lightning address, from the INSTANCE
+/// copy only. It runs per claim on every poll and only feeds the "no
+/// Lightning address" hint, which moves no money, so a public-relay read
+/// (seconds per claimant) is not worth it; the pay path reads the newest
+/// copy itself ([`claimant_lud16`]). `None` when the profile could not be
+/// read.
 async fn has_lud16(ctx: &AutoPayCtx, pubkey: &str) -> Option<bool> {
     let now = now_unix();
     if let Some((at, has)) = ctx.cache.lock().await.lud16.get(pubkey)
@@ -2074,7 +2318,11 @@ async fn has_lud16(ctx: &AutoPayCtx, pubkey: &str) -> Option<bool> {
         return Some(*has);
     }
     let api = Api::new().ok()?;
-    let has = claimant_lud16(&api, pubkey).await.ok()?.is_some();
+    let has = fetch_kind0(&api, pubkey)
+        .await
+        .ok()?
+        .and_then(|content| parse_profile(&content).lud16)
+        .is_some();
     ctx.cache
         .lock()
         .await
@@ -2083,12 +2331,109 @@ async fn has_lud16(ctx: &AutoPayCtx, pubkey: &str) -> Option<bool> {
     Some(has)
 }
 
-/// The claimant's Lightning address from its kind-0. `Err` when the
-/// profile could not be read.
+/// The claimant's Lightning address from its newest kind-0, for the PAY
+/// path: the instance's copy weighed against the public relays' (outbox and
+/// trust relays), so an address changed in another Nostr app is the one
+/// paid. `Err` when the instance read failed; a failed or slow public read
+/// falls back to the instance copy rather than holding payments up.
 async fn claimant_lud16(api: &Api, pubkey: &str) -> Result<Option<String>, ()> {
-    Ok(fetch_kind0(api, pubkey)
-        .await?
-        .and_then(|content| parse_profile(&content).lud16))
+    let instance = fetch_kind0_dated(api, pubkey).await?;
+    let public = public_kind0(pubkey).await.ok().flatten();
+    Ok(newest_lud16(
+        instance,
+        public.map(|event| (event.created_at.as_secs(), event.content)),
+    ))
+}
+
+/// The newest signature-verified kind-0 of `pubkey` on its outbox relays and
+/// the trust relays, all within 20 seconds. `Ok(None)`: at least one relay
+/// answered and none had a profile. `Err(())`: no relay answered (or the
+/// read timed out, or the key is invalid), so nothing is known.
+async fn public_kind0(pubkey: &str) -> Result<Option<Event>, ()> {
+    let public = PublicKey::parse(pubkey).map_err(|_| ())?;
+    let instance = relay_url();
+    let read = async {
+        let (client, urls) = community_client(pubkey).await;
+        let urls: Vec<String> = urls.into_iter().filter(|url| !is_instance_relay(url, &instance)).collect();
+        let filter = Filter::new().kind(Kind::Metadata).author(public).limit(5);
+        let results = read_per_relay(&client, &urls, filter).await;
+        client.disconnect().await;
+        results
+    };
+    let results = tokio::time::timeout(Duration::from_secs(20), read)
+        .await
+        .map_err(|_| diag::note(format!("public kind-0 read for {pubkey} timed out")))?;
+    let (count, events) = public_answers(results, &instance);
+    if count == 0 {
+        diag::note(format!("no public relay answered the kind-0 read for {pubkey}"));
+        return Err(());
+    }
+    Ok(newest_kind0(events.into_iter().map(|(_, event)| event), &public))
+}
+
+/// Whether `url` is the instance relay. The public read leaves it out: it
+/// answers when every public relay is down, and its copy is read apart.
+fn is_instance_relay(url: &str, instance: &str) -> bool {
+    trust::normalize_relay(url) == trust::normalize_relay(instance)
+}
+
+/// [`answered`], counting public relays only, so an answer from the
+/// instance relay alone is no public answer.
+fn public_answers(
+    results: Vec<(String, Result<Vec<Event>, ()>)>,
+    instance: &str,
+) -> (usize, Vec<(String, Event)>) {
+    answered(results.into_iter().filter(|(url, _)| !is_instance_relay(url, instance)).collect())
+}
+
+/// The newest kind-0 by `author` whose signature verifies.
+fn newest_kind0(events: impl IntoIterator<Item = Event>, author: &PublicKey) -> Option<Event> {
+    events
+        .into_iter()
+        .filter(|event| {
+            event.kind == Kind::Metadata && event.pubkey == *author && event.verify().is_ok()
+        })
+        .max_by_key(|event| event.created_at)
+}
+
+/// The `lud16` of the newer of two `(created_at, content)` kind-0 copies.
+/// The newer copy decides even without a `lud16`: the claimant removed it.
+/// On a tie the instance copy stands.
+fn newest_lud16(
+    instance: Option<(u64, String)>,
+    public: Option<(u64, String)>,
+) -> Option<String> {
+    newest_copy(instance, public).and_then(|(_, content)| parse_profile(&content).lud16)
+}
+
+/// The newer of two `(created_at, content)` kind-0 copies; the instance
+/// copy on a tie.
+fn newest_copy(
+    instance: Option<(u64, String)>,
+    public: Option<(u64, String)>,
+) -> Option<(u64, String)> {
+    match (instance, public) {
+        (Some(instance), Some(public)) if public.0 > instance.0 => Some(public),
+        (Some(instance), _) => Some(instance),
+        (None, public) => public,
+    }
+}
+
+/// The kind-0 content a typed Lightning address is merged into: the newer
+/// of the instance copy and the public one ([`newest_copy`]), so a profile
+/// that lives only on public relays, or was edited in another Nostr app
+/// since the instance copy, is kept. `public` is `Err` when no public relay
+/// answered: then the newest copy is unknown and nothing may be published.
+fn profile_to_merge(
+    instance: Option<(u64, String)>,
+    public: Result<Option<(u64, String)>, ()>,
+) -> Result<Option<String>, BridgeError> {
+    let public = public.map_err(|_| {
+        BridgeError::Profile(
+            "Couldn't read your profile from the public relays, so nothing was changed. Try again.",
+        )
+    })?;
+    Ok(newest_copy(instance, public).map(|(_, content)| content))
 }
 
 /// Kind-39999 claims on any of `coordinates` since `since`, and the
@@ -2190,6 +2535,40 @@ fn pays(receipt: &Event, bounty: &Bounty, claim_event_id: &str) -> bool {
         &bounty.id,
         bounty.amount_sats,
     )
+}
+
+/// Whether the receipt the server attached to `claim` on a bounty it pays
+/// can stand. The server matches a receipt by the description's pubkey and
+/// the claim's `e` tag alone, so a forged one, or a payment on another
+/// bounty on the same list, would read as paid. Its own settled row for
+/// this bounty counts (its delegate key is unknown here); otherwise the
+/// receipt must pass [`pays`] with the issuer as payer.
+fn server_receipt_holds(claim: &Claim, bounty: &Bounty) -> bool {
+    let settled_here = claim
+        .auto_payment
+        .as_ref()
+        .is_some_and(|p| p.state == "settled" && p.bounty_id == bounty.id);
+    settled_here
+        || claim
+            .zap_receipt
+            .as_ref()
+            .and_then(raw_to_event)
+            .is_some_and(|receipt| receipt.verify().is_ok() && pays(&receipt, bounty, &claim.event.id))
+}
+
+/// The API's copy of an event as a signed [`Event`]; `None` without a
+/// signature or when any field does not parse.
+fn raw_to_event(raw: &RawEvent) -> Option<Event> {
+    let value = serde_json::json!({
+        "id": raw.id,
+        "pubkey": raw.pubkey,
+        "created_at": raw.created_at?,
+        "kind": raw.kind?,
+        "tags": raw.tags,
+        "content": raw.content,
+        "sig": raw.sig.as_ref()?,
+    });
+    serde_json::from_value(value).ok()
 }
 
 /// One relay claim joined with the server's copy of it, for a bounty the
@@ -2389,6 +2768,22 @@ fn attempts_of<'a>(store: &'a secrets::Store, issuer: &str) -> &'a [secrets::Pay
         .unwrap_or(&[])
 }
 
+/// `app_auto_pay` and `app_min_rank` from this app's setting for the bounty.
+fn apply_setting(bounty: &mut Bounty, setting: Option<&secrets::AutoPaySetting>) {
+    bounty.app_auto_pay = setting.is_some();
+    bounty.app_min_rank = setting.map(|s| s.min_rank.max(trust::INSTANCE_MIN_RANK));
+}
+
+/// The rules the issuer's app pays a bounty by. An issuer stored here has
+/// its switch here; anyone else's app may be paying, so a claim on its
+/// bounty waits on that app. Call after [`apply_setting`].
+fn app_policy(bounty: &Bounty, setting: Option<&secrets::AutoPaySetting>, issuer_here: bool) -> Policy {
+    let min_rank = setting
+        .map(|s| s.min_rank.max(trust::INSTANCE_MIN_RANK))
+        .unwrap_or_else(|| bounty.claim_min_rank());
+    Policy::of(bounty, setting.is_some() || !issuer_here, min_rank)
+}
+
 /// This app's auto-pay setting for a bounty, if any stored account has one.
 fn setting_of<'a>(store: &'a secrets::Store, bounty: &Bounty) -> Option<&'a secrets::AutoPaySetting> {
     store
@@ -2430,9 +2825,8 @@ where
 {
     let now = now_unix();
     for bounty in bounties.iter_mut() {
-        let setting = setting_of(store, bounty);
-        bounty.app_auto_pay = setting.is_some();
-        bounty.app_min_rank = setting.map(|s| s.min_rank.max(trust::INSTANCE_MIN_RANK));
+        let setting = setting_of(store, bounty).cloned();
+        apply_setting(bounty, setting.as_ref());
         mark_expired(bounty, now);
     }
     let app_paid = |b: &Bounty| app_may_be_open(b, now);
@@ -2481,7 +2875,7 @@ fn attempt_row(
     now: u64,
 ) -> AutoPaymentRow {
     let last = attempt.updated_at.max(attempt.started_at);
-    let fresh = now.saturating_sub(last) < RECEIPT_GRACE_SECS;
+    let fresh = attempt_fresh(attempt, now);
     let state = match attempt.state {
         AttemptState::Sending if fresh => "attempting",
         AttemptState::Sending | AttemptState::Unknown => "unknown",
@@ -2503,6 +2897,34 @@ fn attempt_row(
         created_at: Some(attempt.started_at),
         updated_at: Some(last),
     }
+}
+
+/// The `(issuer, claimant)` pairs a decision needs a rank for: unpaid
+/// claims by anyone but the issuer, unattempted or failed ([`owed_plan`]
+/// plans a failed one as unattempted, and a hand payment may retry it).
+fn rank_pairs(issuer: &str, facts: &[ClaimFacts]) -> Vec<(String, String)> {
+    facts
+        .iter()
+        .filter(|f| f.claimant != issuer && !f.paid)
+        .filter(|f| f.attempt.is_none_or(|a| a == AttemptState::Failed))
+        .map(|f| (issuer.to_string(), f.claimant.clone()))
+        .collect()
+}
+
+/// Each fact's rank in `issuer`'s scores, from an [`issuer_ranks`] answer.
+fn set_ranks(issuer: &str, facts: &mut [ClaimFacts], ranks: &HashMap<(String, String), Option<f64>>) {
+    for fact in facts {
+        fact.rank = ranks
+            .get(&(issuer.to_string(), fact.claimant.clone()))
+            .copied()
+            .flatten();
+    }
+}
+
+/// The attempt was last touched inside [`RECEIPT_GRACE_SECS`]: still in
+/// flight, not yet what it is.
+fn attempt_fresh(attempt: &secrets::PayAttempt, now: u64) -> bool {
+    now.saturating_sub(attempt.updated_at.max(attempt.started_at)) < RECEIPT_GRACE_SECS
 }
 
 /// A bounty snapshot with this app's view folded in, and the decision for
@@ -2555,10 +2977,7 @@ where
         return unchanged(detail);
     };
     let setting = setting_of(&store, &detail.bounty).cloned();
-    detail.bounty.app_auto_pay = setting.is_some();
-    detail.bounty.app_min_rank = setting
-        .as_ref()
-        .map(|s| s.min_rank.max(trust::INSTANCE_MIN_RANK));
+    apply_setting(&mut detail.bounty, setting.as_ref());
     if detail.bounty.server_auto_pay_on() {
         return unchanged(detail);
     }
@@ -2599,32 +3018,47 @@ where
     facts.extend(orphans);
     claims.sort_by_key(|c| (c.event.created_at.unwrap_or(0), c.event.id.clone()));
 
-    let pairs: Vec<(String, String)> = facts
-        .iter()
-        .filter(|f| f.claimant != issuer && !f.paid && f.attempt.is_none())
-        .map(|f| (issuer.clone(), f.claimant.clone()))
-        .collect();
-    let ranks = issuer_ranks(ctx, &pairs).await;
-    for fact in &mut facts {
-        fact.rank = ranks
-            .get(&(issuer.clone(), fact.claimant.clone()))
-            .copied()
-            .flatten();
-    }
-    // An issuer stored here has its switch here; anyone else's app may be
-    // paying, so a claim on its bounty waits on that app.
-    let min_rank = setting
-        .as_ref()
-        .map(|s| s.min_rank.max(trust::INSTANCE_MIN_RANK))
-        .unwrap_or_else(|| detail.bounty.claim_min_rank());
-    let policy = Policy::of(&detail.bounty, setting.is_some() || !issuer_here, min_rank);
+    let ranks = issuer_ranks(ctx, &rank_pairs(&issuer, &facts)).await;
+    set_ranks(&issuer, &mut facts, &ranks);
+    let policy = app_policy(&detail.bounty, setting.as_ref(), issuer_here);
     let decisions: HashMap<String, Result<(), Hold>> =
         autopay::plan(&policy, &facts).into_iter().collect();
+    // A manual bounty's claims all read "auto-pay off" in `decisions`; the
+    // ones the rules would hold back say which rule instead.
+    let owed = (!policy.auto_pay).then(|| owed_plan(&policy, &facts));
+    // The ledger's rule too: a closed bounty pays nothing more.
+    let closed = !app_may_be_open(&detail.bounty, now);
     for claim in &mut claims {
         let Some(fact) = facts.iter().find(|f| f.event_id == claim.event.id) else {
             continue;
         };
+        claim.hand_pay = hand_pay_check(&issuer, &detail.bounty, &policy, &facts, &fact.address, now)
+            .is_ok()
+            .then(|| fact.address.clone());
+        let held_by_rule = owed
+            .as_ref()
+            .and_then(|owed| owed.get(&fact.address))
+            .and_then(|decision| match decision {
+                Err(hold @ (Hold::NoSlots | Hold::OverLimit | Hold::RankTooLow { .. })) => Some(*hold),
+                _ => None,
+            });
         claim.unpaid_reason = match decisions.get(&fact.address) {
+            Some(Err(Hold::AutoPayOff | Hold::Attempted(AttemptState::Failed))) if held_by_rule.is_some() => {
+                held_by_rule.and_then(|hold| hold.describe())
+            }
+            Some(Err(Hold::AutoPayOff) | Ok(())) if closed => Some(HAND_CLOSED.to_string()),
+            Some(Err(Hold::Attempted(AttemptState::Failed))) if closed && !policy.auto_pay => {
+                Some(HAND_CLOSED.to_string())
+            }
+            Some(Err(Hold::Attempted(AttemptState::Failed))) if claim.hand_pay.is_some() => {
+                let why = attempts
+                    .iter()
+                    .find(|a| a.bounty_id == detail.bounty.id && a.claim_address == fact.address)
+                    .and_then(|a| a.reason.as_deref())
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
+                Some(format!("The last payment failed{why}. No sats moved, so it can be paid again."))
+            }
             Some(Err(Hold::Attempted(AttemptState::Sending)))
                 if claim.auto_payment.as_ref().is_some_and(|r| r.state == "attempting") =>
             {
@@ -2649,6 +3083,403 @@ where
         policy: Some(policy),
         facts,
     }
+}
+
+// ─── Payments ledger ───────────────────────────────────────────────────────
+// Every claim an account pays or is paid for, with where its money stands
+// (`crate::ledger`). Bounties the server pays read from the server's claim
+// rows; the rest from the relay, the store and `autopay::plan`, the same
+// facts the issuer's app pays by.
+
+const LEDGER_RELAY_UNREAD: &str = "Couldn't read claims and receipts from the relay. Try again.";
+/// The server lists a claim only when the issuer's ranking (the house's
+/// when the issuer chose none) puts the claimant at 2 or more, unless a
+/// payment already holds its slot (magic-carpet-v2 `listClaimsFor`).
+const HIDDEN_BY_SERVER: &str = "the server ranks this account below 2";
+
+async fn fetch_ledger(
+    client: Client,
+    ctx: AutoPayCtx,
+    pubkey: String,
+    seq: u64,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let update = match payments_ledger(&client, &ctx, &pubkey).await {
+        Ok(ledger) => Update::Ledger { pubkey, seq, ledger },
+        Err(message) => Update::LedgerFailed { pubkey, seq, message },
+    };
+    let _ = updates.unbounded_send(update);
+}
+
+/// See [`Command::FetchLedger`]. Any failed read fails the whole ledger:
+/// rows missing or read as owed would be worse than an error.
+async fn payments_ledger(client: &Client, ctx: &AutoPayCtx, me: &str) -> Result<Ledger, String> {
+    let api = Api::new().map_err(|e| e.to_string())?;
+    let issued = api.list_bounties_by(me).await.map_err(|e| e.to_string())?;
+    let all = api.list_all_bounties().await.map_err(|e| e.to_string())?;
+    let mine = claims_by(client, me)
+        .await
+        .ok_or_else(|| LEDGER_RELAY_UNREAD.to_string())?;
+    // An unreadable store is not "no attempts": without them there is no
+    // knowing what was paid.
+    let store = secrets::load().map_err(|e| e.to_string())?;
+    let reads = LedgerReads { issued, all, mine };
+    ledger_with(
+        ctx,
+        &store,
+        me,
+        reads,
+        |coordinates, since| async move { relay_claims(client, &coordinates, since).await },
+        |id| {
+            let api = &api;
+            async move { api.get_bounty(&id).await }
+        },
+    )
+    .await
+}
+
+/// Every kind-39999 `author` signed, from the instance relay, signatures
+/// checked. `None` when the read failed.
+async fn claims_by(client: &Client, author: &str) -> Option<Vec<Event>> {
+    let author = PublicKey::parse(author).ok()?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(events::CLAIM_KIND))
+        .author(author);
+    let events = client
+        .fetch_events(filter)
+        .timeout(Duration::from_secs(10))
+        .await
+        .ok()?;
+    Some(events.into_iter().filter(|event| event.verify().is_ok()).collect())
+}
+
+/// What one ledger fetch read before any claim is counted.
+struct LedgerReads {
+    /// The account's own bounties (the `issuer=` list).
+    issued: Vec<Bounty>,
+    /// Every issuer's bounties (the global list).
+    all: Vec<Bounty>,
+    /// Every claim the account signed.
+    mine: Vec<Event>,
+}
+
+/// One app-paid bounty's claims, decided.
+#[derive(Default)]
+struct Counted<'e> {
+    facts: Vec<ClaimFacts>,
+    /// The relay claim behind each fact; `None` for an attempt whose claim
+    /// left the relay.
+    events: Vec<Option<&'e Event>>,
+    decisions: HashMap<String, Result<(), Hold>>,
+    issuer_here: bool,
+    /// The issuer is here and auto-pay is off: `decisions` come from a plan
+    /// run as if it were on, so the claims it would pay read "manual pay".
+    manual: bool,
+}
+
+/// Whether `claimant`'s claim is a row in `direction` for `me`: others'
+/// claims on my bounties (never the issuer's own), my claims on others'.
+fn in_ledger(direction: Direction, claimant: &str, me: &str) -> bool {
+    match direction {
+        Direction::PaidByMe => claimant != me,
+        Direction::PaidToMe => claimant == me,
+    }
+}
+
+fn counterparty(direction: Direction, bounty: &Bounty, claimant: &str) -> String {
+    match direction {
+        Direction::PaidByMe => claimant.to_string(),
+        Direction::PaidToMe => bounty.issuer_pubkey.clone(),
+    }
+}
+
+/// The bounty ended: the server says expired, or its own time passed.
+fn ended(bounty: &Bounty, now: u64) -> bool {
+    bounty.effective_status() == "expired" || bounty.expired_by(now)
+}
+
+/// What the claimant named ([`Claim::item_name`]); the claim's `d` tag for
+/// an attempt whose claim left the relay.
+fn item_of(event: Option<&Event>, address: &str) -> String {
+    event
+        .and_then(RawEvent::from_event)
+        .map(|raw| Claim::from_event(raw).item_name().to_string())
+        .unwrap_or_else(|| address.split_once(':').map_or(address, |(_, d)| d).to_string())
+}
+
+/// [`payments_ledger`] past its first reads, with the relay read (claims and
+/// receipts on many coordinates) and the server detail read passed in, so
+/// it runs offline.
+async fn ledger_with<R, RFut, D, DFut>(
+    ctx: &AutoPayCtx,
+    store: &secrets::Store,
+    me: &str,
+    reads: LedgerReads,
+    read: R,
+    detail: D,
+) -> Result<Ledger, String>
+where
+    R: FnOnce(Vec<String>, u64) -> RFut,
+    RFut: std::future::Future<Output = Option<(Vec<Event>, Vec<Event>)>>,
+    D: Fn(String) -> DFut,
+    DFut: std::future::Future<Output = Result<BountyDetail, ApiError>>,
+{
+    use futures::TryStreamExt as _;
+
+    let now = now_unix();
+    let mine = &reads.mine;
+    // A claim counts on a bounty only when it is current there: one `z`
+    // tag, made after the bounty ([`current_claims`]).
+    let claims_on = |b: &Bounty| !current_claims(mine, &b.list_coordinate, b.created_at.unwrap_or(0)).is_empty();
+    let mut bounties: Vec<(Direction, Bounty)> = reads
+        .issued
+        .into_iter()
+        .filter(|b| b.issuer_pubkey == me)
+        .map(|b| (Direction::PaidByMe, b))
+        .chain(
+            reads
+                .all
+                .into_iter()
+                .filter(|b| b.issuer_pubkey != me && claims_on(b))
+                .map(|b| (Direction::PaidToMe, b)),
+        )
+        .collect();
+    for (_, bounty) in &mut bounties {
+        let setting = setting_of(store, bounty).cloned();
+        apply_setting(bounty, setting.as_ref());
+        mark_expired(bounty, now);
+    }
+
+    let app_paid = |b: &Bounty| !b.server_auto_pay_on();
+    let mut coordinates: Vec<String> = bounties
+        .iter()
+        .filter(|(_, b)| app_paid(b))
+        .map(|(_, b)| b.list_coordinate.clone())
+        .collect();
+    coordinates.sort();
+    coordinates.dedup();
+    let since = bounties
+        .iter()
+        .filter(|(_, b)| app_paid(b))
+        .filter_map(|(_, b)| b.created_at)
+        .min()
+        .unwrap_or(0);
+    let (events, receipts) = read(coordinates, since)
+        .await
+        .ok_or_else(|| LEDGER_RELAY_UNREAD.to_string())?;
+
+    let mut counted: Vec<Counted> = Vec::new();
+    for (_, bounty) in &bounties {
+        if !app_paid(bounty) {
+            counted.push(Counted::default());
+            continue;
+        }
+        let attempts = attempts_of(store, &bounty.issuer_pubkey);
+        let (mut facts, mut found): (Vec<ClaimFacts>, Vec<Option<&Event>>) =
+            facts_for(bounty, &events, &receipts, attempts)
+                .into_iter()
+                .map(|(fact, event)| (fact, Some(event)))
+                .unzip();
+        let orphans = orphan_attempts(bounty, &facts, attempts);
+        found.extend(orphans.iter().map(|_| None));
+        facts.extend(orphans);
+        counted.push(Counted {
+            facts,
+            events: found,
+            issuer_here: store.accounts.iter().any(|a| a.pubkey == bounty.issuer_pubkey),
+            ..Counted::default()
+        });
+    }
+    let pairs: Vec<(String, String)> = bounties
+        .iter()
+        .zip(&counted)
+        .flat_map(|((_, b), c)| rank_pairs(&b.issuer_pubkey, &c.facts))
+        .collect();
+    let ranks = issuer_ranks(ctx, &pairs).await;
+    for ((_, bounty), c) in bounties.iter().zip(&mut counted) {
+        if !app_paid(bounty) {
+            continue;
+        }
+        set_ranks(&bounty.issuer_pubkey, &mut c.facts, &ranks);
+        let policy = app_policy(bounty, setting_of(store, bounty), c.issuer_here);
+        c.manual = !policy.auto_pay;
+        c.decisions = owed_plan(&policy, &c.facts);
+    }
+
+    // The Lightning-address hint, once per claimant whose payable claim
+    // has no note from the loop, all at once.
+    let mut unchecked: Vec<&str> = bounties
+        .iter()
+        .zip(&counted)
+        .flat_map(|((direction, _), c)| {
+            c.facts.iter().filter(move |f| {
+                !c.manual
+                    && in_ledger(*direction, &f.claimant, me)
+                    && c.decisions.get(&f.address) == Some(&Ok(()))
+                    && ctx.note_for(&f.address).is_none()
+            })
+        })
+        .map(|f| f.claimant.as_str())
+        .collect();
+    unchecked.sort_unstable();
+    unchecked.dedup();
+    let checks = futures::future::join_all(unchecked.iter().map(|c| has_lud16(ctx, c))).await;
+    let lud16: HashMap<&str, Option<bool>> = unchecked.into_iter().zip(checks).collect();
+
+    let mut rows: Vec<Row> = Vec::new();
+    for ((direction, bounty), c) in bounties.iter().zip(&counted) {
+        let attempts = attempts_of(store, &bounty.issuer_pubkey);
+        for (fact, event) in c.facts.iter().zip(&c.events) {
+            let Some(decision) = c.decisions.get(&fact.address) else {
+                continue;
+            };
+            if !in_ledger(*direction, &fact.claimant, me) {
+                continue;
+            }
+            let note = match decision {
+                Ok(()) if c.manual => Some("manual pay".to_string()),
+                Ok(()) => Some(match ctx.note_for(&fact.address) {
+                    Some(note) => note,
+                    None if lud16.get(fact.claimant.as_str()) == Some(&Some(false)) => {
+                        "no Lightning address".to_string()
+                    }
+                    None if c.issuer_here => "waiting for the next auto-pay check".to_string(),
+                    None => "waiting for the issuer's app".to_string(),
+                }),
+                Err(_) => None,
+            };
+            let attempt = attempts
+                .iter()
+                .find(|a| a.bounty_id == bounty.id && a.claim_address == fact.address);
+            let (status, why) = ledger::classify(&ClaimView {
+                fact,
+                decision,
+                attempt_fresh: attempt.is_some_and(|a| attempt_fresh(a, now)),
+                // The card's rule (`annotate_with`): a closed bounty is over
+                // too, not only an expired one.
+                bounty_expired: !app_may_be_open(bounty, now),
+                note: note.as_deref(),
+            });
+            let paid_at = receipts
+                .iter()
+                .filter(|r| fact.paid && pays(r, bounty, &fact.event_id))
+                .map(|r| r.created_at.as_secs())
+                .min();
+            // Money in flight (or maybe gone) dates from the issuer's attempt.
+            let attempted_at = attempt
+                .filter(|_| matches!(status, Status::Paying | Status::Unknown | Status::PaidNoReceipt))
+                .map(|a| a.started_at.max(a.updated_at));
+            rows.push(Row {
+                direction: *direction,
+                bounty_id: bounty.id.clone(),
+                list_coordinate: bounty.list_coordinate.clone(),
+                claim_address: fact.address.clone(),
+                claim_event_id: fact.event_id.clone(),
+                item: item_of(*event, &fact.address),
+                counterparty: counterparty(*direction, bounty, &fact.claimant),
+                sats: bounty.amount_sats,
+                status,
+                why,
+                at: paid_at.or(attempted_at).unwrap_or(fact.created_at),
+            });
+        }
+    }
+
+    // The server's own auto-pay bounties: its claim rows are the record.
+    let server_paid: Vec<String> = bounties
+        .iter()
+        .filter(|(_, b)| !app_paid(b))
+        .map(|(_, b)| b.id.clone())
+        .collect();
+    let details: Vec<BountyDetail> = futures::stream::iter(server_paid)
+        .map(&detail)
+        .buffered(4)
+        .try_collect()
+        .await
+        .map_err(|e| e.to_string())?;
+    for snapshot in &details {
+        let Some((direction, bounty)) = bounties.iter().find(|(_, b)| b.id == snapshot.bounty.id) else {
+            continue;
+        };
+        let expired = ended(&snapshot.bounty, now);
+        for claim in &snapshot.claims {
+            if !in_ledger(*direction, &claim.event.pubkey, me) {
+                continue;
+            }
+            let mut claim = claim.clone();
+            if !server_receipt_holds(&claim, bounty) {
+                claim.zap_receipt = None;
+            }
+            let claim = &claim;
+            let (status, why) = ledger::classify_server(claim, expired);
+            let claimed_at = claim.event.created_at.unwrap_or(0);
+            let paid_at = claim
+                .zap_receipt
+                .as_ref()
+                .filter(|_| status == Status::Paid)
+                .and_then(|r| r.created_at);
+            let address = claim.claim_address.clone().unwrap_or_else(|| {
+                let d = claim.event.tag_value("d").unwrap_or_default();
+                format!("{}:{d}", claim.event.pubkey)
+            });
+            rows.push(Row {
+                direction: *direction,
+                bounty_id: bounty.id.clone(),
+                list_coordinate: bounty.list_coordinate.clone(),
+                claim_address: address,
+                claim_event_id: claim.event.id.clone(),
+                item: claim.item_name().to_string(),
+                counterparty: counterparty(*direction, bounty, &claim.event.pubkey),
+                sats: bounty.amount_sats,
+                status,
+                why,
+                at: paid_at.unwrap_or(claimed_at),
+            });
+        }
+        if *direction != Direction::PaidToMe {
+            continue;
+        }
+        // The server hides claims it ranks too low; mine still get a row.
+        for event in current_claims(mine, &bounty.list_coordinate, bounty.created_at.unwrap_or(0)) {
+            let id = event.id.to_hex();
+            let address = claim_address(event).unwrap_or_default();
+            let listed = snapshot.claims.iter().any(|c| {
+                c.event.id == id || c.claim_address.as_deref() == Some(address.as_str())
+            });
+            if listed {
+                continue;
+            }
+            rows.push(Row {
+                direction: Direction::PaidToMe,
+                bounty_id: bounty.id.clone(),
+                list_coordinate: bounty.list_coordinate.clone(),
+                item: item_of(Some(event), &address),
+                claim_address: address,
+                claim_event_id: id,
+                counterparty: bounty.issuer_pubkey.clone(),
+                sats: bounty.amount_sats,
+                status: Status::NotPayable,
+                why: Some(HIDDEN_BY_SERVER.to_string()),
+                at: event.created_at.as_secs(),
+            });
+        }
+    }
+    rows.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.claim_event_id.cmp(&b.claim_event_id)));
+
+    let mut ledger = Ledger {
+        rows,
+        ..Ledger::default()
+    };
+    for ((direction, mut bounty), c) in bounties.into_iter().zip(counted) {
+        if app_paid(&bounty) {
+            apply_usage(&mut bounty, &c.facts);
+        }
+        match direction {
+            Direction::PaidByMe => ledger.issued.push(bounty),
+            Direction::PaidToMe => ledger.claimed.push(bounty),
+        }
+    }
+    Ok(ledger)
 }
 
 /// Every [`autopay_poll`], each stored account's auto-pay bounties are
@@ -2698,12 +3529,8 @@ async fn autopay_tick(client: &Client, ctx: &AutoPayCtx, updates: &mpsc::Unbound
             let Some(ix) = facts.iter().position(|f| f.address == address) else {
                 break;
             };
-            let paid: Vec<(String, String)> = facts
-                .iter()
-                .filter(|f| f.paid)
-                .map(|f| (f.address.clone(), f.claimant.clone()))
-                .collect();
-            match pay_claim(ctx, &api, &bounty, &facts[ix], paid, updates).await {
+            let paid = paid_pairs(&facts);
+            match pay_claim(ctx, &api, &bounty, &facts[ix], paid, secrets::Existing::Refuse, updates).await {
                 PayOutcome::Decided(state) => facts[ix].attempt = Some(state),
                 PayOutcome::Retry => {
                     facts.remove(ix);
@@ -2714,6 +3541,16 @@ async fn autopay_tick(client: &Client, ctx: &AutoPayCtx, updates: &mpsc::Unbound
             }
         }
     }
+}
+
+/// `(address, claimant)` of every claim a verified receipt pays: the store's
+/// slot recheck counts them with its own attempts.
+fn paid_pairs(facts: &[ClaimFacts]) -> Vec<(String, String)> {
+    facts
+        .iter()
+        .filter(|f| f.paid)
+        .map(|f| (f.address.clone(), f.claimant.clone()))
+        .collect()
 }
 
 /// What one [`pay_claim`] came to.
@@ -2733,11 +3570,13 @@ enum PayOutcome {
 /// leaks nothing. `invoice` signs the request and fetches the bolt11; when
 /// it fails, no payment request was made, so the attempt is taken back and
 /// the claim tried again next tick. `Ok` carries the invoice to pay.
+/// `existing` is what the store does with an earlier attempt on the claim.
 async fn record_then_invoice<F, Fut>(
     ctx: &AutoPayCtx,
     issuer: &str,
     attempt: secrets::PayAttempt,
     limits: &secrets::SlotLimits,
+    existing: secrets::Existing,
     invoice: F,
 ) -> Result<String, PayOutcome>
 where
@@ -2745,7 +3584,7 @@ where
     Fut: std::future::Future<Output = Result<String, String>>,
 {
     let (bounty_id, address) = (attempt.bounty_id.clone(), attempt.claim_address.clone());
-    match secrets::begin_attempt_within(issuer, attempt, Some(limits)) {
+    match secrets::begin_attempt_within(issuer, attempt, Some(limits), existing) {
         Ok(secrets::Begin::Recorded) => {}
         Ok(secrets::Begin::Exists) => return Err(PayOutcome::Decided(AttemptState::Sending)),
         Ok(secrets::Begin::NoSlots) => {
@@ -2778,12 +3617,15 @@ where
 /// Then [`record_then_invoice`]: the attempt is recorded under the store's
 /// limit recheck, and only then is the zap request signed and the invoice
 /// fetched. Then the payment goes out, and its end state is recorded.
+/// `existing`: auto-pay passes [`secrets::Existing::Refuse`] (it never
+/// retries); a payment by hand may replace a failed attempt.
 async fn pay_claim(
     ctx: &AutoPayCtx,
     api: &Api,
     bounty: &Bounty,
     claim: &ClaimFacts,
     paid: Vec<(String, String)>,
+    existing: secrets::Existing,
     updates: &mpsc::UnboundedSender<Update>,
 ) -> PayOutcome {
     let issuer = &bounty.issuer_pubkey;
@@ -2798,7 +3640,7 @@ async fn pay_claim(
             return PayOutcome::Retry;
         }
         Err(()) => {
-            ctx.note(&claim.address, "Couldn't read the claimant's profile. Trying again shortly.");
+            ctx.note(&claim.address, PROFILE_UNREAD);
             return PayOutcome::Retry;
         }
     };
@@ -2809,12 +3651,16 @@ async fn pay_claim(
             return PayOutcome::Retry;
         }
     };
-    match coinos::balance(&login.token).await {
+    match coinos::wallet_balance(&login).await {
         Ok(balance) if balance < sats => {
+            let wallet = match login.server_host() {
+                Some(host) => format!("wallet on {host}"),
+                None => "Coinos wallet".to_string(),
+            };
             ctx.note(
                 &claim.address,
                 format!(
-                    "Wallet empty: the issuer's Coinos wallet holds {balance} sats, and the reward is {sats}."
+                    "Wallet empty: the issuer's {wallet} holds {balance} sats, and the reward is {sats}."
                 ),
             );
             return PayOutcome::Retry;
@@ -2862,7 +3708,7 @@ async fn pay_claim(
             .await
             .map_err(|e| e.to_string())
     };
-    let bolt11 = match record_then_invoice(ctx, issuer, attempt, &limits, invoice).await {
+    let bolt11 = match record_then_invoice(ctx, issuer, attempt, &limits, existing, invoice).await {
         Ok(bolt11) => bolt11,
         Err(outcome) => return outcome,
     };
@@ -2878,7 +3724,7 @@ async fn pay_claim(
     };
     report("attempting", None);
 
-    let (state, reason) = match coinos::pay_invoice(&login.token, &bolt11, sats).await {
+    let (state, reason) = match coinos::wallet_pay(&login, &bolt11, sats).await {
         Ok(()) => (AttemptState::Paid, None),
         Err(e @ coinos::CoinosError::OutcomeUnknown) => (AttemptState::Unknown, Some(e.to_string())),
         Err(e) => (AttemptState::Failed, Some(e.to_string())),
@@ -2902,6 +3748,180 @@ async fn pay_claim(
         reason,
     );
     PayOutcome::Decided(state)
+}
+
+// ─── Paying one claim by hand ──────────────────────────────────────────────
+// A bounty with no auto-pay setting here, whose issuer is stored here, is
+// paid by hand: the issuer picks a claim the rules allow and it goes through
+// `pay_claim`, the same path the auto-pay loop takes.
+
+const PROFILE_UNREAD: &str = "Couldn't read the claimant's profile. Trying again shortly.";
+const HAND_PROFILE_UNREAD: &str = "Couldn't read the claimant's profile. Try again.";
+const HAND_NOT_ISSUER: &str = "Only the issuer can pay this claim.";
+const HAND_AUTOMATIC: &str = "This bounty pays automatically.";
+const HAND_CLOSED: &str = "This bounty is closed or has expired.";
+const HAND_NO_CLAIM: &str = "This claim is no longer on the relay.";
+const HAND_TAKEN: &str = "This claim was already paid or is being paid.";
+const HAND_OWN: &str = "The issuer's own claim is not paid.";
+const HAND_NO_SLOTS: &str = "No reward slots left on this bounty.";
+const HAND_OVER_LIMIT: &str = "This account already has the most rewards one account can get here.";
+const HAND_RANK: &str = "The claimant's rank is below this bounty's minimum.";
+const HAND_UNREAD_BOUNTY: &str = "Couldn't read the bounty. Try again.";
+const HAND_NOT_STARTED: &str = "The payment didn't start. Try again.";
+
+/// The plan an app-paid bounty's claims are owed by: as if auto-pay were on.
+/// `decide` stops at "auto-pay off" before the cap, the per-account limit
+/// and the rank, so a manual bounty is planned with it on; failed attempts
+/// plan as unattempted ([`ledger::plan`]). The ledger's "Owed, manual pay"
+/// rows and [`hand_pay_check`] both read this, so they never disagree.
+fn owed_plan(policy: &Policy, facts: &[ClaimFacts]) -> HashMap<String, Result<(), Hold>> {
+    let policy = Policy {
+        auto_pay: true,
+        ..policy.clone()
+    };
+    ledger::plan(&policy, facts).into_iter().collect()
+}
+
+/// Whether `payer` may pay the claim at `address` by hand now: it is the
+/// issuer, the bounty is manual (`app_policy` turns auto-pay on for an
+/// issuer not stored here, whose own app may be paying), open, the claim
+/// has no receipt and no attempt but a failed one (no sats moved, and a
+/// person asks again), and [`owed_plan`] pays it.
+fn hand_pay_check(
+    payer: &str,
+    bounty: &Bounty,
+    policy: &Policy,
+    facts: &[ClaimFacts],
+    address: &str,
+    now: u64,
+) -> Result<(), &'static str> {
+    if bounty.issuer_pubkey != payer {
+        return Err(HAND_NOT_ISSUER);
+    }
+    if bounty.server_auto_pay_on() || policy.auto_pay {
+        return Err(HAND_AUTOMATIC);
+    }
+    if !app_may_be_open(bounty, now) {
+        return Err(HAND_CLOSED);
+    }
+    let Some(fact) = facts.iter().find(|f| f.address == address) else {
+        return Err(HAND_NO_CLAIM);
+    };
+    match (fact.paid, fact.attempt) {
+        (false, None | Some(AttemptState::Failed)) => {}
+        _ => return Err(HAND_TAKEN),
+    }
+    match owed_plan(policy, facts).get(address) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(Hold::OwnClaim)) => Err(HAND_OWN),
+        Some(Err(Hold::NoSlots)) => Err(HAND_NO_SLOTS),
+        Some(Err(Hold::OverLimit)) => Err(HAND_OVER_LIMIT),
+        Some(Err(Hold::RankTooLow { .. })) => Err(HAND_RANK),
+        _ => Err(HAND_TAKEN),
+    }
+}
+
+/// [`Command::PayClaim`]: read the bounty, then [`hand_pay_with`] through
+/// [`annotate`] and [`pay_claim`]. A refusal is one `PayClaimRefused`.
+async fn pay_claim_by_hand(
+    client: Client,
+    ctx: AutoPayCtx,
+    pubkey: String,
+    bounty_id: String,
+    claim_address: String,
+    updates: mpsc::UnboundedSender<Update>,
+) {
+    let result = match Api::new() {
+        Err(_) => Err(HAND_UNREAD_BOUNTY.to_string()),
+        Ok(api) => match api.get_bounty(&bounty_id).await {
+            Err(_) => Err(HAND_UNREAD_BOUNTY.to_string()),
+            Ok(detail) => {
+                let (ctx, client, api, sink) = (&ctx, &client, &api, &updates);
+                hand_pay_with(
+                    ctx,
+                    &pubkey,
+                    &claim_address,
+                    detail,
+                    |detail| annotate(ctx, client, detail),
+                    |bounty, fact, paid| async move {
+                        pay_claim(ctx, api, &bounty, &fact, paid, secrets::Existing::ReplaceFailed, sink).await
+                    },
+                )
+                .await
+            }
+        },
+    };
+    if let Err(message) = result {
+        let _ = updates.unbounded_send(Update::PayClaimRefused {
+            bounty_id,
+            claim_address,
+            message,
+        });
+    }
+}
+
+/// [`pay_claim_by_hand`] past the bounty read, with the fact gathering and
+/// the payment passed in, so its gates run offline. `Ok` once `pay` sent
+/// the payment (its `PaymentState`s say how it went).
+async fn hand_pay_with<A, AFut, P, PFut>(
+    ctx: &AutoPayCtx,
+    payer: &str,
+    address: &str,
+    detail: BountyDetail,
+    annotate: A,
+    pay: P,
+) -> Result<(), String>
+where
+    A: FnOnce(BountyDetail) -> AFut,
+    AFut: std::future::Future<Output = Annotated>,
+    P: FnOnce(Bounty, ClaimFacts, Vec<(String, String)>) -> PFut,
+    PFut: std::future::Future<Output = PayOutcome>,
+{
+    let store = secrets::load().map_err(|e| e.to_string())?;
+    if detail.bounty.issuer_pubkey != payer || !store.accounts.iter().any(|a| a.pubkey == payer) {
+        return Err(HAND_NOT_ISSUER.to_string());
+    }
+    if detail.bounty.server_auto_pay_on() {
+        return Err(HAND_AUTOMATIC.to_string());
+    }
+    let annotated = annotate(detail).await;
+    let Some(policy) = annotated.policy else {
+        return Err(LEDGER_RELAY_UNREAD.to_string());
+    };
+    let bounty = annotated.detail.bounty;
+    hand_pay_check(payer, &bounty, &policy, &annotated.facts, address, now_unix())?;
+    let paid = paid_pairs(&annotated.facts);
+    let Some(fact) = annotated.facts.into_iter().find(|f| f.address == address) else {
+        return Err(HAND_NO_CLAIM.to_string());
+    };
+    // A note left from an earlier try would read as this one's answer.
+    ctx.clear_note(address);
+    let outcome = pay(bounty, fact, paid).await;
+    hand_pay_answer(ctx, address, outcome)
+}
+
+/// What a hand payment's [`PayOutcome`] tells the issuer. `pay_claim`
+/// leaves a note whenever it stops before sending (and the auto-pay loop
+/// retries next tick); a manual bounty has no next tick, so the note is
+/// said once, here, and dropped.
+fn hand_pay_answer(ctx: &AutoPayCtx, address: &str, outcome: PayOutcome) -> Result<(), String> {
+    let note = ctx.note_for(address);
+    ctx.clear_note(address);
+    match outcome {
+        // `Begin::Exists`: another click, or another instance, recorded an
+        // attempt first. `pay_claim` never finishes one as sending.
+        PayOutcome::Decided(AttemptState::Sending) => Err(HAND_TAKEN.to_string()),
+        // Sent: the PaymentStates carry the rest.
+        PayOutcome::Decided(AttemptState::Paid | AttemptState::Unknown) => Ok(()),
+        // The store's per-account recheck leaves a note; a refused payment
+        // does not (its PaymentState says "failed").
+        PayOutcome::Decided(AttemptState::Failed) => note.map_or(Ok(()), Err),
+        PayOutcome::Retry | PayOutcome::Full => Err(match note {
+            Some(note) if note == PROFILE_UNREAD => HAND_PROFILE_UNREAD.to_string(),
+            Some(note) => note,
+            None => HAND_NOT_STARTED.to_string(),
+        }),
+    }
 }
 
 /// Poll the relay's real status so the UI dot is honest, not hopeful.
@@ -4398,6 +5418,60 @@ mod tests {
     }
 
     #[test]
+    fn a_server_paid_bounty_keeps_only_receipts_it_settled_or_the_issuer_signed() {
+        let issuer = Keys::generate();
+        let issuer_hex = issuer.public_key().to_hex();
+        let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": issuer_hex }));
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let id = event.id.to_hex();
+        let relays = vec!["wss://nos.lol".to_string()];
+        let with_receipt = |request: &Event| Claim {
+            zap_receipt: RawEvent::from_event(&receipt_around(request, &id)),
+            payment_status: Some("payable".into()),
+            ..Claim::from_event(RawEvent::from_event(&event).unwrap())
+        };
+        let settled_on = |claim: &Claim, bounty_id: &str| Claim {
+            auto_payment: Some(AutoPaymentRow {
+                id: "p1".into(),
+                claim_event_id: id.clone(),
+                bounty_id: bounty_id.into(),
+                issuer_pubkey: None,
+                claimant_pubkey: None,
+                claim_address: None,
+                amount_sats: Some(100),
+                state: "settled".into(),
+                reason: None,
+                created_at: None,
+                updated_at: None,
+            }),
+            ..claim.clone()
+        };
+
+        // A request the app cannot verify: unsigned, then a stranger's.
+        let unsigned = serde_json::from_value::<Event>(serde_json::json!({
+            "id": "0".repeat(64), "pubkey": issuer_hex, "created_at": 1, "kind": 9734,
+            "tags": [["e", id]], "content": "", "sig": "0".repeat(128),
+        }))
+        .unwrap();
+        let stranger = events::zap_request(&Keys::generate(), &bob.public_key().to_hex(), &id, COORD, "b1", 100, &relays).unwrap();
+        for request in [&unsigned, &stranger] {
+            let claim = with_receipt(request);
+            assert!(!server_receipt_holds(&claim, &bounty));
+            let stripped = Claim { zap_receipt: None, ..claim.clone() };
+            assert_ne!(ledger::classify_server(&stripped, false).0, Status::Paid);
+            // The server's settled row for this bounty is trusted; one for
+            // another bounty is not.
+            assert!(server_receipt_holds(&settled_on(&claim, "b1"), &bounty));
+            assert!(!server_receipt_holds(&settled_on(&claim, "b2"), &bounty));
+        }
+
+        // The issuer's own signed request for this bounty's reward stands.
+        let signed = events::zap_request(&issuer, &bob.public_key().to_hex(), &id, COORD, "b1", 100, &relays).unwrap();
+        assert!(server_receipt_holds(&with_receipt(&signed), &bounty));
+    }
+
+    #[test]
     fn facts_count_only_this_bountys_reward_and_attempts() {
         let issuer = Keys::generate();
         let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": issuer.public_key().to_hex() }));
@@ -4512,20 +5586,20 @@ mod tests {
             // Another instance already took the one slot.
             let x = sending("b1", "x:1", "x");
             assert!(matches!(
-                secrets::begin_attempt_within(&me, x, Some(&one)),
+                secrets::begin_attempt_within(&me, x, Some(&one), secrets::Existing::Refuse),
                 Ok(secrets::Begin::Recorded)
             ));
-            let full = record_then_invoice(&ctx, &me, sending("b1", "y:1", "y"), &one, invoice(Ok("lnbc".into()))).await;
+            let full = record_then_invoice(&ctx, &me, sending("b1", "y:1", "y"), &one, secrets::Existing::Refuse, invoice(Ok("lnbc".into()))).await;
             assert_eq!(full, Err(PayOutcome::Full));
             assert_eq!(signed.load(Ordering::SeqCst), 0, "no zap request after a refusal");
 
             // An invoice that can't be had takes the attempt back.
-            let failed = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, invoice(Err("no zaps".into()))).await;
+            let failed = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, secrets::Existing::Refuse, invoice(Err("no zaps".into()))).await;
             assert_eq!(failed, Err(PayOutcome::Retry));
             assert!(secrets::pay_attempts(&me).unwrap().iter().all(|a| a.bounty_id != "b2"));
             assert_eq!(ctx.note_for("y:1").as_deref(), Some("no zaps"));
 
-            let paid = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, invoice(Ok("lnbc".into()))).await;
+            let paid = record_then_invoice(&ctx, &me, sending("b2", "y:1", "y"), &one, secrets::Existing::Refuse, invoice(Ok("lnbc".into()))).await;
             assert_eq!(paid, Ok("lnbc".to_string()));
             assert_eq!(signed.load(Ordering::SeqCst), 2);
         });
@@ -5004,6 +6078,611 @@ mod tests {
         assert!(full.is_pending(), "a fresh payment keeps the fast poll");
     }
 
+    /// A store holding `me` with `attempts`, built in memory.
+    fn store_with(me: &str, attempts: &[secrets::PayAttempt]) -> secrets::Store {
+        serde_json::from_value(serde_json::json!({
+            "active": me,
+            "accounts": [{ "pubkey": me, "nsec": "nsec1unused", "pay_attempts": attempts }],
+        }))
+        .unwrap()
+    }
+
+    /// `me`'s ledger from fixture reads: `relay` is the batched relay read's
+    /// answer, `server` the details of the bounties the server pays.
+    fn ledger_of(
+        ctx: &AutoPayCtx,
+        store: &secrets::Store,
+        me: &str,
+        reads: LedgerReads,
+        relay: Option<(Vec<Event>, Vec<Event>)>,
+        server: Vec<BountyDetail>,
+    ) -> Result<Ledger, String> {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(ledger_with(
+            ctx,
+            store,
+            me,
+            reads,
+            |_, _| async move { relay },
+            |id| {
+                let server = &server;
+                async move {
+                    server
+                        .iter()
+                        .find(|d| d.bounty.id == id)
+                        .cloned()
+                        .ok_or(ApiError::Status { status: 404, message: String::new() })
+                }
+            },
+        ))
+    }
+
+    fn row_for<'a>(ledger: &'a Ledger, bounty: &str, claimant: &str) -> &'a Row {
+        ledger
+            .rows
+            .iter()
+            .find(|r| r.bounty_id == bounty && r.claim_address.starts_with(claimant))
+            .unwrap_or_else(|| panic!("a row for {claimant} on {bounty}"))
+    }
+
+    #[test]
+    fn the_ledger_has_rows_both_ways_and_each_bounty_counts_only_its_own_receipt() {
+        let (me, bob, carol) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (me_hex, bob_hex, carol_hex) =
+            (me.public_key().to_hex(), bob.public_key().to_hex(), carol.public_key().to_hex());
+        let relays = vec!["wss://nos.lol".to_string()];
+        // B1 and B2 are mine, on one list; bob's one claim is paid on B1 only.
+        let my_list = format!("39998:{me_hex}:bagels");
+        let mine_on = |id: &str| {
+            bounty_row(serde_json::json!({ "id": id, "issuer_pubkey": me_hex, "list_coordinate": my_list }))
+        };
+        let bob_claim = claim_at(&bob, "everything", &[&my_list], 200);
+        let bob_id = bob_claim.id.to_hex();
+        let paid_b1 = events::zap_request(&me, &bob_hex, &bob_id, &my_list, "b1", 100, &relays).unwrap();
+        // B3 is carol's, already expired; she paid my claim on it.
+        let her_list = format!("39998:{carol_hex}:donuts");
+        let b3 = bounty_row(serde_json::json!({
+            "id": "b3", "issuer_pubkey": carol_hex, "list_coordinate": her_list, "expiration": 999,
+        }));
+        let my_claim = claim_at(&me, "sesame", &[&her_list], 200);
+        let my_id = my_claim.id.to_hex();
+        let paid_b3 = events::zap_request(&carol, &me_hex, &my_id, &her_list, "b3", 100, &relays).unwrap();
+        // B4 is paid by the server, which does not list my claim on it.
+        let server_list = "39998:dd:x";
+        let b4 = bounty_row(serde_json::json!({
+            "id": "b4", "issuer_pubkey": "dd", "list_coordinate": server_list, "auto_pay": 1,
+        }));
+        let hidden = claim_at(&me, "plain", &[server_list], 200);
+        let b4_detail = parse_detail(
+            &serde_json::json!({
+                "success": true,
+                "bounty": { "id": "b4", "issuer_pubkey": "dd", "list_coordinate": server_list,
+                    "amount_sats": 100, "status": "open", "auto_pay": 1 },
+                "claims": [{ "event": { "id": "c9", "pubkey": "ee", "kind": 39999,
+                    "created_at": 200, "tags": [], "content": "x" } }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = AutoPayCtx::default();
+        let ranks = [((me_hex.clone(), bob_hex.clone()), (now_unix(), Some(5.0)))];
+        ctx.cache.try_lock().unwrap().ranks.extend(ranks);
+        let reads = LedgerReads {
+            issued: vec![mine_on("b1"), mine_on("b2")],
+            all: vec![mine_on("b1"), b3, b4, bounty_row(serde_json::json!({ "id": "b5" }))],
+            mine: vec![my_claim.clone(), hidden],
+        };
+        let relay = (
+            vec![bob_claim, my_claim],
+            vec![receipt_around(&paid_b1, &bob_id), receipt_around(&paid_b3, &my_id)],
+        );
+        let ledger =
+            ledger_of(&ctx, &store_with(&me_hex, &[]), &me_hex, reads, Some(relay), vec![b4_detail]).unwrap();
+
+        assert_eq!(ledger.rows.len(), 4, "{:#?}", ledger.rows);
+        let b1 = row_for(&ledger, "b1", &bob_hex);
+        assert_eq!((b1.direction, b1.status), (Direction::PaidByMe, Status::Paid));
+        assert_eq!((b1.item.as_str(), b1.counterparty.as_str(), b1.sats), ("everything", bob_hex.as_str(), 100));
+        assert!(b1.at > 200, "a paid row is dated by its receipt");
+        let b2 = row_for(&ledger, "b2", &bob_hex);
+        assert_eq!(b2.status, Status::Owed, "B1's receipt does not pay the claim on B2");
+        assert_eq!(b2.why.as_deref(), Some("manual pay"));
+        assert_eq!(b2.at, 200);
+        let b3 = row_for(&ledger, "b3", &me_hex);
+        assert_eq!((b3.direction, b3.status), (Direction::PaidToMe, Status::Paid), "paid stays paid after expiry");
+        assert_eq!(b3.counterparty, carol_hex);
+        let b4 = row_for(&ledger, "b4", &me_hex);
+        assert_eq!((b4.status, b4.why.as_deref()), (Status::NotPayable, Some(HIDDEN_BY_SERVER)));
+        assert!(ledger.rows.windows(2).all(|w| w[0].at >= w[1].at), "newest first");
+
+        let ids = |list: &[Bounty]| list.iter().map(|b| b.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&ledger.issued), ["b1", "b2"]);
+        assert_eq!(ids(&ledger.claimed), ["b3", "b4"]);
+        let b1_state = ledger.issued[0].payment_state.as_ref().unwrap();
+        assert_eq!(b1_state.paid_reward_count, 1, "the app's own count");
+        assert_eq!(ledger.issued[0].effective_status(), "fulfilled");
+        assert_eq!(ledger.issued[1].effective_status(), "open");
+    }
+
+    #[test]
+    fn the_ledger_reads_stored_attempts_as_paying_or_unknown() {
+        let me = Keys::generate().public_key().to_hex();
+        let (bob, carol) = (Keys::generate(), Keys::generate());
+        let list = format!("39998:{me}:bagels");
+        let bounty = bounty_row(serde_json::json!({
+            "issuer_pubkey": me, "list_coordinate": list, "bounty_cap_sats": 300, "reward_per_item": 1,
+        }));
+        let bob_claim = claim_at(&bob, "everything", &[&list], 200);
+        let carol_claim = claim_at(&carol, "sesame", &[&list], 210);
+        let attempt = |address: String, claimant: String, at: u64| secrets::PayAttempt {
+            started_at: at,
+            updated_at: at,
+            ..sending("b1", &address, &claimant)
+        };
+        let bob_hex = bob.public_key().to_hex();
+        let carol_hex = carol.public_key().to_hex();
+        let sent_at = now_unix();
+        let attempts = [
+            attempt(format!("{bob_hex}:everything"), bob_hex.clone(), sent_at),
+            secrets::PayAttempt { updated_at: 5, ..attempt(format!("{carol_hex}:sesame"), carol_hex.clone(), 1) },
+            // Its claim left the relay; the money may have gone all the same.
+            attempt("dd:plain".into(), "dd".into(), 1),
+        ];
+        let reads = LedgerReads { issued: vec![bounty], all: Vec::new(), mine: Vec::new() };
+        let relay = Some((vec![bob_claim, carol_claim], Vec::new()));
+        let ledger =
+            ledger_of(&AutoPayCtx::default(), &store_with(&me, &attempts), &me, reads, relay, Vec::new()).unwrap();
+        let paying = row_for(&ledger, "b1", &bob_hex);
+        assert_eq!((paying.status, paying.at), (Status::Paying, sent_at), "dated by the attempt, not the claim");
+        let stale = row_for(&ledger, "b1", &carol_hex);
+        assert_eq!((stale.status, stale.why.as_deref()), (Status::Unknown, Some("sent, no answer yet")));
+        assert_eq!(stale.at, 5, "the newer of started and updated");
+        let orphan = row_for(&ledger, "b1", "dd:");
+        assert_eq!((orphan.status, orphan.item.as_str()), (Status::Unknown, "plain"));
+    }
+
+    #[test]
+    fn a_manual_bounty_owes_only_what_the_cap_limit_and_rank_allow() {
+        let me = Keys::generate().public_key().to_hex();
+        let list = format!("39998:{me}:bagels");
+        // One slot, no auto-pay setting stored: the issuer pays by hand.
+        let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": me, "list_coordinate": list }));
+        let low = Keys::generate();
+        let ranked = [Keys::generate(), Keys::generate(), Keys::generate()];
+        let ctx = AutoPayCtx::default();
+        let mut claims = vec![claim_at(&low, "x", &[&list], 200)];
+        {
+            let mut cache = ctx.cache.try_lock().unwrap();
+            cache.ranks.insert((me.clone(), low.public_key().to_hex()), (now_unix(), Some(1.0)));
+            for (i, keys) in ranked.iter().enumerate() {
+                cache.ranks.insert((me.clone(), keys.public_key().to_hex()), (now_unix(), Some(5.0)));
+                claims.push(claim_at(keys, "x", &[&list], 210 + i as u64));
+            }
+        }
+        let reads = LedgerReads { issued: vec![bounty], all: Vec::new(), mine: Vec::new() };
+        let ledger =
+            ledger_of(&ctx, &store_with(&me, &[]), &me, reads, Some((claims, Vec::new())), Vec::new()).unwrap();
+
+        let low_row = row_for(&ledger, "b1", &low.public_key().to_hex());
+        assert_eq!((low_row.status, low_row.why.as_deref()), (Status::NotPayable, Some("rank 1, bounty needs 2")));
+        let statuses: Vec<(Status, Option<&str>)> = ranked
+            .iter()
+            .map(|k| row_for(&ledger, "b1", &k.public_key().to_hex()))
+            .map(|r| (r.status, r.why.as_deref()))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (Status::Owed, Some("manual pay")),
+                (Status::NotPayable, Some("no reward slots left")),
+                (Status::NotPayable, Some("no reward slots left")),
+            ]
+        );
+        assert_eq!(ledger::totals(&ledger.rows, Direction::PaidByMe).owed, 100);
+    }
+
+    #[test]
+    fn a_closed_manual_bounty_owes_nothing_in_the_ledger_and_on_its_card() {
+        let me = Keys::generate().public_key().to_hex();
+        let list = format!("39998:{me}:bagels");
+        let bob = Keys::generate();
+        let ctx = AutoPayCtx::default();
+        ctx.cache
+            .try_lock()
+            .unwrap()
+            .ranks
+            .insert((me.clone(), bob.public_key().to_hex()), (now_unix(), Some(5.0)));
+        let row_on = |status: &str| {
+            let bounty = bounty_row(serde_json::json!({ "issuer_pubkey": me, "list_coordinate": list, "status": status }));
+            let reads = LedgerReads { issued: vec![bounty], all: Vec::new(), mine: Vec::new() };
+            let claims = vec![claim_at(&bob, "x", &[&list], 200)];
+            let ledger =
+                ledger_of(&ctx, &store_with(&me, &[]), &me, reads, Some((claims, Vec::new())), Vec::new()).unwrap();
+            let row = row_for(&ledger, "b1", &bob.public_key().to_hex()).clone();
+            (row.status, row.why)
+        };
+        // Closed but not expired: ended, as its card says.
+        assert_eq!(row_on("closed"), (Status::Expired, Some("bounty ended unpaid".to_string())));
+        // Fulfilled by the server's count means nothing here: still owed.
+        assert_eq!(row_on("fulfilled"), (Status::Owed, Some("manual pay".to_string())));
+        assert_eq!(row_on("open"), (Status::Owed, Some("manual pay".to_string())));
+        // A paid claim stays paid however the bounty ended.
+        let paid = ClaimFacts { paid: true, ..hand_fact("bob", 1, 5.0) };
+        let view = ClaimView {
+            fact: &paid,
+            decision: &Err(Hold::Paid),
+            attempt_fresh: false,
+            bounty_expired: true,
+            note: None,
+        };
+        assert_eq!(ledger::classify(&view), (Status::Paid, None));
+    }
+
+    #[test]
+    fn a_closed_manual_bounty_card_says_closed_and_has_no_button() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("hand-pay-closed");
+        let bob = Keys::generate();
+        let events = vec![claim_at(&bob, "everything", &[COORD], 200)];
+        let ctx = AutoPayCtx::default();
+        ctx.cache
+            .try_lock()
+            .unwrap()
+            .ranks
+            .insert((issuer.clone(), bob.public_key().to_hex()), (now_unix(), Some(5.0)));
+        let mut detail = manual_detail(&issuer);
+        detail.bounty.status = Some("closed".into());
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let claims = runtime.block_on(async {
+            annotate_with(&ctx, detail, move |_, _| async move { Some((events, Vec::new())) })
+                .await
+                .detail
+                .claims
+        });
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].hand_pay, None);
+        assert_eq!(claims[0].unpaid_reason.as_deref(), Some(HAND_CLOSED));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_hand_payment_keeps_its_slot_and_can_be_paid_again() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("hand-pay-failed");
+        let (bob, carol) = (Keys::generate(), Keys::generate());
+        let events = vec![
+            claim_at(&bob, "everything", &[COORD], 200),
+            claim_at(&carol, "sesame", &[COORD], 210),
+        ];
+        let bob_address = format!("{}:everything", bob.public_key().to_hex());
+        let failed = secrets::PayAttempt {
+            claim_event_id: events[0].id.to_hex(),
+            ..sending("b1", &bob_address, &bob.public_key().to_hex())
+        };
+        assert_eq!(
+            secrets::begin_attempt_within(&issuer, failed, None, secrets::Existing::Refuse).unwrap(),
+            secrets::Begin::Recorded
+        );
+        secrets::finish_attempt_for(&issuer, "b1", &bob_address, AttemptState::Failed, Some("refused".into()), 2)
+            .unwrap();
+        let ctx = AutoPayCtx::default();
+        {
+            let mut cache = ctx.cache.try_lock().unwrap();
+            for keys in [&bob, &carol] {
+                cache.ranks.insert((issuer.clone(), keys.public_key().to_hex()), (now_unix(), Some(5.0)));
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let claims = runtime.block_on(async {
+            annotate_with(&ctx, manual_detail(&issuer), move |_, _| async move { Some((events, Vec::new())) })
+                .await
+                .detail
+                .claims
+        });
+        let by = |keys: &Keys| claims.iter().find(|c| c.event.pubkey == keys.public_key().to_hex()).unwrap();
+        assert_eq!(by(&bob).hand_pay.as_deref(), Some(bob_address.as_str()));
+        assert_eq!(
+            by(&bob).unpaid_reason.as_deref(),
+            Some("The last payment failed (refused). No sats moved, so it can be paid again.")
+        );
+        assert_eq!(by(&carol).hand_pay, None, "bob's failed claim keeps the one slot");
+        assert_eq!(by(&carol).unpaid_reason, Hold::NoSlots.describe());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unpaid, unattempted claim fact by `claimant`, ranked `rank`.
+    fn hand_fact(claimant: &str, n: u64, rank: f64) -> ClaimFacts {
+        ClaimFacts {
+            address: format!("{claimant}:{n}"),
+            event_id: format!("e{n}"),
+            claimant: claimant.into(),
+            created_at: 200 + n,
+            paid: false,
+            attempt: None,
+            rank: Some(rank),
+        }
+    }
+
+    #[test]
+    fn a_claim_is_payable_by_hand_only_where_the_manual_plan_owes_it() {
+        let manual = bounty_row(serde_json::json!({}));
+        let policy = app_policy(&manual, None, true);
+        assert!(!policy.auto_pay, "no setting, issuer here: manual");
+        let check = |bounty: &Bounty, policy: &Policy, facts: &[ClaimFacts], address: &str| {
+            hand_pay_check("aa", bounty, policy, facts, address, now_unix())
+        };
+        let bob = hand_fact("bob", 1, 5.0);
+        assert_eq!(check(&manual, &policy, std::slice::from_ref(&bob), "bob:1"), Ok(()));
+
+        // Auto-pay here, the server's auto-payer, or an issuer not stored here.
+        let auto = app_policy(&manual, None, false);
+        assert_eq!(check(&manual, &auto, std::slice::from_ref(&bob), "bob:1"), Err(HAND_AUTOMATIC));
+        let server = bounty_row(serde_json::json!({ "auto_pay": 1 }));
+        assert_eq!(check(&server, &policy, std::slice::from_ref(&bob), "bob:1"), Err(HAND_AUTOMATIC));
+        assert_eq!(
+            hand_pay_check("cc", &manual, &policy, std::slice::from_ref(&bob), "bob:1", now_unix()),
+            Err(HAND_NOT_ISSUER)
+        );
+        let expired = bounty_row(serde_json::json!({ "expiration": 999 }));
+        assert_eq!(check(&expired, &policy, std::slice::from_ref(&bob), "bob:1"), Err(HAND_CLOSED));
+        assert_eq!(check(&manual, &policy, std::slice::from_ref(&bob), "nobody:1"), Err(HAND_NO_CLAIM));
+
+        // The one slot: an older owed claim takes it, and a paid one fills it.
+        let carol = hand_fact("carol", 2, 5.0);
+        let both = [bob.clone(), carol.clone()];
+        assert_eq!(check(&manual, &policy, &both, "carol:2"), Err(HAND_NO_SLOTS));
+        let paid = [ClaimFacts { paid: true, ..hand_fact("dave", 0, 5.0) }, bob.clone()];
+        assert_eq!(check(&manual, &policy, &paid, "bob:1"), Err(HAND_NO_SLOTS));
+        assert_eq!(check(&manual, &policy, &paid, "dave:0"), Err(HAND_TAKEN));
+
+        // Per item, one reward per account: bob's second claim is over it.
+        let per_item = bounty_row(serde_json::json!({
+            "bounty_cap_sats": 300, "reward_per_item": 1, "max_rewards_per_npub": 1,
+        }));
+        let per_item_policy = app_policy(&per_item, None, true);
+        let twice = [
+            ClaimFacts { paid: true, ..bob.clone() },
+            hand_fact("bob", 3, 5.0),
+        ];
+        assert_eq!(check(&per_item, &per_item_policy, &twice, "bob:3"), Err(HAND_OVER_LIMIT));
+
+        let low = hand_fact("erin", 4, 1.0);
+        assert_eq!(check(&manual, &policy, std::slice::from_ref(&low), "erin:4"), Err(HAND_RANK));
+        let own = hand_fact("aa", 5, 9.0);
+        assert_eq!(check(&manual, &policy, std::slice::from_ref(&own), "aa:5"), Err(HAND_OWN));
+
+        for state in [AttemptState::Sending, AttemptState::Paid, AttemptState::Unknown] {
+            let tried = ClaimFacts { attempt: Some(state), ..bob.clone() };
+            assert_eq!(check(&manual, &policy, std::slice::from_ref(&tried), "bob:1"), Err(HAND_TAKEN), "{state:?}");
+        }
+        // A failed attempt moved no sats: it may be paid again by hand, and
+        // it keeps its place, so the newer claim has no slot.
+        let failed = ClaimFacts { attempt: Some(AttemptState::Failed), ..bob.clone() };
+        let after_failure = [failed, carol.clone()];
+        assert_eq!(check(&manual, &policy, &after_failure, "bob:1"), Ok(()));
+        assert_eq!(check(&manual, &policy, &after_failure, "carol:2"), Err(HAND_NO_SLOTS));
+    }
+
+    #[test]
+    fn a_hand_payment_that_stops_before_sending_says_why_once() {
+        let ctx = AutoPayCtx::default();
+        let answer = |outcome, note: Option<&str>| {
+            if let Some(note) = note {
+                ctx.note("bob:1", note);
+            }
+            let answer = hand_pay_answer(&ctx, "bob:1", outcome);
+            assert_eq!(ctx.note_for("bob:1"), None, "said once, not left for a next tick");
+            answer
+        };
+        assert_eq!(answer(PayOutcome::Retry, Some(PROFILE_UNREAD)), Err(HAND_PROFILE_UNREAD.to_string()));
+        let empty = "Wallet empty: the issuer's Coinos wallet holds 5 sats, and the reward is 100.";
+        assert_eq!(answer(PayOutcome::Retry, Some(empty)), Err(empty.to_string()));
+        assert_eq!(answer(PayOutcome::Retry, None), Err(HAND_NOT_STARTED.to_string()));
+        assert_eq!(answer(PayOutcome::Full, Some(HAND_NO_SLOTS)), Err(HAND_NO_SLOTS.to_string()));
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Sending), None), Err(HAND_TAKEN.to_string()));
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Failed), Some(HAND_OVER_LIMIT)), Err(HAND_OVER_LIMIT.to_string()));
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Failed), None), Ok(()), "its PaymentState says failed");
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Paid), None), Ok(()));
+        assert_eq!(answer(PayOutcome::Decided(AttemptState::Unknown), None), Ok(()));
+    }
+
+    /// A manual bounty `b1` of `issuer` on [`COORD`], from the server.
+    fn manual_detail(issuer: &str) -> BountyDetail {
+        parse_detail(
+            &serde_json::json!({
+                "success": true,
+                "bounty": { "id": "b1", "issuer_pubkey": issuer, "list_coordinate": COORD,
+                    "amount_sats": 100, "status": "open", "created_at": 100, "auto_pay": 0 },
+                "claims": [],
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_the_claims_the_manual_plan_owes_get_a_pay_button() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("hand-pay-cards");
+        let me = secrets::keys(&issuer).unwrap().unwrap();
+        let (bob, carol, dave) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let events = vec![
+            claim_at(&bob, "everything", &[COORD], 200),
+            claim_at(&carol, "sesame", &[COORD], 210),
+            // Older than bob's, so its rank, not the slot, holds it back.
+            claim_at(&dave, "plain", &[COORD], 150),
+            claim_at(&me, "mine", &[COORD], 230),
+        ];
+        let ctx = AutoPayCtx::default();
+        {
+            let mut cache = ctx.cache.try_lock().unwrap();
+            for (keys, rank) in [(&bob, 5.0), (&carol, 5.0), (&dave, 1.0)] {
+                cache.ranks.insert((issuer.clone(), keys.public_key().to_hex()), (now_unix(), Some(rank)));
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let cards = || {
+            runtime.block_on(async {
+                let events = events.clone();
+                annotate_with(&ctx, manual_detail(&issuer), move |_, _| async move { Some((events, Vec::new())) })
+                    .await
+                    .detail
+                    .claims
+            })
+        };
+        let by = |claims: &[Claim], keys: &Keys| {
+            claims.iter().find(|c| c.event.pubkey == keys.public_key().to_hex()).cloned().unwrap()
+        };
+
+        let claims = cards();
+        let bob_card = by(&claims, &bob);
+        assert_eq!(bob_card.hand_pay, Some(format!("{}:everything", bob.public_key().to_hex())));
+        assert_eq!(bob_card.unpaid_reason, Hold::AutoPayOff.describe());
+        let carol_card = by(&claims, &carol);
+        assert_eq!(carol_card.hand_pay, None, "bob's older claim takes the one slot");
+        assert_eq!(carol_card.unpaid_reason, Hold::NoSlots.describe());
+        let dave_card = by(&claims, &dave);
+        assert_eq!(dave_card.hand_pay, None);
+        assert_eq!(dave_card.unpaid_reason, Hold::RankTooLow { rank: Some(1.0), min: 2 }.describe());
+        let own = by(&claims, &me);
+        assert_eq!((own.hand_pay, own.unpaid_reason), (None, Hold::OwnClaim.describe()));
+
+        // With auto-pay on, the app pays it: no card is paid by hand. (The
+        // Lightning-address hint is cached, so nothing is read.)
+        ctx.cache.try_lock().unwrap().lud16.insert(bob.public_key().to_hex(), (now_unix(), true));
+        secrets::set_auto_pay(&issuer, "b1", 2).unwrap();
+        assert!(cards().iter().all(|c| c.hand_pay.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_hand_payments_for_one_claim_record_one_attempt_and_one_invoice() {
+        let _store = store_turn();
+        let (dir, issuer) = temp_store("hand-pay-twice");
+        let bob = Keys::generate();
+        let event = claim_at(&bob, "everything", &[COORD], 200);
+        let address = format!("{}:everything", bob.public_key().to_hex());
+        let ctx = AutoPayCtx::default();
+        ctx.cache
+            .try_lock()
+            .unwrap()
+            .ranks
+            .insert((issuer.clone(), bob.public_key().to_hex()), (now_unix(), Some(5.0)));
+        let (pays, invoices) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+        // `pay_claim` past its network reads: record, then invoice, then the
+        // payment's end state.
+        let pay = |bounty: Bounty, fact: ClaimFacts, paid: Vec<(String, String)>| {
+            let (ctx, issuer, pays, invoices) = (&ctx, issuer.clone(), &pays, &invoices);
+            async move {
+                pays.fetch_add(1, Ordering::SeqCst);
+                let (slots, per_npub) = autopay::slots_and_limit(&bounty);
+                let limits = secrets::SlotLimits { slots, per_npub, paid };
+                let attempt = secrets::PayAttempt {
+                    claim_event_id: fact.event_id.clone(),
+                    ..sending(&bounty.id, &fact.address, &fact.claimant)
+                };
+                let invoice = || async {
+                    invoices.fetch_add(1, Ordering::SeqCst);
+                    Ok("lnbc".to_string())
+                };
+                match record_then_invoice(ctx, &issuer, attempt, &limits, secrets::Existing::ReplaceFailed, invoice)
+                    .await
+                {
+                    Ok(_) => {
+                        secrets::finish_attempt_for(&issuer, &bounty.id, &fact.address, AttemptState::Paid, None, 2)
+                            .unwrap();
+                        PayOutcome::Decided(AttemptState::Paid)
+                    }
+                    Err(outcome) => outcome,
+                }
+            }
+        };
+        let annotate = || {
+            let (ctx, event) = (&ctx, event.clone());
+            move |detail| async move {
+                annotate_with(ctx, detail, move |_, _| async move { Some((vec![event], Vec::new())) }).await
+            }
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            // The facts as read before the first click recorded its attempt:
+            // two clicks that pass the check at the same moment.
+            let early = annotate()(manual_detail(&issuer)).await;
+            let click = || hand_pay_with(&ctx, &issuer, &address, manual_detail(&issuer), annotate(), pay);
+            assert_eq!(click().await, Ok(()));
+            assert_eq!((pays.load(Ordering::SeqCst), invoices.load(Ordering::SeqCst)), (1, 1));
+            // The second click sees the attempt and stops before paying.
+            assert_eq!(click().await, Err(HAND_TAKEN.to_string()));
+            assert_eq!(pays.load(Ordering::SeqCst), 1);
+            // Racing past the check, the store's record refuses it before
+            // any zap request is signed.
+            let raced =
+                hand_pay_with(&ctx, &issuer, &address, manual_detail(&issuer), |_| async move { early }, pay).await;
+            assert_eq!(raced, Err(HAND_TAKEN.to_string()));
+            assert_eq!((pays.load(Ordering::SeqCst), invoices.load(Ordering::SeqCst)), (2, 1));
+            // Another account stored here is not the issuer.
+            let other = secrets::add_account(&Secret::new(Keys::generate().secret_key().to_bech32().unwrap()), true)
+                .unwrap()
+                .pubkey;
+            let refused = hand_pay_with(&ctx, &other, &address, manual_detail(&issuer), annotate(), pay).await;
+            assert_eq!(refused, Err(HAND_NOT_ISSUER.to_string()));
+        });
+        let attempts = secrets::pay_attempts(&issuer).unwrap();
+        assert_eq!(attempts.len(), 1, "one attempt: {attempts:?}");
+        assert_eq!(attempts[0].state, AttemptState::Paid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hand_pay_command_and_its_refusal_carry_no_secret() {
+        let command = Command::PayClaim {
+            pubkey: "aa".repeat(32),
+            bounty_id: "b1".into(),
+            claim_address: "bb:everything".into(),
+        };
+        assert_eq!(
+            format!("{command:?}"),
+            format!(
+                "PayClaim {{ pubkey: \"{}\", bounty_id: \"b1\", claim_address: \"bb:everything\" }}",
+                "aa".repeat(32)
+            )
+        );
+        let update = Update::PayClaimRefused {
+            bounty_id: "b1".into(),
+            claim_address: "bb:everything".into(),
+            message: HAND_TAKEN.into(),
+        };
+        assert_eq!(
+            format!("{update:?}"),
+            format!(
+                "PayClaimRefused {{ bounty_id: \"b1\", claim_address: \"bb:everything\", message: \"{HAND_TAKEN}\" }}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_failed_read_fails_the_whole_ledger() {
+        let me = Keys::generate().public_key().to_hex();
+        let store = store_with(&me, &[]);
+        let ctx = AutoPayCtx::default();
+        let app_paid = || LedgerReads {
+            issued: vec![bounty_row(serde_json::json!({ "issuer_pubkey": me }))],
+            all: Vec::new(),
+            mine: Vec::new(),
+        };
+        let failed = ledger_of(&ctx, &store, &me, app_paid(), None, Vec::new());
+        assert_eq!(failed, Err(LEDGER_RELAY_UNREAD.to_string()));
+        // A server-paid bounty whose detail can't be read fails it too.
+        let server_paid = LedgerReads {
+            issued: vec![bounty_row(serde_json::json!({ "issuer_pubkey": me, "auto_pay": 1 }))],
+            all: Vec::new(),
+            mine: Vec::new(),
+        };
+        let missing = ledger_of(&ctx, &store, &me, server_paid, Some((Vec::new(), Vec::new())), Vec::new());
+        assert!(missing.is_err());
+    }
+
     #[test]
     fn only_an_unanswered_create_is_outcome_unknown() {
         let unknown = |e| matches!(create_outcome(e), BridgeError::OutcomeUnknown(_));
@@ -5036,6 +6715,22 @@ mod tests {
             ("wss://b".into(), relay_answer(Some(Ok(vec![])), false)),
         ]);
         assert_eq!((count, events.len()), (0, 0));
+    }
+
+    #[test]
+    fn the_instance_relay_alone_is_no_public_answer() {
+        let instance = "wss://relay.example.com";
+        let profile = EventBuilder::new(Kind::Metadata, "{}").finalize(&Keys::generate()).unwrap();
+        let only_instance = vec![
+            ("wss://relay.example.com/".to_string(), Ok(vec![profile.clone()])),
+            ("wss://a".to_string(), Err(())),
+        ];
+        assert_eq!(public_answers(only_instance, instance).0, 0);
+        let both = vec![
+            (instance.to_string(), Ok(vec![profile.clone()])),
+            ("wss://a".to_string(), Ok(vec![])),
+        ];
+        assert_eq!(public_answers(both, instance), (1, vec![]));
     }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/bounty-5f44688e.json");
@@ -5182,6 +6877,63 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_address_replaces_the_old_one_and_keeps_every_other_field() {
+        let existing = r#"{"name":"Ada","picture":"https://example.com/p.png","about":null,"lud16":"old@example.com","custom":{"deep":1}}"#;
+        let merged =
+            merge_lud16_as(Some(existing), "ada@example.org", None, Lud16Write::Replace).unwrap();
+        assert_eq!(merged["lud16"], "ada@example.org");
+        assert_eq!(merged["name"], "Ada");
+        assert_eq!(merged["picture"], "https://example.com/p.png");
+        assert_eq!(merged["about"], serde_json::Value::Null);
+        assert_eq!(merged["custom"]["deep"], 1);
+        assert_eq!(merged.len(), 5);
+        // The wallet setup's mode still refuses the same write.
+        assert!(matches!(
+            merge_lud16_as(Some(existing), "ada@example.org", None, Lud16Write::KeepOther),
+            Err(BridgeError::Profile(_))
+        ));
+        // Replace does not loosen the format guard.
+        assert!(merge_lud16_as(Some("[1]"), "ada@example.org", None, Lud16Write::Replace).is_err());
+    }
+
+    #[test]
+    fn a_lightning_address_command_and_update_carry_no_secret() {
+        let command = Command::SetLightningAddress {
+            pubkey: "aa".repeat(32),
+            address: "ada@example.com".into(),
+        };
+        assert_eq!(
+            format!("{command:?}"),
+            format!(
+                "SetLightningAddress {{ pubkey: \"{}\", address: \"ada@example.com\" }}",
+                "aa".repeat(32)
+            )
+        );
+        // Both updates print exactly the account and the address or the
+        // fixed error text: no field that could carry a key.
+        let set = Update::LightningAddressSet {
+            pubkey: "aa".repeat(32),
+            address: "ada@example.com".into(),
+        };
+        assert_eq!(
+            format!("{set:?}"),
+            format!(
+                "LightningAddressSet {{ pubkey: \"{}\", address: \"ada@example.com\" }}",
+                "aa".repeat(32)
+            )
+        );
+        let message = coinos::AddressCheckError::NoReceipts.to_string();
+        let failed = Update::LightningAddressFailed {
+            pubkey: "aa".repeat(32),
+            message: message.clone(),
+        };
+        assert_eq!(
+            format!("{failed:?}"),
+            format!("LightningAddressFailed {{ pubkey: \"{}\", message: {message:?} }}", "aa".repeat(32))
+        );
+    }
+
+    #[test]
     fn merging_lud16_keeps_every_other_profile_field() {
         let existing = r#"{"name":"Matthias","picture":"https://x/p.png","about":"hi","nip05":"m@x.io","custom":{"deep":1}}"#;
         let merged = merge_lud16(Some(existing), "carpet1234@coinos.io", None).unwrap();
@@ -5296,6 +7048,89 @@ mod tests {
     }
 
     #[test]
+    fn the_pay_path_reads_the_lud16_of_the_newest_kind_0() {
+        let copy = |at: u64, content: &str| Some((at, content.to_string()));
+        let old = r#"{"lud16":"old@example.com"}"#;
+        let new = r#"{"lud16":"new@example.com"}"#;
+        assert_eq!(
+            newest_lud16(copy(100, old), copy(200, new)).as_deref(),
+            Some("new@example.com"),
+            "a newer public copy wins"
+        );
+        assert_eq!(
+            newest_lud16(copy(200, new), copy(100, old)).as_deref(),
+            Some("new@example.com"),
+            "a newer instance copy wins"
+        );
+        assert_eq!(
+            newest_lud16(copy(100, old), copy(200, r#"{"name":"Alice"}"#)),
+            None,
+            "a newer profile without lud16 means the address was removed"
+        );
+        assert_eq!(
+            newest_lud16(copy(100, old), None).as_deref(),
+            Some("old@example.com"),
+            "a failed public read falls back to the instance copy"
+        );
+        assert_eq!(
+            newest_lud16(None, copy(100, new)).as_deref(),
+            Some("new@example.com"),
+            "no instance profile: the public one is used"
+        );
+    }
+
+    #[test]
+    fn a_typed_address_merges_into_the_newest_profile_copy() {
+        let copy = |at: u64, content: &str| Some((at, content.to_string()));
+        let instance = r#"{"name":"Old","lud16":"old@example.com"}"#;
+        let public = r#"{"name":"New","picture":"https://x/p.png"}"#;
+        assert_eq!(
+            profile_to_merge(copy(100, instance), Ok(copy(200, public))).unwrap().as_deref(),
+            Some(public),
+            "a newer public copy wins"
+        );
+        assert_eq!(
+            profile_to_merge(copy(200, instance), Ok(copy(100, public))).unwrap().as_deref(),
+            Some(instance),
+            "a newer instance copy wins"
+        );
+        let only_public = profile_to_merge(None, Ok(copy(100, public))).unwrap();
+        let merged = merge_lud16_as(only_public.as_deref(), "new@example.com", None, Lud16Write::Replace).unwrap();
+        assert_eq!(merged["name"], "New", "a public-only profile keeps its fields");
+        assert_eq!(merged["picture"], "https://x/p.png");
+        assert_eq!(merged["lud16"], "new@example.com");
+        assert_eq!(profile_to_merge(copy(100, instance), Ok(None)).unwrap().as_deref(), Some(instance));
+        let unread = profile_to_merge(copy(100, instance), Err(())).unwrap_err();
+        assert_eq!(
+            unread.to_string(),
+            "Couldn't read your profile from the public relays, so nothing was changed. Try again."
+        );
+    }
+
+    #[test]
+    fn newest_kind0_keeps_only_the_authors_newest_verified_event() {
+        let kind0 = |keys: &Keys, content: &str, at: u64| {
+            EventBuilder::new(Kind::Metadata, content)
+                .custom_created_at(Timestamp::from_secs(at))
+                .finalize(keys)
+                .unwrap()
+        };
+        let (alice, outsider) = (Keys::generate(), Keys::generate());
+        let forged = {
+            let event = kind0(&alice, "forged", 500);
+            Event::from_json(event.as_json().replace("forged", "forgex")).unwrap()
+        };
+        let events = vec![
+            kind0(&alice, "old", 100),
+            kind0(&alice, "new", 200),
+            kind0(&outsider, "outside", 300),
+            forged,
+        ];
+        let found = newest_kind0(events, &alice.public_key()).unwrap();
+        assert_eq!(found.content, "new");
+    }
+
+    #[test]
     fn a_profile_is_read_field_by_field() {
         let profile = parse_profile(r#"{"name":"Alice","about":42}"#);
         assert_eq!(profile.name.as_deref(), Some("Alice"));
@@ -5320,6 +7155,7 @@ mod tests {
         let update = Update::WalletCreated {
             pubkey: "aa".repeat(32),
             created: WalletCreated {
+                server_host: None,
                 username: "carpetab12cd34".into(),
                 lightning_address: "carpetab12cd34@coinos.io".into(),
                 publish_error: Some("The Nostr servers didn't accept the profile update.".into()),

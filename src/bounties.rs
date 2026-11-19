@@ -11,6 +11,7 @@
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::component::{h_flex, input::{Input, Paste}, v_flex};
+use nostr_sdk::prelude::{PublicKey, ToBech32 as _};
 
 use magic_carpet_chat::api::{Bounty, Claim};
 use magic_carpet_chat::bounty_search::coordinate_dtag;
@@ -21,6 +22,7 @@ use crate::dashboard::{MONO, count_badge};
 use crate::palette::*;
 use crate::shell::{
     BOUNTY_FIELD_DEFS, BountyTab, F_CRITERIA, Load, RANK_NOTE, Screen, Shell, form_locked, opens_claim, short_id,
+    short_npub,
 };
 use crate::timefmt;
 
@@ -238,8 +240,8 @@ fn bounty_row(
 }
 
 /// "{label} ({n})", the count only once the list is in.
-fn tab_label(label: &str, list: &Load<Vec<Bounty>>) -> String {
-    match list {
+fn tab_label<'a>(label: &str, list: impl Into<Load<&'a [Bounty]>>) -> String {
+    match list.into() {
         Load::Ready(list) => format!("{label} ({})", list.len()),
         _ => label.to_string(),
     }
@@ -258,6 +260,7 @@ fn tab(
         .aria_selected(on)
         .px(px(10.))
         .py(px(5.))
+        .flex_1()
         .rounded(px(7.))
         .cursor_pointer()
         .text_size(px(11.5))
@@ -275,32 +278,60 @@ fn tab(
         .into_any_element()
 }
 
-/// The tab strip over the list. The Eligible tab needs an account to be
-/// eligible as, so read-only mode shows the house list alone.
+/// The tab strip over the list. Issued, Claimed and Eligible need an
+/// account to be read for, so read-only mode shows the house list alone.
 fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
     let house = tab(
         "bounties-tab-house",
-        tab_label("House bounties", &shell.bounties),
+        tab_label("All open", &shell.bounties),
         shell.bounty_tab == BountyTab::House,
         BountyTab::House,
         cx,
     );
+    let mine = shell.ledger.as_ref().map(|_| {
+        [
+            tab(
+                "bounties-tab-issued",
+                tab_label("Issued by me", shell.ledger_list(|l| &l.issued)),
+                shell.bounty_tab == BountyTab::Issued,
+                BountyTab::Issued,
+                cx,
+            ),
+            tab(
+                "bounties-tab-claimed",
+                tab_label("Claimed by me", shell.ledger_list(|l| &l.claimed)),
+                shell.bounty_tab == BountyTab::Claimed,
+                BountyTab::Claimed,
+                cx,
+            ),
+        ]
+    });
     let eligible = shell.eligible.as_ref().map(|slot| {
         tab(
             "bounties-tab-eligible",
-            tab_label("Eligible for me to claim", &slot.list),
+            tab_label("Eligible", &slot.list),
             shell.bounty_tab == BountyTab::Eligible,
             BountyTab::Eligible,
             cx,
         )
     });
-    h_flex()
+    // Two tabs to a row, each half the pane, so four make a tidy grid. An odd
+    // last tab keeps its half next to an empty filler.
+    let mut tabs: Vec<AnyElement> = std::iter::once(house)
+        .chain(mine.into_iter().flatten())
+        .chain(eligible)
+        .collect();
+    let mut rows = Vec::new();
+    while !tabs.is_empty() {
+        let row: Vec<AnyElement> = tabs.drain(..tabs.len().min(2)).collect();
+        let filler = (row.len() == 1).then(|| div().flex_1());
+        rows.push(h_flex().gap(px(6.)).children(row).children(filler));
+    }
+    v_flex()
         .a11y("bounties-tabs", Role::TabList, "Bounty lists")
-        .flex_wrap()
         .gap(px(6.))
         .mb(px(8.))
-        .child(house)
-        .children(eligible)
+        .children(rows)
         .into_any_element()
 }
 
@@ -360,7 +391,12 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .child({
                     let text = format!(
                         "{} didn't load: {message}",
-                        if eligible { "Eligible bounties" } else { "Bounties" }
+                        match shell.bounty_tab {
+                            BountyTab::House => "Bounties",
+                            BountyTab::Issued => "Your bounties",
+                            BountyTab::Claimed => "Your claims",
+                            BountyTab::Eligible => "Eligible bounties",
+                        }
                     );
                     div()
                         .a11y("bounties-error", Role::Label, text.clone())
@@ -386,19 +422,22 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 )
                 .into_any_element(),
         ],
-        Load::Ready(list) if list.is_empty() => vec![
-            div()
-                .a11y(
-                    "bounties-empty",
-                    Role::Label,
-                    "No bounties yet. ⌘N creates the first one.",
-                )
-                .py(px(20.))
-                .text_size(px(12.5))
-                .text_color(rgb(TEXT_DIM))
-                .child("No bounties yet. ⌘N creates the first one.")
-                .into_any_element(),
-        ],
+        Load::Ready([]) => {
+            let text = match shell.bounty_tab {
+                BountyTab::Issued => "You haven't issued a bounty yet.",
+                BountyTab::Claimed => "You haven't claimed a bounty yet.",
+                BountyTab::House | BountyTab::Eligible => "No bounties yet. ⌘N creates the first one.",
+            };
+            vec![
+                div()
+                    .a11y("bounties-empty", Role::Label, text)
+                    .py(px(20.))
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_DIM))
+                    .child(text)
+                    .into_any_element(),
+            ]
+        }
         Load::Ready(_) => {
             let rows = shell.displayed();
             if rows.is_empty() {
@@ -445,8 +484,123 @@ fn list_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
 
 // ----------------------------------------------------------------- detail
 
-fn claim_card(claim: &Claim) -> AnyElement {
+/// The hand-pay button on a claim card ([`Shell::pay_control`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayControl {
+    /// Not the issuer's to pay by hand here, or not payable now.
+    None,
+    Ready,
+    /// The first click landed; the next one pays.
+    Armed,
+    /// `PayClaim` went out; the snapshot has not caught up yet.
+    Sending,
+}
+
+/// Under an armed "Pay": the app cannot see a payment made another way.
+const PAY_NOTE: &str =
+    "The app only knows payments made with this button. If you already paid this claim another way, don't pay again.";
+
+/// The hand-pay row of a claim card: the button (or its sending line),
+/// then the last refusal.
+fn pay_rows(
+    cid: &str,
+    bounty: &Bounty,
+    claim: &Claim,
+    pay: PayControl,
+    refusal: Option<String>,
+    cx: &mut Context<Shell>,
+) -> Vec<AnyElement> {
+    let sats = timefmt::fmt_sats(bounty.amount_sats);
+    let to = PublicKey::from_hex(&claim.event.pubkey)
+        .ok()
+        .and_then(|key| key.to_bech32().ok())
+        .map(|npub| short_npub(&npub))
+        .unwrap_or_else(|| short_id(&claim.event.pubkey));
+    let mut rows = Vec::new();
+    match (pay, claim.hand_pay.clone()) {
+        (PayControl::Sending, _) => {
+            let text = "Sending payment…";
+            rows.push(
+                div()
+                    .a11y(format!("{cid}-pay-sending"), Role::Label, text)
+                    .mt(px(6.))
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(text)
+                    .into_any_element(),
+            );
+        }
+        (PayControl::Ready | PayControl::Armed, Some(address)) => {
+            let armed = pay == PayControl::Armed;
+            let label = if armed {
+                format!("Click again to pay {sats} sats to {to}")
+            } else {
+                format!("Pay {sats} sats")
+            };
+            let bounty_id = bounty.id.clone();
+            let event_id = claim.event.id.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("{cid}-pay")))
+                    .a11y(format!("{cid}-pay"), Role::Button, label.clone())
+                    .self_start()
+                    .mt(px(6.))
+                    .px(px(12.))
+                    .py(px(5.))
+                    .rounded(px(7.))
+                    .border_1()
+                    .border_color(rgb(if armed { AMBER } else { BORDER_3 }))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(if armed { AMBER } else { ACCENT_LIGHT }))
+                    .child(SharedString::from(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pay_claim(bounty_id.clone(), address.clone(), event_id.clone(), cx)
+                    }))
+                    .into_any_element(),
+            );
+            if armed {
+                // The app sees only its own payments: one made in the Wallet,
+                // in Coinos or on another machine still reads unpaid here.
+                let note = PAY_NOTE;
+                rows.push(
+                    div()
+                        .a11y(format!("{cid}-pay-note"), Role::Label, note)
+                        .mt(px(4.))
+                        .text_size(px(12.))
+                        .text_color(rgb(AMBER))
+                        .child(note)
+                        .into_any_element(),
+                );
+            }
+        }
+        _ => {}
+    }
+    if let Some(message) = refusal {
+        rows.push(
+            div()
+                .a11y(format!("{cid}-pay-refused"), Role::Label, message.clone())
+                .mt(px(4.))
+                .text_size(px(12.))
+                .text_color(rgb(RED))
+                .child(SharedString::from(message))
+                .into_any_element(),
+        );
+    }
+    rows
+}
+
+fn claim_card(
+    bounty: &Bounty,
+    claim: &Claim,
+    pay: PayControl,
+    refusal: Option<String>,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
     let cid = format!("claim-{}", claim.event.id);
+    // A manual bounty's attempts are the issuer's clicks, not auto-pay's.
+    let manual = !bounty.auto_pay_on();
     let now = timefmt::now_unix();
     let claim_ts = claim.event.created_at.unwrap_or(0);
     let mut rows: Vec<AnyElement> = vec![timeline_row(
@@ -484,7 +638,7 @@ fn claim_card(claim: &Claim) -> AnyElement {
                     rows.push(timeline_row(
                         format!("{cid}-attempted"),
                         ACCENT,
-                        "Auto-pay attempted".into(),
+                        if manual { "Payment attempted" } else { "Auto-pay attempted" }.into(),
                         Some(format!(
                             "{} UTC · {}",
                             timefmt::hhmmss_utc(started),
@@ -514,10 +668,12 @@ fn claim_card(claim: &Claim) -> AnyElement {
                 .map(|r| format!(" ({r})"))
                 .unwrap_or_default();
             let (dot, text) = match row.state.as_str() {
+                "attempting" if manual => (ACCENT, "Paying…".to_string()),
                 "attempting" => (ACCENT, "Auto-pay attempting…".to_string()),
                 "paid" => (AMBER, "Paid, waiting for the zap receipt".to_string()),
                 "settled" => (GREEN, "Payment settled".to_string()),
                 "paid_unreceipted" => (AMBER, format!("Paid, no receipt{why}")),
+                "failed" if manual => (RED, format!("Payment failed{why}")),
                 "failed" => (RED, format!("Auto-pay failed{why}")),
                 other => (TEXT_MUTED, format!("Payment status: {other}{why}")),
             };
@@ -552,6 +708,8 @@ fn claim_card(claim: &Claim) -> AnyElement {
             Some(format!("{amount}{secs} s after the claim")),
         ));
     }
+
+    rows.extend(pay_rows(&cid, bounty, claim, pay, refusal, cx));
 
     let item = claim.item_name().to_string();
     let by = format!("by {}", short_id(&claim.event.pubkey));
@@ -704,7 +862,15 @@ fn detail_pane(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                 .child("No claims yet.")
                 .into_any_element(),
         ],
-        Some(detail) => detail.claims.iter().map(claim_card).collect(),
+        Some(detail) => detail
+            .claims
+            .iter()
+            .map(|claim| {
+                let pay = shell.pay_control(bounty, claim);
+                let refusal = shell.pay_refusal(&bounty.id, claim);
+                claim_card(bounty, claim, pay, refusal, cx)
+            })
+            .collect(),
     };
     let claim_count = detail.map(|d| d.claims.len()).unwrap_or(0);
 
@@ -1042,9 +1208,9 @@ fn forms(shell: &Shell, cx: &mut Context<Shell>) -> Option<AnyElement> {
             } else if form.submitting {
                 "Publishing…"
             } else if form.existing_list.is_some() {
-                "Enter moves to the next field. Enter on the last field creates the bounty. With auto-pay on, this app pays qualifying claims from your Coinos wallet while it runs. esc cancels."
+                "Enter moves to the next field. Enter on the last field creates the bounty. With auto-pay on, this app pays qualifying claims from your wallet while it runs. esc cancels."
             } else {
-                "Enter moves to the next field. Enter on the last field publishes the list and creates the bounty. With auto-pay on, this app pays qualifying claims from your Coinos wallet while it runs. esc cancels."
+                "Enter moves to the next field. Enter on the last field publishes the list and creates the bounty. With auto-pay on, this app pays qualifying claims from your wallet while it runs. esc cancels."
             },
             Some(form_locked(form.submitting, form.checking_list)),
             cx,
@@ -1234,14 +1400,31 @@ mod tests {
         );
         assert_eq!(
             tab_label(
-                "Eligible for me to claim",
+                "Eligible",
                 &Load::Ready(vec![row(serde_json::json!({}))])
             ),
-            "Eligible for me to claim (1)"
+            "Eligible (1)"
         );
         assert_eq!(
             tab_label("House bounties", &Load::Failed("x".into())),
             "House bounties"
+        );
+    }
+
+    #[test]
+    fn a_ledger_tab_counts_its_borrowed_list_once_loaded() {
+        let issued = [row(serde_json::json!({}))];
+        assert_eq!(
+            tab_label("Issued by me", Load::Ready(&issued[..])),
+            "Issued by me (1)"
+        );
+        assert_eq!(
+            tab_label("Claimed by me", Load::<&[Bounty]>::Loading),
+            "Claimed by me"
+        );
+        assert_eq!(
+            tab_label("Claimed by me", Load::<&[Bounty]>::Failed("x".into())),
+            "Claimed by me"
         );
     }
 }

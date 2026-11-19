@@ -458,9 +458,21 @@ pub enum Begin {
     OverLimit,
 }
 
+/// What [`begin_attempt_within`] does with an attempt already recorded for
+/// the same bounty and claim address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existing {
+    /// Any earlier attempt is final: `Begin::Exists`. Auto-pay never retries.
+    Refuse,
+    /// A `Failed` attempt moved no sats, so a person paying by hand may
+    /// replace it; any other state is still `Begin::Exists`.
+    ReplaceFailed,
+}
+
 /// Record a payment attempt before the payment goes out. `Begin::Exists`
 /// when an attempt for the same bounty and claim address already exists,
-/// from this process or another: the caller must not pay. With `limits`,
+/// from this process or another (with [`Existing::ReplaceFailed`], unless
+/// it failed): the caller must not pay. With `limits`,
 /// the cap and the per-npub limit are counted inside the same lock from
 /// what the store holds NOW (every instance's attempts on this bounty that
 /// may have paid) plus the receipt-paid claims, so a plan made from an older
@@ -470,17 +482,21 @@ pub fn begin_attempt_within(
     pubkey: &str,
     attempt: PayAttempt,
     limits: Option<&SlotLimits>,
+    existing: Existing,
 ) -> Result<Begin, SecretError> {
     modify(|store| {
         let account = account_mut(store, pubkey)?;
         let same_bounty = |a: &&PayAttempt| a.bounty_id == attempt.bounty_id;
-        if account
+        let earlier = account
             .pay_attempts
             .iter()
-            .filter(same_bounty)
-            .any(|a| a.claim_address == attempt.claim_address)
-        {
-            return Ok(Begin::Exists);
+            .position(|a| a.bounty_id == attempt.bounty_id && a.claim_address == attempt.claim_address);
+        if let Some(ix) = earlier {
+            let replace =
+                existing == Existing::ReplaceFailed && account.pay_attempts[ix].state == AttemptState::Failed;
+            if !replace {
+                return Ok(Begin::Exists);
+            }
         }
         if let Some(limits) = limits {
             let mut holders: HashMap<&str, &str> = account
@@ -500,6 +516,11 @@ pub fn begin_attempt_within(
             if limits.per_npub.is_some_and(|limit| mine >= limit) {
                 return Ok(Begin::OverLimit);
             }
+        }
+        // A failed attempt holds no slot, so the recount above is the same
+        // with or without it.
+        if let Some(ix) = earlier {
+            account.pay_attempts.remove(ix);
         }
         account.pay_attempts.push(attempt);
         Ok(Begin::Recorded)
@@ -789,13 +810,13 @@ mod tests {
             updated_at: 1,
         };
         assert_eq!(
-            begin_attempt_within(&record.pubkey, attempt.clone(), None).unwrap(),
+            begin_attempt_within(&record.pubkey, attempt.clone(), None, Existing::Refuse).unwrap(),
             Begin::Recorded
         );
         // A replaced claim event is the same address: never a second attempt.
         let replaced = PayAttempt { claim_event_id: "e2".into(), ..attempt.clone() };
         assert_eq!(
-            begin_attempt_within(&record.pubkey, replaced, None).unwrap(),
+            begin_attempt_within(&record.pubkey, replaced, None, Existing::Refuse).unwrap(),
             Begin::Exists
         );
         finish_attempt_for(&record.pubkey, "b1", "bob:item", AttemptState::Unknown, Some("x".into()), 5)
@@ -837,7 +858,7 @@ mod tests {
 
         // Another instance already paid X on a one-slot bounty: Y waits.
         let one = SlotLimits { slots: 1, per_npub: Some(1), paid: Vec::new() };
-        let begin = |a: PayAttempt, l: &SlotLimits| begin_attempt_within(&me, a, Some(l)).unwrap();
+        let begin = |a: PayAttempt, l: &SlotLimits| begin_attempt_within(&me, a, Some(l), Existing::Refuse).unwrap();
         assert_eq!(begin(attempt_on("b1", "x:1", "x"), &one), Begin::Recorded);
         assert_eq!(begin(attempt_on("b1", "y:1", "y"), &one), Begin::NoSlots);
         // The same claim on another bounty is its own attempt.
@@ -857,6 +878,38 @@ mod tests {
         };
         assert_eq!(begin(attempt_on("b3", "erin:1", "erin"), &paid), Begin::NoSlots);
         assert_eq!(begin(attempt_on("b3", "erin:1", "erin"), &two), Begin::Recorded);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_hand_payment_replaces_an_attempt_and_only_a_failed_one() {
+        let _store = STORE_DIR.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("mc-replace-test-{}", std::process::id()));
+        unsafe { std::env::set_var("MC_STORE_DIR", &dir) };
+        let keys = Keys::generate();
+        let me = add_account(&Secret::new(keys.secret_key().to_bech32().unwrap()), true)
+            .unwrap()
+            .pubkey;
+        let one = SlotLimits { slots: 1, per_npub: Some(1), paid: Vec::new() };
+        let begin = |a: PayAttempt, existing| begin_attempt_within(&me, a, Some(&one), existing).unwrap();
+
+        // A failed attempt: auto-pay still refuses it, a hand payment replaces it.
+        assert_eq!(begin(attempt_on("b1", "bob:1", "bob"), Existing::Refuse), Begin::Recorded);
+        finish_attempt_for(&me, "b1", "bob:1", AttemptState::Failed, Some("refused".into()), 2).unwrap();
+        assert_eq!(begin(attempt_on("b1", "bob:1", "bob"), Existing::Refuse), Begin::Exists);
+        assert_eq!(pay_attempts(&me).unwrap()[0].state, AttemptState::Failed);
+        let retry = PayAttempt { started_at: 7, updated_at: 7, ..attempt_on("b1", "bob:1", "bob") };
+        assert_eq!(begin(retry.clone(), Existing::ReplaceFailed), Begin::Recorded);
+        assert_eq!(pay_attempts(&me).unwrap(), vec![retry.clone()], "one entry, the new attempt's");
+
+        // Sending, Paid and Unknown are never replaced.
+        for state in [AttemptState::Sending, AttemptState::Paid, AttemptState::Unknown] {
+            finish_attempt_for(&me, "b1", "bob:1", state, None, 9).unwrap();
+            let before = pay_attempts(&me).unwrap();
+            assert_eq!(begin(attempt_on("b1", "bob:1", "bob"), Existing::ReplaceFailed), Begin::Exists, "{state:?}");
+            assert_eq!(pay_attempts(&me).unwrap(), before, "{state:?}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

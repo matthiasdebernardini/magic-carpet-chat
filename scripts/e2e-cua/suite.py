@@ -25,12 +25,12 @@ APP_BIN = "/usr/local/bin/magic-carpet-chat-e2e"   # run.sh installs here; the d
 WALLET = "node /usr/local/lib/node_modules/brainstorm/node_modules/.bin/agent-wallet"
 FAKE_URL, RELAY_URL = "http://127.0.0.1:8787", "ws://127.0.0.1:10547"
 BS_URL = "http://127.0.0.1:8788"        # fake Brainstorm (same fake_instance.py)
-PAID = ("P", "R", "Y", "Z")             # move real sats: skipped by --no-paid
+PAID = ("P", "R", "Y", "Z", "I")        # move real sats: skipped by --no-paid
 # Two 1280x960 apps side by side: xfwm adds 5 px of frame left and right, so
 # each window is 1290 wide and two fit 2580 exactly (scenarios.APP_B_AT),
 # three 3870 (scenarios.Z_AT).
-OPT_IN = ("Y", "Z")                     # never in a default run, only via --only
-WIDE = {"Y": (2580, 960), "Z": (3870, 960)}   # the screen and the recording are this size
+OPT_IN = ("Y", "Z", "I")                # never in a default run, only via --only
+WIDE = {"Y": (2580, 960), "Z": (3870, 960), "I": (2580, 960)}   # the screen and the recording are this size
 # The e2e session bus inside mc: the app registers its AccessKit tree on the
 # accessibility bus this bus's at-spi-bus-launcher hands out, and atspi.py
 # reads it there. Box.a11y_up gives the bus its own XDG_RUNTIME_DIR, so that
@@ -264,23 +264,27 @@ class AppDriver(Driver):
                     return None
             cap = self.a11y("exists", "~bounty-row-[0-9a-f-]{36}")["count"] + 1
             cur = title()
-            for i in range(cap + 1):
-                if cur == arg:
-                    await asyncio.sleep(1)
-                    cur = title()
+            # Down the list, then back Up: a list that grew while a row low
+            # in it stayed selected (a refreshed Eligible tab) has this run's
+            # bounty above the selection, where Down alone never gets.
+            for key in ("Down", "Up"):
+                for i in range(cap + 1):
                     if cur == arg:
-                        return f"select_bounty {arg!r} after {i} Down"
-                    continue   # moved on after all: decide again on what it shows now
-                if i == cap:
-                    break
-                await self.x(f"xdotool key --window {wid} Down")
-                prev, end = cur, time.time() + 4
-                while time.time() < end:
-                    await asyncio.sleep(0.3)
-                    cur = title()
-                    if cur != prev:
+                        await asyncio.sleep(1)
+                        cur = title()
+                        if cur == arg:
+                            return f"select_bounty {arg!r} after {i} {key}"
+                        continue   # moved on after all: decide again on what it shows now
+                    if i == cap:
                         break
-            raise RuntimeError(f"select_bounty: {arg!r} not reached in {cap} Down presses (last {cur!r})")
+                    await self.x(f"xdotool key --window {wid} {key}")
+                    prev, end = cur, time.time() + 4
+                    while time.time() < end:
+                        await asyncio.sleep(0.3)
+                        cur = title()
+                        if cur != prev:
+                            break
+            raise RuntimeError(f"select_bounty: {arg!r} not reached in {cap} Down then {cap} Up presses (last {cur!r})")
         if kind in ("press", "click_id", "wait_id", "scroll_to"):
             t = arg if isinstance(arg, dict) else {"id": arg}
             if kind == "wait_id":
@@ -968,7 +972,11 @@ class Suite:
             # Z funds three wallets with 250 each, plus fees (800).
             two = sum(1 for s in ("R", "Y") if s in wanted)
             need = 250 + 204 * (two - 1) + (102 if "P" in wanted else 0) if two else (200 if "P" in wanted else 0)
-            need += 800 if "Z" in wanted else 0
+            # With reused wallets Z tops up only what each wallet lacks, and
+            # z_fund checks the float covers that before it sends anything.
+            need += (300 if self.args.reuse_wallets else 800) if "Z" in wanted else 0
+            # I tops A up to 150 only if it holds less (z_fund checks it).
+            need += 210 if "I" in wanted else 0
             if bal is None or bal < need:
                 print(f"PREFLIGHT: the auto-pay float is {bal} sats, below {need}. "
                       f"Stopping. fund with ~/mc/fund.sh 500", flush=True)
@@ -1144,14 +1152,14 @@ def _quiet_agent_log():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", default=time.strftime("%Y%m%d-%H%M%S"))
-    ap.add_argument("--no-paid", action="store_true", help="development only: skip P, R, Y and Z")
+    ap.add_argument("--no-paid", action="store_true", help="development only: skip P, R, Y, Z and I")
     ap.add_argument("--only", default="", help="comma list of scenario ids, e.g. A,G")
     ap.add_argument("--mock-jev", action="store_true", help="development only: no TypeSafe calls")
     ap.add_argument("--no-restore", action="store_true", help="do not relaunch run-app.sh at the end")
     ap.add_argument("--reuse-wallets", default="", metavar="RUN_ID",
                     help="Y: seed its two newcomers from that run's R store in the trash "
                          "(two app-made Coinos accounts); Z: seed A, B, C and D from that run's "
-                         "Z stores; instead of new Coinos signups")
+                         "Z stores, and I's A and B from them; instead of new Coinos signups")
     args = ap.parse_args()
     _quiet_agent_log()
     from scenarios import SCENARIOS

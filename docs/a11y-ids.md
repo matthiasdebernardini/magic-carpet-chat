@@ -112,10 +112,11 @@ suite on the cua box (`scripts/e2e-cua/atspi.py`, X11 under xfce).
 | `sidebar-remove-account` | Button | Remove this account / Click again to remove | first press arms, second removes |
 | `sidebar-remove-warning` | Label | sats-left warning | only while armed with sats left |
 | `sidebar-account-step` | Button | Next account | the "›" chevron |
-| `nav-<screen>` | Tab | screen name | `dashboard`, `bounties`, `payments`, `claimants`, `leaderboards`, `wallet`, `tags`, `chat`; `nav-bounties` has the open count as description when it is above 0 |
+| `nav-<screen>` | Tab | screen name | `dashboard`, `bounties`, `payments`, `claimants`, `leaderboards`, `wallet`, `tags`, `chat`; `nav-bounties` has the open count as description when it is above 0; `nav-payments` has the unsettled count (claims this account owes, is paying or lost track of) as description when it is above 0 |
+| `nav-payments-badge` | Label | the unsettled count | amber pill beside Payments; only when the active account's ledger has one or more unsettled claims |
 | `sidebar-open-title`, `sidebar-promised-title`, `sidebar-paid-title` | Label | OPEN BOUNTIES, PROMISED, PAID SO FAR | |
-| `sidebar-open`, `sidebar-promised`, `sidebar-paid` | Label | the figure | "…" while loading, "—" on failure; the "sats" unit is not in the label |
-| `sidebar-open-note`, `sidebar-promised-note`, `sidebar-paid-note` | Label | the note under the figure | |
+| `sidebar-open`, `sidebar-promised`, `sidebar-paid` | Label | the figure | "…" while loading, "—" on failure; promised and paid are the active account's own, from its payments ledger, and "—" with no account; the "sats" unit is not in the label |
+| `sidebar-open-note`, `sidebar-promised-note`, `sidebar-paid-note` | Label | the note under the figure | promised: in your open bounties; paid: paid by this account |
 | `top-shortcut` | Label | the keys just pressed and what they do, e.g. `⌘R Refresh` | shown for about 2 s after an app shortcut (cmd-… or esc); overlaid beside `top-auto-pay`, absent otherwise |
 | `top-search` | TextInput | Search | filters and ranks the bounty list (fuzzy); typing off the Bounties screen switches to it; esc clears it |
 | `top-auto-pay` | Label | Auto-pay armed / Auto-pay off | only while a bounty is focused |
@@ -127,7 +128,7 @@ renames its ids.
 
 | id | role | label | meaning |
 |---|---|---|---|
-| `placeholder-<screen>-title` | Heading | screen name | Payments, Claimants, Leaderboards, Tags, Settings |
+| `placeholder-<screen>-title` | Heading | screen name | Claimants, Leaderboards, Tags, Settings |
 | `placeholder-<screen>` | Label | Coming soon. | |
 | `wallet-title` | Heading | Wallet: <name> / Wallet | |
 | `wallet-no-account` | Label | No account. Press + in the rail to add one. | |
@@ -200,16 +201,18 @@ The map row's kind changes with the verdict, so match the prefix
 |---|---|---|---|
 | `bounties-title` | Heading | Bounties | |
 | `bounties-keys-hint` | Label | the key hint line | |
-| `bounties-new` | Button | + New DList + bounty (⌘N) / + Submit a bounty claim (⌘N) | any account issues; the claim label shows on the Eligible tab |
+| `bounties-new` | Button | + New DList + bounty (⌘N) / + Submit a bounty claim (⌘N) | any account issues; the claim label shows on the Claimed by me and Eligible tabs |
 | `bounties-tabs` | TabList | Bounty lists | |
-| `bounties-tab-house` | Tab | House bounties (N) | count once loaded; lists every issuer's open bounties plus the stored accounts' own (the label predates that) |
-| `bounties-tab-eligible` | Tab | Eligible for me to claim (N) | only with an account |
+| `bounties-tab-house` | Tab | All open (N) | count once loaded; lists every issuer's open bounties plus the stored accounts' own |
+| `bounties-tab-issued` | Tab | Issued by me (N) | only with an account; the active account's own bounties, any status, from its payments ledger |
+| `bounties-tab-claimed` | Tab | Claimed by me (N) | only with an account; other issuers' bounties the active account has a claim on, from its payments ledger |
+| `bounties-tab-eligible` | Tab | Eligible (N) | only with an account |
 | `bounties-list` | List | Bounties | |
 | `bounties-loading` | Label | Loading bounties… | |
-| `bounties-empty` | Label | the empty text of the open tab | |
+| `bounties-empty` | Label | the empty text of the open tab | Issued by me: You haven't issued a bounty yet.; Claimed by me: You haven't claimed a bounty yet. |
 | `bounties-no-match` | Label | No bounties match "<query>". | the search matches nothing |
 | `bounties-eligible-identity` | Button | the share-your-npub hint | Eligible tab, empty |
-| `bounties-error` | Label | Bounties didn't load: … / Eligible bounties didn't load: … | |
+| `bounties-error` | Label | Bounties didn't load: … / Your bounties didn't load: … / Your claims didn't load: … / Eligible bounties didn't load: … | |
 | `bounties-retry` | Button | Retry (⌘R) | |
 | `<row>` | ListItem | list name (d-tag) | `(selected)` when selected; press to select |
 | `<row>-status`, `<row>-sats`, `<row>-paid`, `<row>-auto-pay`, `<row>-qualify` | Label | the pills of the row | folded into the row's line by macos-harness |
@@ -229,8 +232,12 @@ The map row's kind changes with the verdict, so match the prefix
 | `<claim>` | Group | item name | one per claim |
 | `<claim>-item`, `<claim>-author` | Label | item name, by <short pubkey> | |
 | `<claim>-submitted`, `<claim>-attempted`, `<claim>-blocked`, `<claim>-receipt` | Label | timeline rows | |
-| `<claim>-payment` | Label | payment state: Auto-pay attempting…, Paid, waiting for the zap receipt, Payment settled, Paid, no receipt (…), Auto-pay failed (…), Payment status: unknown (…), Payment status: …, No auto-payment row yet | same id whatever the state; the issuer's own app's attempts read the same way, and on a bounty the server doesn't pay, every app (the claimant's too) reads Payment settled once a receipt around the issuer's signed request for the reward lands (one naming another bounty on the list doesn't count; one naming no bounty counts on every bounty on its list) |
-| `<claim>-unpaid-reason` | Label | why the claim is not paid: Rank too low: … rank this account N, and the bounty needs M. / No Lightning address in the claimant's profile, … / Wallet empty: … / Payment failed. … / Payment outcome unknown. … / Paying now… / Waiting for the issuer's app to pay it. / Waiting for the next auto-pay check. / No reward slots left on this bounty. / … | only on unpaid claims of bounties the server does not pay itself |
+| `<claim>-payment` | Label | payment state: Auto-pay attempting… (Paying… on a manual bounty), Paid, waiting for the zap receipt, Payment settled, Paid, no receipt (…), Auto-pay failed (…) (Payment failed (…) on a manual bounty), Payment status: unknown (…), Payment status: …, No auto-payment row yet | same id whatever the state; the issuer's own app's attempts read the same way, and on a bounty the server doesn't pay, every app (the claimant's too) reads Payment settled once a receipt around the issuer's signed request for the reward lands (one naming another bounty on the list doesn't count; one naming no bounty counts on every bounty on its list) |
+| `<claim>-unpaid-reason` | Label | why the claim is not paid: Rank too low: … rank this account N, and the bounty needs M. / No Lightning address in the claimant's profile, … / Wallet empty: … / Payment failed. … / Payment outcome unknown. … / Paying now… / The last payment failed (…). No sats moved, so it can be paid again. / This bounty is closed or has expired. / Waiting for the issuer's app to pay it. / Waiting for the next auto-pay check. / No reward slots left on this bounty. / … | only on unpaid claims of bounties the server does not pay itself |
+| `<claim>-pay` | Button | Pay N sats / Click again to pay N sats to <short npub> | only for the active issuer, on its own manual bounty, on a claim the rules let it pay by hand (one whose last payment failed included); the first press arms, a press under 600 ms later (a double-click) is ignored, the next one pays; another bounty, another screen, an account switch or 10 s disarm it |
+| `<claim>-pay-note` | Label | The app only knows payments made with this button. If you already paid this claim another way, don't pay again. | while `<claim>-pay` is armed |
+| `<claim>-pay-sending` | Label | Sending payment… | after the second press, until a payment state for the claim, a snapshot that no longer offers the button, a refusal, another bounty, another screen or an account switch |
+| `<claim>-pay-refused` | Label | why the hand payment was not sent: This claim was already paid or is being paid. / No reward slots left on this bounty. / The claimant's rank is below this bounty's minimum. / Wallet empty: … / No Lightning address in the claimant's profile, … / … | until the next press |
 | `<claim>-submitted-meta`, `-attempted-meta`, `-payment-meta` | Label | HH:MM:SS UTC · <relative> (· N sats) | `-payment-meta` carries the paid amount |
 | `<claim>-receipt-meta` | Label | N sats · Ns after the claim | |
 
@@ -253,6 +260,33 @@ The map row's kind changes with the verdict, so match the prefix
 | `claim-form-note` | Label | the payout note | |
 | `claim-form-submit` | Button | Submit claim | same as Enter in the field; dimmed and inert while the claim is being sent |
 
+## Payments
+
+`<row>` is `payment-row-<bounty-id>-<claim-event-id>`: a claim on a list claims every bounty on it, so one claim can head several rows.
+
+| id | role | label | meaning |
+|---|---|---|---|
+| `payments-title` | Heading | Payments | |
+| `payments-no-account` | Label | No account. Press + in the rail to add one. | read-only mode |
+| `payments-loading` | Label | Loading payments… | first read for the account |
+| `payments-error` | Label | Payments didn't load: … | first read failed |
+| `payments-retry-hint` | Label | ⌘R tries again. | under `payments-error` |
+| `payments-stale` | Label | Couldn't refresh. Showing payments as of N min ago. Retrying… / … ⌘R tries again. | above the tabs while the rows predate a failed refresh; "⌘R tries again." once the automatic retries (15 s, then 60 s) are used up |
+| `payments-tabs` | TabList | Payment lists | |
+| `payments-tab-by-me`, `payments-tab-to-me` | Tab | Paid by me (N), Paid to me (N) | `Value: on` for the open tab; Paid by me opens first |
+| `payments-total-owed`, `payments-total-paying`, `payments-total-paid`, `payments-total-pledged` | Label | N sats | Paid by me tab; PAYING counts unknown outcomes too |
+| `payments-total-owed-to-me`, `payments-total-received` | Label | N sats | Paid to me tab |
+| `<total>-title` | Label | OWED, PAYING, PAID, PLEDGED, OWED TO ME, RECEIVED | the caption over each total |
+| `payments-list` | List | Payments | the open tab's rows, newest first |
+| `payments-empty` | Label | You have not paid for any claims yet. / Nobody has paid you for a claim yet. | the open tab has no rows |
+| `<row>` | Group | item name | one per claim; press (or ↑/↓ then Enter) to open the bounty's detail pane on Bounties |
+| `<row>-item` | Label | item name | |
+| `<row>-who` | Label | to <name> · list <d-tag> / from <name> · list <d-tag> | name is a stored account's profile name, else a short npub |
+| `<row>-sats` | Label | N sats | |
+| `<row>-status` | Label | Paid / Paid, no receipt / Paying / Unknown / Not payable / Expired / Owed | |
+| `<row>-why` | Label | why the row has that status | only when there is a reason |
+| `<row>-when` | Label | <relative> | |
+
 ## Wallet panel
 
 On the Wallet screen, the Account page's Wallet tab and the account-setup ready steps (never two at once).
@@ -272,7 +306,7 @@ On the Wallet screen, the Account page's Wallet tab and the account-setup ready 
 | `wallet-send-error` | Label | the send error | same slot as the status, separate id |
 | `wallet-username` | Label | Coinos username: … | after a signup in this session |
 | `wallet-copy-username`, `wallet-copy-password` | Button | Copy username, Copy password | |
-| `wallet-other-address` | Label | Your profile pays X, not this wallet. … | |
+| `wallet-other-address` | Label | Claims pay X, not this Coinos wallet. | |
 | `wallet-publish-warning`, `wallet-publish-error` | Label | | |
 | `wallet-retry-publish` | Button | Retry publishing | |
 | `wallet-opening` | Label | Opening a Coinos wallet… | |
@@ -283,6 +317,15 @@ On the Wallet screen, the Account page's Wallet tab and the account-setup ready 
 | `wallet-no-address` | Label | No Lightning address yet: … | |
 | `wallet-create` | Button | Create a Coinos wallet for this account | |
 | `wallet-error` | Label | the panel error | |
+| `wallet-payout-address` | TextInput | Your Lightning address for claim payouts | active account's own page only, once its profile is read; prefilled with the profile's lud16; placeholder is "name@domain.com" |
+| `wallet-payout-save` | Button | Save | inert while checking and when the field equals the current address |
+| `wallet-payout-status` | Label | Checking… / Checked: this address accepts payments and sends receipts. | |
+| `wallet-payout-error` | Label | the check or publish error | same slot as the status, separate id |
+| `wallet-debts-pledged` | Label | Pledged outstanding: N sats / Pledged outstanding: … | active account's own page only; "…" while the ledger's first read is out |
+| `wallet-debts-owed` | Label | Owed but unpaid: N sats / Owed but unpaid: … | |
+| `wallet-debts-total` | Label | Total debts: N sats / Total debts: … | |
+| `wallet-debts-error` | Label | Couldn't load your debts. | replaces the three lines when the ledger read failed |
+| `wallet-debts-stale` | Label | Couldn't refresh. These may be out of date. | under the three lines while the ledger predates a failed refresh |
 
 ## Chat
 

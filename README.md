@@ -57,6 +57,24 @@ Coinos refuses outright, so a signup that times out on the way back is never
 lost. "Copy username" and "Copy password" on the panel are the only way the
 password leaves the file.
 
+## Wallet server
+
+Set `MC_WALLET_SERVER=https://wallet.example` to open new wallets on a
+self-hosted [LNbits](https://lnbits.com) server instead of Coinos. The server
+must allow sign-ups, run the LNURLp ("Pay Links") extension, and sit at the
+root of its host: the wallet's Lightning address is
+`carpet<random>@wallet.example`, with zaps on so bounties get receipts. The
+variable is read only when a wallet is created; an account's stored login
+(`src/lnbits.rs`; the wallet's admin key in place of a Coinos token) names its
+server, so balance reads and payments keep going there with the variable
+unset. Anything but an `https://` URL with only a host is refused and creates
+nothing. `tests/lnbits_live.rs` (`#[ignore]`) opens a wallet on the server
+and checks it reads 0 sats and takes zaps:
+
+```sh
+MC_WALLET_SERVER=https://wallet.example mbx nextest run --run-ignored only --no-capture -E 'binary(lnbits_live)'
+```
+
 `MC_SENTRY_DSN` turns on crash and error reporting to any Sentry-protocol
 receiver (unset means off). `magic-carpet-chat --sentry-ping` sends one test
 event to that DSN and prints its id.
@@ -83,6 +101,21 @@ MC_E2E_PAYER_TOKEN=$(jq -r '.accounts[0].coinos.token' ~/Library/Application\ Su
 
 Without it the test prints A's address and waits for a phone wallet
 (`MC_E2E_ZAP_WAIT_SECS`, default 600).
+
+The second ignored test checks that the issuer's auto-pay can pay a claimant
+whose Lightning address is not on coinos, and that the zap receipt from that
+provider reaches the instance relay. It spends 10 real sats and needs
+`MC_E2E_ISSUER_NSEC` (whose trust scores rank the claimant at least 2),
+`MC_E2E_PAYER_TOKEN` (the issuer's funded coinos wallet),
+`MC_E2E_CLAIMANT_NSEC` and `MC_E2E_EXTERNAL_LUD16` (the claimant's address on
+a provider that sends zap receipts):
+
+```sh
+mbx nextest run --run-ignored only --no-capture -E 'binary(e2e) and test(issuer_pays_a_claimant_on_another_lightning_provider)'
+```
+
+Run one test at a time: `-E 'binary(e2e)'` alone runs both, and the second
+stops before spending anything when its variables are missing.
 
 ## What is here
 
